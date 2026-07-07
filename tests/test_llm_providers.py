@@ -27,9 +27,17 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(_normalize_provider("zhipuai"), "glm")
 
     def test_provider_defaults_cover_local_free_models(self) -> None:
-        self.assertEqual(_default_model_for_provider("deepseek"), "deepseek-chat")
+        self.assertEqual(_default_model_for_provider("deepseek"), "deepseek-v4-flash")
         self.assertEqual(_default_model_for_provider("glm"), "glm-4")
         self.assertEqual(_default_model_for_provider("ollama"), "llama3.1")
+
+    def test_missing_deepseek_key_is_deferred_until_request(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            client = LLMClient(provider="deepseek")
+
+        self.assertIsNotNone(client.configuration_error)
+        with self.assertRaisesRegex(RuntimeError, "DEEPSEEK_API_KEY"):
+            client.respond(instructions="", messages=[{"role": "user", "content": "hi"}], tools=[])
 
     def test_missing_openai_key_is_deferred_until_request(self) -> None:
         with patch.dict("os.environ", {}, clear=True):

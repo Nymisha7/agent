@@ -79,9 +79,27 @@ class LLMClient:
             if not os.environ.get("ANTHROPIC_API_KEY"):
                 self.configuration_error = _provider_configuration_error("Anthropic", "ANTHROPIC_API_KEY")
         elif self.provider == "deepseek":
-            self.client, self.endpoint, self.mode = _deepseek_client()
+            self.endpoint = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+            self.mode = "hosted"
+            api_key = os.environ.get("DEEPSEEK_API_KEY")
+            if api_key:
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint)
+            else:
+                self.configuration_error = _provider_configuration_error("DeepSeek", "DEEPSEEK_API_KEY")
         elif self.provider == "glm":
-            self.client, self.endpoint, self.mode = _glm_client()
+            self.endpoint = (
+                os.environ.get("GLM_BASE_URL")
+                or os.environ.get("ZAI_BASE_URL")
+                or os.environ.get("ZHIPUAI_BASE_URL")
+                or os.environ.get("BIGMODEL_BASE_URL")
+                or "https://open.bigmodel.cn/api/paas/v4"
+            )
+            self.mode = "hosted"
+            api_key = _first_env("GLM_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY", "BIGMODEL_API_KEY")
+            if api_key:
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint)
+            else:
+                self.configuration_error = _provider_configuration_error("GLM", "GLM_API_KEY")
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
 
@@ -320,62 +338,18 @@ def _normalize_provider(value: str) -> str:
 
 def _default_model_for_provider(provider: str) -> str:
     defaults = {
-        "openai": os.environ.get("OPENAI_MODEL") or "gpt-4o",
+        "openai": os.environ.get("OPENAI_MODEL") or "gpt-5.4-mini",
         "openai-compatible": os.environ.get("NYM_OPENAI_COMPAT_MODEL") or "local-model",
         "ollama": os.environ.get("OLLAMA_MODEL") or "llama3.1",
         "lmstudio": os.environ.get("LMSTUDIO_MODEL") or "local-model",
         "anthropic": os.environ.get("ANTHROPIC_MODEL") or "claude-3-5-sonnet-latest",
         "deepseek": os.environ.get("DEEPSEEK_MODEL")
-        or os.environ.get("OLLAMA_DEEPSEEK_MODEL")
-        or os.environ.get("OLLAMA_MODEL")
-        or "deepseek-chat",
+        or "deepseek-v4-flash",
         "glm": os.environ.get("GLM_MODEL")
         or os.environ.get("ZAI_MODEL")
-        or os.environ.get("OLLAMA_GLM_MODEL")
-        or os.environ.get("OLLAMA_MODEL")
         or "glm-4",
     }
     return defaults[provider]
-
-
-def _deepseek_client() -> tuple[OpenAI, str, str]:
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if api_key:
-        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        return (
-            OpenAI(api_key=api_key, base_url=base_url),
-            base_url,
-            "hosted",
-        )
-    base_url = _ollama_base_url()
-    return (
-        OpenAI(api_key=os.environ.get("OLLAMA_API_KEY") or "ollama", base_url=base_url),
-        base_url,
-        "local",
-    )
-
-
-def _glm_client() -> tuple[OpenAI, str, str]:
-    api_key = _first_env("GLM_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY", "BIGMODEL_API_KEY")
-    if api_key:
-        base_url = (
-            os.environ.get("GLM_BASE_URL")
-            or os.environ.get("ZAI_BASE_URL")
-            or os.environ.get("ZHIPUAI_BASE_URL")
-            or os.environ.get("BIGMODEL_BASE_URL")
-            or "https://open.bigmodel.cn/api/paas/v4"
-        )
-        return (
-            OpenAI(api_key=api_key, base_url=base_url),
-            base_url,
-            "hosted",
-        )
-    base_url = _ollama_base_url()
-    return (
-        OpenAI(api_key=os.environ.get("OLLAMA_API_KEY") or "ollama", base_url=base_url),
-        base_url,
-        "local",
-    )
 
 
 def _first_env(*names: str) -> str | None:
@@ -395,8 +369,8 @@ def _required_env(name: str, provider_name: str) -> str:
 
 def _provider_configuration_error(provider_name: str, env_name: str) -> str:
     return (
-        f"{provider_name} is not configured. Set {env_name}, or switch to a local provider with "
-        "`/provider ollama <installed-model>` or `nym --provider ollama --model <installed-model>`."
+        f"{provider_name} is not configured. Set {env_name}, or switch to a local model with "
+        "`/model ollama <installed-model>` or `nym --provider ollama --model <installed-model>`."
     )
 
 
@@ -417,13 +391,13 @@ def _friendly_llm_error(
     if "api key" in text_lower or "authentication" in text_lower or "unauthorized" in text_lower:
         return (
             f"{provider_name} is not authenticated. Set the provider API key or switch providers with "
-            f"`/provider ollama <installed-model>`. Active model: {model_name}."
+            f"`/model ollama <installed-model>`. Active model: {model_name}."
         )
 
     if "connection" in text_lower or "refused" in text_lower or "connection error" in text_lower:
         return (
             f"Cannot reach {provider_name} at {endpoint or 'configured endpoint'}. "
-            f"Start the local server or switch providers with `/provider <provider> [model]`."
+            f"Start the local server or switch providers with `/model <source> <model>`."
         )
 
     if "model" in text_lower and ("not found" in text_lower or "does not exist" in text_lower):

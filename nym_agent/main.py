@@ -8,15 +8,20 @@ import uuid
 import textwrap
 import threading
 import time
+import webbrowser
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from enum import Enum
+import json
+import urllib.error
+import urllib.request
 
 from .context_builder import build_stored_context
 from .language_servers import LanguageServerManager
-from .llm import LLMClient, SUPPORTED_PROVIDERS
+from .llm import LLMClient, SUPPORTED_PROVIDERS, _normalize_provider
 from .planner import (
     AgentSession,
     agent_session_from_dict,
@@ -31,6 +36,11 @@ SESSION_LIST_LIMIT = 10
 USAGE_PANEL_WIDTH = 30
 USAGE_PANEL_MIN_TERMINAL_WIDTH = 105
 DEFAULT_CONTEXT_WINDOWS = {
+    "gpt-5.5": 1_000_000,
+    "gpt-5.5-mini": 400_000,
+    "gpt-5.4": 1_000_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.4-nano": 400_000,
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
     "gpt-4.1": 1_047_576,
@@ -39,25 +49,144 @@ DEFAULT_CONTEXT_WINDOWS = {
     "o3": 200_000,
     "o3-mini": 200_000,
     "o4-mini": 200_000,
+    "claude-3-5-sonnet-latest": 200_000,
+    "claude-3-5-haiku-latest": 200_000,
+    "llama3.1": 128_000,
+    "llama3.3": 128_000,
+    "qwen2.5-coder": 128_000,
+    "qwen3": 128_000,
+    "qwen3.5": 128_000,
+    "qwen3.6": 256_000,
+    "qwen3-coder": 256_000,
+    "qwen3-coder-next": 256_000,
+    "deepseek-r1": 128_000,
+    "deepseek-v3": 128_000,
+    "deepseek-v3.2": 128_000,
+    "deepseek-chat": 64_000,
+    "deepseek-reasoner": 64_000,
+    "deepseek-v4-flash": 128_000,
+    "deepseek-v4-pro": 128_000,
+    "glm-4": 128_000,
+    "glm-4.5": 128_000,
+    "glm-4.7": 128_000,
+    "glm-4.7-flash": 128_000,
+    "glm-5": 128_000,
+    "glm-5.1": 128_000,
+    "gemma3": 128_000,
+    "gemma4": 128_000,
+    "codestral": 128_000,
+    "codellama": 128_000,
+    "gpt-oss": 128_000,
+    "starcoder2": 128_000,
 }
+
+
 LOCAL_COMMANDS = (
-    ("/help", "Show local command help"),
-    ("/status", "Show session, provider, and configuration status"),
-    ("/providers", "Show active provider and available providers"),
-    ("/provider", "Switch provider: /provider <provider> [model]"),
-    ("/models", "Show model suggestions for each provider"),
-    ("/model", "Switch model on the active provider: /model <model>"),
-    ("/connect", "Show setup instructions for hosted and local providers"),
-    ("/exit", "Exit the TUI"),
+    ("/models", "Open the model picker"),
+    ("/model", "Switch model"),
+    ("/status", "Show session and model status"),
+    ("/connect", "Set up hosted or local models"),
+    ("/help", "Show commands and shortcuts"),
+    ("/exit", "Exit Nym"),
 )
+
+PROVIDER_API_KEY_ENVS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "glm": "GLM_API_KEY",
+    "openai-compatible": "NYM_OPENAI_COMPAT_API_KEY",
+}
+
+PROVIDER_LOGIN_URLS = {
+    "openai": "https://platform.openai.com/api-keys",
+    "anthropic": "https://console.anthropic.com/settings/keys",
+    "deepseek": "https://platform.deepseek.com/api_keys",
+    "glm": "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
+    "openai-compatible": "https://platform.openai.com/api-keys",
+}
+PROVIDER_DISPLAY_NAMES = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "deepseek": "DeepSeek",
+    "glm": "GLM",
+    "openai-compatible": "Custom OpenAI-compatible",
+    "ollama": "Ollama",
+    "lmstudio": "LM Studio",
+}
+PROVIDER_ARGUMENT_COMMANDS = {"/provider", "/login", "/auth", "/apikey", "/key"}
+LOCAL_PROVIDERS = {"ollama", "lmstudio"}
+PROVIDER_SORT_ORDER = {
+    "ollama": 0,
+    "lmstudio": 1,
+    "openai": 2,
+    "anthropic": 3,
+    "deepseek": 4,
+    "glm": 5,
+    "openai-compatible": 6,
+}
 PROVIDER_MODEL_HINTS = {
-    "openai": ("gpt-4o", "gpt-4o-mini", "gpt-4.1"),
+    "openai": (
+        "gpt-5.5",
+        "gpt-5.5-mini",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o3",
+        "o3-mini",
+        "o4-mini",
+    ),
     "anthropic": ("claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"),
-    "ollama": ("llama3.1", "qwen2.5-coder", "deepseek-r1"),
+    "ollama": (
+        "qwen3.6",
+        "qwen3-coder",
+        "qwen3-coder-next",
+        "qwen3.5",
+        "qwen3",
+        "qwen2.5-coder",
+        "qwen2.5",
+        "deepseek-r1",
+        "deepseek-v3.2",
+        "deepseek-v3",
+        "deepseek-coder-v2",
+        "deepseek-coder",
+        "llama3.3",
+        "llama3.1",
+        "llama3.2",
+        "llama4",
+        "gemma4",
+        "gemma3",
+        "gemma3n",
+        "mistral-small3.2",
+        "mistral-small",
+        "mistral-nemo",
+        "mistral",
+        "mixtral",
+        "codestral",
+        "codegemma",
+        "codellama",
+        "gpt-oss",
+        "phi4",
+        "phi4-reasoning",
+        "phi4-mini",
+        "granite-code",
+        "starcoder2",
+        "glm-5.1",
+        "glm-4.7-flash",
+    ),
     "lmstudio": ("local-model",),
     "openai-compatible": ("local-model",),
-    "deepseek": ("deepseek-chat", "deepseek-reasoner"),
-    "glm": ("glm-4", "glm-4.5"),
+    "deepseek": (
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ),
+    "glm": ("glm-5.1", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4", "glm-4.5"),
 }
 COLOR_HEADER = 1
 COLOR_USER = 2
@@ -81,6 +210,8 @@ class AppContext:
     stored_context: str | None = None
     debug: bool = False
 
+    pending_provider: str | None = None
+    pending_model: str | None = None
 
 @dataclass(frozen=True)
 class PaletteEntry:
@@ -90,6 +221,38 @@ class PaletteEntry:
     complete_to: str
     execute: bool = False
 
+class AccessMode(Enum):
+    NO_AUTH = "no_auth"
+    API_KEY = "api_key"
+    BROWSER_LOGIN = "browser_login"
+    OPTIONAL_API_KEY = "optional_api_key"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRecord:
+    id: str
+    display_name: str
+    provider_id: str
+    access: "AccessMode"
+    state: "ModelState"
+    capabilities: frozenset[str]
+    context_window: int | None
+    local: bool
+    installed: bool | None
+    selectable: bool
+    action_label: str | None = None
+
+class ModelState(Enum):
+    READY = "ready"
+    AUTH_REQUIRED = "auth_required"
+    LOGIN_REQUIRED = "login_required"
+    SERVER_OFFLINE = "server_offline"
+    MODEL_NOT_INSTALLED = "model_not_installed"
+    DOWNLOADING = "downloading"
+    LOADING = "loading"
+    UNAVAILABLE = "unavailable"
+    INCOMPATIBLE = "incompatible"
+    UNKNOWN = "unknown"
 
 @dataclass
 class ApprovalQueueState:
@@ -360,7 +523,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         default=None,
-        choices=["openai", "openai-compatible", "ollama", "lmstudio", "anthropic", "deepseek", "glm"],
+        choices=sorted(SUPPORTED_PROVIDERS),
         help=(
             "LLM provider. Defaults to NYM_LLM_PROVIDER or openai. "
             "Use ollama/lmstudio/deepseek/glm for local no-login providers when no hosted API key is set."
@@ -443,12 +606,17 @@ def build_context(
         store=store,
         session=session_info,
     ).text
+    provider = getattr(args, "provider", None) or session_info.provider
+    model = _selected_model(args, session_info)
+    llm = LLMClient(model=model, provider=provider)
+    if session_info.provider != llm.provider or session_info.model != llm.model:
+        store.update_llm_config(session_info.id, provider=llm.provider, model=llm.model)
 
     return AppContext(
         workspace_root=workspace_root,
         search_roots=parse_search_roots(workspace_root),
         rust=RustTools(rust_bin=rust_bin),
-        llm=LLMClient(model=args.model, provider=args.provider),
+        llm=llm,
         language_servers=LanguageServerManager(),
         session=session,
         session_id=session_info.id,
@@ -456,6 +624,15 @@ def build_context(
         stored_context=stored_context,
         debug=args.debug,
     )
+
+
+def _selected_model(args: argparse.Namespace, session_info: SessionInfo) -> str | None:
+    if getattr(args, "model", None):
+        return args.model
+    provider_override = getattr(args, "provider", None)
+    if provider_override and provider_override != session_info.provider:
+        return None
+    return session_info.model
 
 
 def default_workspace_root(args: argparse.Namespace) -> Path:
@@ -605,6 +782,7 @@ def create_new_session(args: argparse.Namespace, store: SessionStore) -> Session
     workspace_root = default_workspace_root(args)
     return store.create_session(
         workspace_root=workspace_root,
+        provider=args.provider,
         model=args.model,
     )
 
@@ -654,7 +832,7 @@ def persist_agent_state(ctx: AppContext) -> None:
 
 
 def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
-    text = user_input.strip()
+    text = _normalized_command_prompt(user_input.strip())
     if not text.startswith("/"):
         return None
     if text == "/":
@@ -662,22 +840,21 @@ def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
     parts = text.split()
     command = parts[0].casefold()
 
-    if command in {"/providers", "/provider"} and len(parts) == 1:
-        return _providers_text(ctx)
+    if command in {"/login", "/auth"}:
+        provider = parts[1] if len(parts) >= 2 else _active_provider(ctx)
+        return _login_provider(ctx, provider)
 
-    if command == "/provider":
+    if command in {"/apikey", "/key"}:
         provider = parts[1] if len(parts) >= 2 else ""
-        model = parts[2] if len(parts) >= 3 else None
+        api_key = parts[2] if len(parts) >= 3 else ""
         if not provider:
-            return "Usage: /provider <provider> [model]"
-        try:
-            ctx.llm = LLMClient(model=model, provider=provider)
-        except Exception as exc:
-            return f"Could not switch provider: {exc}"
-        return (
-            f"Provider switched to {_active_provider(ctx)} with model {ctx.llm.model}.\n"
-            f"Configuration: {_llm_configuration(ctx)}"
-        )
+            return "Usage: /apikey <provider> [api-key]"
+        if not api_key:
+            return (
+                f"Paste the key using the hidden TUI prompt: /apikey {provider}\n"
+                f"Non-TUI fallback: /apikey {provider} <api-key>"
+            )
+        return _set_provider_api_key(ctx, provider, api_key)
 
     if command in {"/models", "/model"} and len(parts) == 1:
         return _models_text(ctx)
@@ -685,12 +862,17 @@ def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
     if command == "/model":
         if len(parts) < 2:
             return _models_text(ctx)
-        model = parts[1]
-        try:
-            ctx.llm = LLMClient(model=model, provider=_active_provider(ctx))
-        except Exception as exc:
-            return f"Could not switch model: {exc}"
-        return f"Model switched to {ctx.llm.model} on provider {_active_provider(ctx)}."
+        provider: str | None = None
+        if len(parts) >= 3:
+            try:
+                provider = _normalize_provider(parts[1])
+                model = parts[2]
+            except ValueError:
+                provider = None
+                model = parts[1]
+        else:
+            model = parts[1]
+        return _switch_model(ctx, model=model, provider=provider)
 
     if command == "/status":
         return _status_text(ctx)
@@ -715,38 +897,723 @@ def _slash_help_text() -> str:
     return "\n".join(lines)
 
 
+def _provider_switch_text(ctx: AppContext) -> str:
+    provider = _active_provider(ctx)
+    configuration = _llm_configuration(ctx)
+    lines = [f"Model source switched to {_model_source_label(provider)} with model {ctx.llm.model}."]
+    if configuration == "ready":
+        lines.append("Configuration: ready")
+        return "\n".join(lines)
+
+    env_name = PROVIDER_API_KEY_ENVS.get(provider)
+    display_name = PROVIDER_DISPLAY_NAMES.get(provider, provider)
+    if provider == "openai-compatible" and "BASE_URL" in configuration:
+        lines.extend([
+            "",
+            "OpenAI-compatible models need an endpoint before requests can run.",
+            "Set environment variable: NYM_OPENAI_COMPAT_BASE_URL",
+            "Optional API key: /apikey openai-compatible",
+        ])
+        return "\n".join(lines)
+
+    if env_name:
+        lines.extend([
+            "",
+            f"{display_name} needs an API key before requests can run.",
+            f"Set key: /apikey {provider}",
+        ])
+        if provider in PROVIDER_LOGIN_URLS:
+            lines.append(f"Open account/API keys: /login {provider}")
+        lines.extend([
+            f"Environment variable: {env_name}",
+            "Keys loaded with /apikey are used for this Nym process and are not written to session history.",
+        ])
+        return "\n".join(lines)
+
+    lines.append(f"Configuration: {configuration}")
+    return "\n".join(lines)
+
+
 def _providers_text(ctx: AppContext) -> str:
     provider = _active_provider(ctx)
     providers = ", ".join(sorted(SUPPORTED_PROVIDERS))
     return (
-        f"Active provider: {provider}\n"
         f"Active model: {ctx.llm.model}\n"
+        f"Model source: {_model_source_label(provider)}\n"
         f"Mode: {_llm_mode(ctx)}\n"
         f"Endpoint: {_llm_endpoint(ctx)}\n"
         f"Configuration: {_llm_configuration(ctx)}\n"
-        f"Available providers: {providers}\n"
-        "Switch with: /provider <provider> [model]"
+        f"Available model sources: {providers}\n"
+        "Switch with: /model <source> <model>"
     )
 
 
 def _models_text(ctx: AppContext) -> str:
     active_provider = _active_provider(ctx)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for option in _model_options_for_display(ctx):
+        grouped.setdefault(option["provider"], []).append(option)
+
     lines = [
-        f"Active provider: {active_provider}",
         f"Active model: {ctx.llm.model}",
+        f"Model source: {_model_source_label(active_provider)}",
         "",
-        "Suggested models:",
+        "Models:",
     ]
-    for provider in sorted(SUPPORTED_PROVIDERS):
-        hints = ", ".join(PROVIDER_MODEL_HINTS.get(provider, ("custom-model",)))
-        marker = "*" if provider == active_provider else " "
-        lines.append(f"{marker} {provider}: {hints}")
+
+    for provider in sorted(
+        grouped,
+        key=lambda item: PROVIDER_SORT_ORDER.get(item, 99),
+    ):
+        lines.append("")
+        lines.append(
+            f"{_model_source_label(provider)} - {_provider_access_label(provider)}"
+        )
+        for option in grouped[provider]:
+            marker = (
+                "*"
+                if (
+                    option["provider"] == active_provider
+                    and option["model"] == ctx.llm.model
+                )
+                else " "
+            )
+            lines.append(
+                f"{marker} {option['model']}  "
+                f"{_model_state_label(option)}"
+            )
+
     lines.extend([
         "",
         "Switch model: /model <model>",
-        "Switch provider and model: /provider <provider> <model>",
+        "Choose exact source/model: /model <source> <model>",
+        "Hosted models open auth automatically when a key is missing.",
+        "Local models require Ollama/LM Studio to be installed, running, and loaded or pulled first.",
     ])
+
     return "\n".join(lines)
+
+def _resolve_local_model_name(
+    ctx: Any,
+    provider: str,
+    requested_model: str,
+) -> tuple[str | None, str | None]:
+    discovered, discovery_error = _discover_provider_models(
+        ctx,
+        provider,
+    )
+
+    if discovery_error:
+        return None, _local_model_setup_error(provider, requested_model, discovery_error)
+
+    # Exact installed model name.
+    if requested_model in discovered:
+        return requested_model, None
+
+    requested_lower = requested_model.casefold()
+
+    # Allow an untagged alias only when it resolves to one model.
+    matches = [
+        model
+        for model in discovered
+        if model.casefold() == requested_lower
+        or model.casefold().startswith(
+            f"{requested_lower}:"
+        )
+    ]
+
+    if len(matches) == 1:
+        return matches[0], None
+
+    if len(matches) > 1:
+        choices = ", ".join(matches)
+
+        return None, (
+            f"`{requested_model}` matches multiple installed models: "
+            f"{choices}. Choose the exact model name."
+        )
+
+    installed = ", ".join(discovered) or "none"
+
+    message = (
+        f"Local model `{requested_model}` is not installed. "
+        f"Installed models: {installed}."
+    )
+    if provider == "ollama":
+        message = f"{message} Install it with: ollama pull {requested_model}"
+    elif provider == "lmstudio":
+        message = f"{message} Download or load it in LM Studio first."
+    return None, message
+
+
+def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
+    source = _model_source_label(provider)
+    if provider == "ollama":
+        return (
+            f"{source} is not ready for `{model}`.\n"
+            "Install and start Ollama, then pull the model first:\n"
+            f"ollama pull {model}\n"
+            f"Details: {detail}"
+        )
+    if provider == "lmstudio":
+        return (
+            f"{source} is not ready for `{model}`.\n"
+            "Install LM Studio, load the model, and start its local server first.\n"
+            f"Details: {detail}"
+        )
+    return detail
+
+
+def _switch_model(
+    ctx: Any,
+    *,
+    model: str,
+    provider: str | None = None,
+) -> str:
+    resolved_provider = provider or _provider_for_model(
+        model,
+        _active_provider(ctx),
+    )
+
+    try:
+        candidate = LLMClient(
+            model=model,
+            provider=resolved_provider,
+        )
+    except Exception as exc:
+        return f"Could not use model `{model}`: {exc}"
+
+    configuration_error = getattr(
+        candidate,
+        "configuration_error",
+        None,
+    )
+
+    if configuration_error:
+        # Local models should show server/install instructions,
+        # not an API-key prompt.
+        if resolved_provider in LOCAL_PROVIDERS:
+            return _handle_model_setup(candidate)
+
+        # Remember what the user selected while authentication happens.
+        ctx.pending_provider = resolved_provider
+        ctx.pending_model = model
+
+        lines = [
+            f"{model} needs authentication.\n"
+            f"Set key: /apikey {resolved_provider}",
+        ]
+        if resolved_provider in PROVIDER_LOGIN_URLS:
+            lines.append(f"Open account/API keys: /login {resolved_provider}")
+        lines.append(f"Complete the secure {_model_source_label(resolved_provider)} key prompt to continue.")
+        return "\n".join(lines)
+
+    previous_llm = ctx.llm
+
+    try:
+        ctx.llm = candidate
+        ctx.pending_provider = None
+        ctx.pending_model = None
+        _persist_llm_config(ctx)
+    except Exception as exc:
+        ctx.llm = previous_llm
+        return f"Could not save model `{model}`: {exc}"
+
+    return _model_switch_text(ctx)
+
+
+def _normalize_base_url(base_url: str) -> str:
+    url = base_url.strip().rstrip("/")
+
+    if not url:
+        return ""
+
+    if not url.startswith(("http://", "https://")):
+        url = f"http://{url}"
+
+    for suffix in (
+        "/chat/completions",
+        "/responses",
+        "/models",
+    ):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)].rstrip("/")
+
+    return url
+
+
+def _strip_api_suffix(base_url: str) -> str:
+    url = _normalize_base_url(base_url)
+
+    if url.endswith("/v1"):
+        return url[:-3].rstrip("/")
+
+    return url
+
+
+def _openai_models_url(base_url: str) -> str:
+    url = _normalize_base_url(base_url)
+
+    if not url:
+        return ""
+
+    if not url.endswith("/v1"):
+        url = f"{url}/v1"
+
+    return f"{url}/models"
+
+
+def _ollama_tags_url(base_url: str) -> str:
+    root = _strip_api_suffix(base_url)
+
+    if not root:
+        return ""
+
+    return f"{root}/api/tags"
+
+
+def _get_json(
+    url: str,
+    *,
+    api_key: str | None = None,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    if not url:
+        raise RuntimeError("Endpoint is not configured.")
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Nym/1.0",
+    }
+
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request = urllib.request.Request(
+        url,
+        headers=headers,
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=timeout,
+        ) as response:
+            raw = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        if exc.code in {401, 403}:
+            raise RuntimeError(
+                "Authentication failed."
+            ) from exc
+
+        if exc.code == 404:
+            raise RuntimeError(
+                f"Model-list endpoint was not found: {url}"
+            ) from exc
+
+        raise RuntimeError(
+            f"Endpoint returned HTTP {exc.code}: {body}"
+        ) from exc
+
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+
+        raise RuntimeError(
+            f"Could not connect to {url}: {reason}"
+        ) from exc
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Endpoint returned invalid JSON: {url}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Endpoint returned an unexpected response: {url}"
+        )
+
+    return payload
+
+
+def _discover_ollama_models(
+    base_url: str,
+) -> list[str]:
+    payload = _get_json(
+        _ollama_tags_url(base_url),
+    )
+
+    items = payload.get("models", [])
+
+    if not isinstance(items, list):
+        return []
+
+    models: list[str] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        model = item.get("model") or item.get("name")
+
+        if isinstance(model, str) and model:
+            models.append(model)
+
+    return sorted(set(models))
+
+
+def _discover_openai_compatible_models(
+    base_url: str,
+    *,
+    api_key: str | None = None,
+) -> list[str]:
+    payload = _get_json(
+        _openai_models_url(base_url),
+        api_key=api_key,
+    )
+
+    items = payload.get("data", [])
+
+    if not isinstance(items, list):
+        return []
+
+    models: list[str] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        model = item.get("id")
+
+        if isinstance(model, str) and model:
+            models.append(model)
+
+    return sorted(set(models))
+
+
+def _provider_base_url(
+    ctx: Any,
+    provider: str,
+) -> str:
+    # First use the endpoint already resolved by LLMClient.
+    active_llm = getattr(ctx, "llm", None)
+
+    if (
+        active_llm is not None
+        and getattr(active_llm, "provider", None) == provider
+    ):
+        endpoint = getattr(active_llm, "endpoint", None)
+
+        if isinstance(endpoint, str) and endpoint.strip():
+            return endpoint.strip()
+
+    # Then use provider-specific environment configuration.
+    if provider == "ollama":
+        return os.environ.get(
+            "NYM_OLLAMA_BASE_URL",
+            os.environ.get(
+                "OLLAMA_HOST",
+                "http://localhost:11434",
+            ),
+        )
+
+    if provider == "lmstudio":
+        return os.environ.get(
+            "NYM_LMSTUDIO_BASE_URL",
+            "http://localhost:1234/v1",
+        )
+
+    if provider == "openai-compatible":
+        return os.environ.get(
+            "NYM_OPENAI_COMPAT_BASE_URL",
+            "",
+        )
+
+    if provider == "openai":
+        return "https://api.openai.com/v1"
+
+    return ""
+
+
+
+def _discover_provider_models(
+    ctx: Any,
+    provider: str,
+) -> tuple[list[str], str | None]:
+    base_url = _provider_base_url(ctx, provider)
+
+    try:
+        if provider == "ollama":
+            return _discover_ollama_models(base_url), None
+
+        if provider == "lmstudio":
+            return _discover_openai_compatible_models(base_url), None
+
+        if provider == "openai-compatible":
+            if not base_url:
+                return [], "Endpoint is not configured."
+
+            api_key = os.environ.get(
+                "NYM_OPENAI_COMPAT_API_KEY",
+            )
+
+            return (
+                _discover_openai_compatible_models(
+                    base_url,
+                    api_key=api_key,
+                ),
+                None,
+            )
+
+        if provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY")
+
+            if not api_key:
+                return [], "OpenAI API key is required."
+
+            return (
+                _discover_openai_compatible_models(
+                    "https://api.openai.com/v1",
+                    api_key=api_key,
+                ),
+                None,
+            )
+
+        return list(PROVIDER_MODEL_HINTS.get(provider, ())), None
+
+    except RuntimeError as exc:
+        return [], str(exc)
+
+
+def _model_state_label(option: dict[str, Any]) -> str:
+    state = option.get("state")
+
+    labels = {
+        ModelState.READY: "Ready",
+        ModelState.AUTH_REQUIRED: "Add API key",
+        ModelState.LOGIN_REQUIRED: "Sign in",
+        ModelState.SERVER_OFFLINE: "Server offline",
+        ModelState.MODEL_NOT_INSTALLED: "Not installed",
+        ModelState.DOWNLOADING: "Downloading",
+        ModelState.LOADING: "Loading",
+        ModelState.UNAVAILABLE: "Unavailable",
+        ModelState.INCOMPATIBLE: "Incompatible",
+        ModelState.UNKNOWN: "Setup required",
+    }
+
+    return labels.get(state, "Unknown")
+
+
+def _handle_model_setup(candidate: Any) -> str:
+    provider = str(getattr(candidate, "provider", "") or "")
+    model = str(getattr(candidate, "model", "") or "")
+    error = str(
+        getattr(candidate, "configuration_error", "")
+        or "Model is not ready."
+    )
+
+    if provider == "ollama":
+        return (
+            f"`{model}` is not ready locally.\n"
+            f"Start Ollama, then install it with: ollama pull {model}"
+        )
+
+    if provider == "lmstudio":
+        return (
+            f"`{model}` is not ready locally.\n"
+            "Start the LM Studio server and load the model first."
+        )
+
+    if provider in PROVIDER_API_KEY_ENVS:
+        return (
+            f"`{model}` needs an API key.\n"
+            f"Details: {error}"
+        )
+
+    return f"Could not prepare `{model}`: {error}"    
+
+def _model_switch_text(ctx: Any) -> str:
+    provider = _active_provider(ctx)
+    model = getattr(getattr(ctx, "llm", None), "model", None)
+    configuration = _llm_configuration(ctx)
+    lines = [
+        f"Model switched to {model}.",
+        f"Source: {_model_source_label(provider)}",
+        f"Access: {_provider_access_label(provider)}",
+    ]
+    if configuration == "ready":
+        lines.append("Configuration: ready")
+        return "\n".join(lines)
+    lines.append("")
+    lines.append(_provider_switch_text(ctx))
+    return "\n".join(lines)
+
+
+def _provider_for_model(model: str, active_provider: str) -> str:
+    providers = _providers_for_model(model)
+    if active_provider in providers:
+        return active_provider
+    if providers:
+        local_matches = [provider for provider in providers if provider in LOCAL_PROVIDERS]
+        if local_matches:
+            return local_matches[0]
+        return providers[0]
+    return active_provider
+
+
+def _providers_for_model(model: str) -> list[str]:
+    normalized = model.casefold()
+    providers: list[str] = []
+    for provider in sorted(
+        SUPPORTED_PROVIDERS,
+        key=lambda item: PROVIDER_SORT_ORDER.get(item, 99),
+    ):
+        hints = PROVIDER_MODEL_HINTS.get(provider, ())
+        if any(hint.casefold() == normalized for hint in hints):
+            providers.append(provider)
+    return providers
+
+
+def _discovered_model_options(ctx: Any,) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+
+    for provider in sorted(
+        SUPPORTED_PROVIDERS,
+        key=lambda item: PROVIDER_SORT_ORDER.get(item, 99),
+    ):
+        discovered, discovery_error = _discover_provider_models(
+            ctx,
+            provider,
+        )
+
+        discovered_set = set(discovered)
+        suggestions = PROVIDER_MODEL_HINTS.get(provider, ())
+
+        for model in discovered:
+            options.append({
+                "provider": provider,
+                "model": model,
+                "state": ModelState.READY,
+                "selectable": True,
+                "error": None,
+            })
+
+        for model in suggestions:
+            if model in discovered_set:
+                continue
+
+            if provider in LOCAL_PROVIDERS:
+                state = (
+                    ModelState.SERVER_OFFLINE
+                    if discovery_error
+                    else ModelState.MODEL_NOT_INSTALLED
+                )
+            elif discovery_error and "key" in discovery_error.casefold():
+                state = ModelState.AUTH_REQUIRED
+            elif discovery_error:
+                state = ModelState.UNAVAILABLE
+            else:
+                state = ModelState.UNKNOWN
+
+            options.append({
+                "provider": provider,
+                "model": model,
+                "state": state,
+                "selectable": state in {
+                    ModelState.READY,
+                    ModelState.AUTH_REQUIRED,
+                },
+                "error": discovery_error,
+            })
+
+    return options
+
+def _model_options() -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+
+    for provider in sorted(
+        SUPPORTED_PROVIDERS,
+        key=lambda item: PROVIDER_SORT_ORDER.get(
+            item,
+            99,
+        ),
+    ):
+        for model in PROVIDER_MODEL_HINTS.get(
+            provider,
+            (),
+        ):
+            options.append({
+                "provider": provider,
+                "model": model,
+                "state": ModelState.UNKNOWN,
+                "selectable": True,
+                "error": None,
+            })
+
+    return options
+
+
+def _model_options_for_display(ctx: Any) -> list[dict[str, Any]]:
+    active_provider = _active_provider(ctx)
+    active_model = str(getattr(getattr(ctx, "llm", None), "model", "") or "")
+    options = _model_options()
+
+    for option in options:
+        provider = option["provider"]
+        model = option["model"]
+        option["state"] = _hinted_model_state(ctx, provider, model, active_provider, active_model)
+        option["selectable"] = True
+        option["error"] = None
+
+    return options
+
+
+def _hinted_model_state(
+    ctx: Any,
+    provider: str,
+    model: str,
+    active_provider: str,
+    active_model: str,
+) -> ModelState:
+    if provider == active_provider and model == active_model and _llm_configuration(ctx) == "ready":
+        return ModelState.READY
+
+    if provider in LOCAL_PROVIDERS:
+        return ModelState.UNKNOWN
+
+    if provider == "openai-compatible":
+        return ModelState.UNKNOWN
+
+    env_name = PROVIDER_API_KEY_ENVS.get(provider)
+    if env_name and not os.environ.get(env_name):
+        return ModelState.AUTH_REQUIRED
+
+    return ModelState.UNKNOWN
+
+
+def _provider_access_label(provider: str) -> str:
+    if provider in LOCAL_PROVIDERS:
+        return "local app, no login"
+    if provider == "openai-compatible":
+        return "endpoint required"
+    if provider in {"deepseek", "glm"}:
+        return "sign in or API key"
+    return "sign in or API key"
+
+
+def _model_source_label(provider: str) -> str:
+    return PROVIDER_DISPLAY_NAMES.get(provider, provider)
 
 
 def _status_text(ctx: AppContext) -> str:
@@ -755,27 +1622,63 @@ def _status_text(ctx: AppContext) -> str:
         for item in getattr(ctx.session, "pending_approvals", [])
         if isinstance(item, dict) and item.get("status") == "pending"
     ]
-    return "\n".join([
+    lines = [
         f"Session: {ctx.session_id}",
         f"Root: {ctx.workspace_root}",
-        f"Provider: {_active_provider(ctx)}",
         f"Model: {ctx.llm.model}",
+        f"Model source: {_model_source_label(_active_provider(ctx))}",
         f"Mode: {_llm_mode(ctx)}",
-        f"Endpoint: {_llm_endpoint(ctx)}",
         f"Configuration: {_llm_configuration(ctx)}",
-        f"Pending approvals: {len(pending_approvals)}",
-    ])
+    ]
+    lines.extend(_status_context_lines(ctx))
+    lines.append(f"Pending approvals: {len(pending_approvals)}")
+    return "\n".join(lines)
+
+
+def _status_context_lines(ctx: Any) -> list[str]:
+    model = str(getattr(getattr(ctx, "llm", None), "model", "") or "")
+    context_limit = _context_window_for_model(model)
+    session_info = _ctx_session_info(ctx)
+    if session_info is None:
+        total_tokens = 0
+        cost_usd = 0.0
+    else:
+        total_tokens = _billable_token_total(session_info.tokens)
+        cost_usd = session_info.cost_usd
+
+    lines = [f"Tokens used: {_format_count(total_tokens)}"]
+    if context_limit is None:
+        lines.append("Context left: n/a")
+    else:
+        context_left = max(0, context_limit - total_tokens)
+        lines.append(f"Context left: {_format_count(context_left)} / {_format_count(context_limit)}")
+        lines.append(f"Context used: {_format_percent(_usage_percent(total_tokens, context_limit))}")
+    lines.append(f"Cost: {_format_cost(cost_usd)}")
+    return lines
+
+
+def _ctx_session_info(ctx: Any) -> SessionInfo | None:
+    store = getattr(ctx, "store", None)
+    session_id = getattr(ctx, "session_id", None)
+    if store is None or not session_id or not hasattr(store, "get_session"):
+        return None
+    try:
+        return store.get_session(session_id)
+    except Exception:
+        return None
 
 
 def _connect_text() -> str:
     return "\n".join([
-        "Provider setup:",
-        "OpenAI: set OPENAI_API_KEY, then /provider openai [model]",
-        "Anthropic: set ANTHROPIC_API_KEY, then /provider anthropic [model]",
-        "DeepSeek hosted: set DEEPSEEK_API_KEY, then /provider deepseek [model]",
-        "GLM hosted: set GLM_API_KEY or ZAI_API_KEY, then /provider glm [model]",
-        "Ollama local: start Ollama, pull a model, then /provider ollama <model>",
-        "LM Studio local: start the local server, then /provider lmstudio <model>",
+        "Model setup:",
+        "OpenAI: /login openai, then /apikey openai (OPENAI_API_KEY)",
+        "Anthropic: /login anthropic, then /apikey anthropic (ANTHROPIC_API_KEY)",
+        "DeepSeek hosted: /login deepseek, then /apikey deepseek (DEEPSEEK_API_KEY)",
+        "GLM hosted: /login glm, then /apikey glm (GLM_API_KEY)",
+        "Ollama local: install Ollama, run `ollama pull <model>`, then /model ollama <model>",
+        "LM Studio local: install LM Studio, load a model, start the local server, then /model lmstudio <model>",
+        "Local models are not bundled with Nym; the local app owns download, storage, and runtime.",
+        "Persistent keys: export the model source environment variable before starting nym.",
     ])
 
 
@@ -792,6 +1695,136 @@ def _llm_endpoint(ctx: AppContext) -> str:
 def _llm_configuration(ctx: AppContext) -> str:
     error = getattr(getattr(ctx, "llm", None), "configuration_error", None)
     return str(error) if error else "ready"
+
+
+def _persist_llm_config(ctx: Any) -> None:
+    store = getattr(ctx, "store", None)
+    session_id = getattr(ctx, "session_id", None)
+    if store is None or not session_id or not hasattr(store, "update_llm_config"):
+        return
+    store.update_llm_config(
+        session_id,
+        provider=getattr(getattr(ctx, "llm", None), "provider", None),
+        model=getattr(getattr(ctx, "llm", None), "model", None),
+    )
+
+
+def _set_provider_api_key(ctx: Any, provider: str, api_key: str) -> str:
+    try:
+        normalized = _normalize_provider(provider)
+    except ValueError as exc:
+        return str(exc)
+
+    env_name = PROVIDER_API_KEY_ENVS.get(normalized)
+    if env_name is None:
+        return f"{_model_source_label(normalized)} does not use an API key."
+
+    os.environ[env_name] = api_key
+    active_provider = _active_provider(ctx)
+    pending_provider = getattr(ctx, "pending_provider", None)
+    pending_model = getattr(ctx, "pending_model", None)
+    reload_provider = pending_provider if pending_provider == normalized else active_provider
+
+    if reload_provider == normalized:
+        current_model = getattr(getattr(ctx, "llm", None), "model", None)
+        reload_model = pending_model if pending_provider == normalized else current_model
+        try:
+            ctx.llm = LLMClient(model=reload_model, provider=reload_provider)
+            ctx.pending_provider = None
+            ctx.pending_model = None
+            _persist_llm_config(ctx)
+        except Exception as exc:
+            return f"{_model_source_label(normalized)} key loaded, but reload failed: {exc}"
+
+    return (
+        f"{_model_source_label(normalized)} key loaded.\n"
+        f"Configuration: {_llm_configuration(ctx)}"
+    )
+
+
+def _provider_api_key_needed(
+    ctx: Any,
+) -> str | None:
+    pending_provider = getattr(
+        ctx,
+        "pending_provider",
+        None,
+    )
+
+    if pending_provider:
+        if pending_provider in LOCAL_PROVIDERS:
+            return None
+
+        if pending_provider in PROVIDER_API_KEY_ENVS:
+            return pending_provider
+
+        return None
+
+    provider = _active_provider(ctx)
+
+    if provider in LOCAL_PROVIDERS:
+        return None
+
+    if _llm_configuration(ctx) == "ready":
+        return None
+
+    if provider == "openai-compatible":
+        return None
+
+    if provider in PROVIDER_API_KEY_ENVS:
+        return provider
+
+    return None
+
+
+def _login_provider(ctx: Any, provider: str) -> str:
+    try:
+        normalized = _normalize_provider(provider)
+    except ValueError as exc:
+        return str(exc)
+
+    url = PROVIDER_LOGIN_URLS.get(normalized)
+    display_name = PROVIDER_DISPLAY_NAMES.get(normalized, normalized)
+    if url is None:
+        if normalized in {"ollama", "lmstudio"}:
+            return f"{display_name} is local. Start its local server, then use /model {normalized} <model>."
+        return f"No login URL is configured for {normalized}."
+
+    opened = False
+    try:
+        opened = bool(webbrowser.open(url, new=2, autoraise=True))
+    except Exception:
+        opened = False
+
+    status = "Opened" if opened else "Open"
+    active_hint = ""
+    if normalized == _active_provider(ctx):
+        active_hint = f"\nAfter creating a key, return here and run: /apikey {normalized}"
+    return f"{status} {display_name} account/API-key page:\n{url}{active_hint}"
+
+
+def _api_key_prompt_provider(text: str) -> str | None:
+    parts = text.strip().split()
+    if len(parts) != 2 or parts[0].casefold() not in {"/apikey", "/key"}:
+        return None
+    try:
+        return _normalize_provider(parts[1])
+    except ValueError:
+        return None
+
+
+
+
+def _starts_auth_candidate(text: str) -> bool:
+    normalized = text.strip().casefold()
+    return normalized.startswith("/provider ") or normalized.startswith("/model ")
+
+
+def _redact_local_command(text: str) -> str:
+    parts = text.strip().split()
+    if len(parts) >= 3 and parts[0].casefold() in {"/apikey", "/key"}:
+        return f"{parts[0]} {parts[1]} <redacted>"
+    return text
 
 
 def _is_exit_command(value: str) -> bool:
@@ -943,7 +1976,7 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
     curses.curs_set(1)
     stdscr.keypad(True)
     stdscr.nodelay(True)
-    _setup_tui_colors()
+    _setup_tui_colors(stdscr)
 
     prompt = ""
     prompt_history: list[str] = []
@@ -959,6 +1992,8 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
     active_prompt: str | None = None
     queued_prompts: deque[str] = deque()
     palette_index = 0
+    secret_provider: str | None = None
+    secret_value = ""
 
     def launch_turn(user_prompt: str, *, queue_if_busy: bool = True) -> None:
         nonlocal worker, worker_error, active_prompt, status
@@ -1019,13 +2054,13 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             live_turn.snapshot(),
             max(20, content_width - 2),
         )
-        palette_entries = _slash_palette_entries(prompt)
+        palette_entries = [] if secret_provider else _slash_palette_entries(prompt)
         if palette_entries:
             palette_index = min(palette_index, len(palette_entries) - 1)
         else:
             palette_index = 0
         command_palette = _slash_command_lines(prompt, max(20, content_width - 2), selected_index=palette_index)
-        palette_height = min(5, len(command_palette))
+        palette_height = min(9, len(command_palette))
 
         header_height = 3
         status_y = max(header_height + 1, height - 3)
@@ -1074,12 +2109,14 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             worker_alive=worker is not None and worker.is_alive(),
             error=worker_error,
             usage_summary=None if show_usage_panel else _compact_usage_text(session_info, ctx.llm.model, _active_provider(ctx)),
+            auth_active=secret_provider is not None,
         )
         _draw_input_line(
             stdscr,
             input_y,
             width,
-            prompt,
+            "*" * len(secret_value) if secret_provider else prompt,
+            label=f" {secret_provider} key> " if secret_provider else " nym> ",
         )
         stdscr.refresh()
 
@@ -1089,6 +2126,11 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             continue
 
         if key == 3:  # Ctrl+C
+            if secret_provider:
+                secret_provider = None
+                secret_value = ""
+                status = "API key entry cancelled"
+                continue
             if worker is not None and worker.is_alive():
                 canceled = ctx.rust.cancel_active()
                 status = "Cancelling..." if canceled else "Cancellation requested"
@@ -1097,6 +2139,12 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
 
         if key == 17:  # Ctrl+Q
             break
+
+        if key == 15:  # Ctrl+O
+            if secret_provider:
+                login_answer = _login_provider(ctx, secret_provider)
+                status = truncate(login_answer, 80)
+            continue
 
         if key == 1:  # Ctrl+A
             if approval_queue.approve_selected():
@@ -1121,6 +2169,26 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             continue
 
         if key in (10, 13):  # Enter
+            if secret_provider:
+                provider = secret_provider
+                api_key = secret_value.strip()
+                secret_provider = None
+                secret_value = ""
+                if not api_key:
+                    status = "API key entry cancelled"
+                    continue
+                local_answer = _set_provider_api_key(ctx, provider, api_key)
+                logged_candidate = f"/apikey {provider} <redacted>"
+                prompt_history.append(logged_candidate)
+                history_index = None
+                transcript_at_bottom = True
+                transcript_scroll = 0
+                ctx.store.update_last_prompt(ctx.session_id, logged_candidate)
+                ctx.store.add_message(ctx.session_id, "user", logged_candidate)
+                ctx.store.add_message(ctx.session_id, "assistant", local_answer)
+                status = truncate(local_answer, 80)
+                continue
+
             candidate = prompt.strip()
             if candidate:
                 selected = _selected_palette_entry(prompt, palette_index)
@@ -1133,27 +2201,49 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
                         continue
                 if _is_exit_command(candidate):
                     break
-                prompt_history.append(candidate)
-                history_index = None
                 prompt = ""
                 transcript_at_bottom = True
                 transcript_scroll = 0
+                api_key_provider = _api_key_prompt_provider(candidate)
+                if api_key_provider:
+                    secret_provider = api_key_provider
+                    secret_value = ""
+                    prompt_history.append(candidate)
+                    history_index = None
+                    status = f"Paste {api_key_provider} API key. Input is hidden."
+                    continue
                 local_answer = _handle_local_command(ctx, candidate)
                 if local_answer is not None:
-                    ctx.store.update_last_prompt(ctx.session_id, candidate)
-                    ctx.store.add_message(ctx.session_id, "user", candidate)
+                    logged_candidate = _redact_local_command(candidate)
+                    prompt_history.append(logged_candidate)
+                    history_index = None
+                    ctx.store.update_last_prompt(ctx.session_id, logged_candidate)
+                    ctx.store.add_message(ctx.session_id, "user", logged_candidate)
                     ctx.store.add_message(ctx.session_id, "assistant", local_answer)
-                    status = truncate(local_answer, 80)
+                    auth_provider = _provider_api_key_needed(ctx)
+                    if auth_provider and _starts_auth_candidate(candidate):
+                        secret_provider = auth_provider
+                        secret_value = ""
+                        status = f"{auth_provider} needs a key. Paste it here; Ctrl+O opens account/API keys."
+                    else:
+                        status = truncate(local_answer, 80)
                 else:
+                    prompt_history.append(candidate)
+                    history_index = None
                     launch_turn(candidate)
             continue
 
         if key in (curses.KEY_BACKSPACE, 127, 8):
-            prompt = prompt[:-1]
+            if secret_provider:
+                secret_value = secret_value[:-1]
+            else:
+                prompt = prompt[:-1]
             palette_index = 0
             continue
 
         if key == 9:  # Tab
+            if secret_provider:
+                continue
             completed = _complete_slash_command(prompt)
             if completed is not None:
                 prompt = completed
@@ -1161,6 +2251,8 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             continue
 
         if key == curses.KEY_UP:
+            if secret_provider:
+                continue
             if palette_entries:
                 palette_index = max(0, palette_index - 1)
             elif prompt:
@@ -1180,6 +2272,8 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             continue
 
         if key == curses.KEY_DOWN:
+            if secret_provider:
+                continue
             if palette_entries:
                 palette_index = min(len(palette_entries) - 1, palette_index + 1)
             elif prompt:
@@ -1214,27 +2308,36 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             continue
 
         if 32 <= key <= 126:
-            prompt += chr(key)
+            if secret_provider:
+                secret_value += chr(key)
+            else:
+                char = chr(key)
+                prompt += "/" if char == "\\" and not prompt else char
             palette_index = 0
             continue
 
 
-def _setup_tui_colors() -> None:
+def _setup_tui_colors(stdscr: Any | None = None) -> None:
     try:
         curses.use_default_colors()
     except curses.error:
-        return
+        pass
     if not _has_tui_colors():
         return
     curses.start_color()
+    theme = os.environ.get("NYM_TUI_THEME", "").strip().casefold()
+    light_theme = theme == "light"
+    background = curses.COLOR_WHITE if light_theme else -1
+    text = curses.COLOR_BLACK if light_theme else curses.COLOR_WHITE
+    muted = curses.COLOR_BLUE if light_theme else curses.COLOR_WHITE
     pairs = [
-        (COLOR_HEADER, curses.COLOR_CYAN, -1),
-        (COLOR_USER, curses.COLOR_GREEN, -1),
-        (COLOR_ASSISTANT, curses.COLOR_WHITE, -1),
-        (COLOR_THINKING, curses.COLOR_MAGENTA, -1),
-        (COLOR_GUARDRAIL, curses.COLOR_YELLOW, -1),
-        (COLOR_MUTED, curses.COLOR_BLUE, -1),
-        (COLOR_ERROR, curses.COLOR_RED, -1),
+        (COLOR_HEADER, curses.COLOR_BLUE if light_theme else curses.COLOR_CYAN, background),
+        (COLOR_USER, text, background),
+        (COLOR_ASSISTANT, text, background),
+        (COLOR_THINKING, curses.COLOR_MAGENTA if light_theme else curses.COLOR_YELLOW, background),
+        (COLOR_GUARDRAIL, curses.COLOR_MAGENTA if light_theme else curses.COLOR_YELLOW, background),
+        (COLOR_MUTED, muted, background),
+        (COLOR_ERROR, curses.COLOR_RED, background),
     ]
     for pair, foreground, background in pairs:
         try:
@@ -1261,7 +2364,7 @@ def _draw_header(stdscr: Any, ctx: AppContext, width: int) -> None:
     root_budget = max(12, width - 58)
     title = " nym "
     detail = (
-        f"session {ctx.session_id}  provider {_active_provider(ctx)}  model {ctx.llm.model}  "
+        f"session {ctx.session_id}  source {_model_source_label(_active_provider(ctx))}  model {ctx.llm.model}  "
         f"root {truncate(str(ctx.workspace_root), root_budget)}"
     )
     stdscr.addnstr(0, 0, title, width - 1, _tui_attr(COLOR_HEADER, curses.A_BOLD))
@@ -1311,20 +2414,22 @@ def _slash_command_lines(prompt: str, width: int, *, selected_index: int = 0) ->
         return []
     title = _slash_palette_title(prompt)
     lines = [_clip_line(title, width)]
-    for index, entry in enumerate(entries[:4]):
+    for index, entry in enumerate(entries[:8]):
         marker = ">" if index == selected_index else " "
         lines.append(_clip_line(f"{marker} {entry.label:<16} {entry.description}", width))
     return lines
 
 
 def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
+    prompt = _normalized_command_prompt(prompt)
     if not prompt.startswith("/"):
         return []
 
     stripped = prompt.strip()
     parts = stripped.split()
-    if _is_provider_palette_prompt(prompt, parts):
-        return _provider_palette_entries(parts[1] if len(parts) >= 2 else "")
+    provider_command = _provider_argument_command(prompt, parts)
+    if provider_command is not None:
+        return _provider_palette_entries(provider_command, parts[1] if len(parts) >= 2 else "")
     if _is_model_palette_prompt(prompt, parts):
         return _model_palette_entries(parts[1] if len(parts) >= 2 else "")
 
@@ -1334,8 +2439,8 @@ def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
             value=name,
             label=name,
             description=description,
-            complete_to=f"{name} " if name in {"/provider", "/model"} else name,
-            execute=name not in {"/provider", "/model"},
+            complete_to=_slash_command_complete_to(name),
+            execute=_slash_command_executes(name),
         )
         for name, description in LOCAL_COMMANDS
         if name.casefold().startswith(query)
@@ -1347,65 +2452,98 @@ def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
                 value=name,
                 label=name,
                 description=description,
-                complete_to=f"{name} " if name in {"/provider", "/model"} else name,
-                execute=name not in {"/provider", "/model"},
+                complete_to=_slash_command_complete_to(name),
+                execute=_slash_command_executes(name),
             )
             for name, description in LOCAL_COMMANDS
         ]
     return matches
 
 
-def _provider_palette_entries(query: str) -> list[PaletteEntry]:
+def _slash_command_complete_to(name: str) -> str:
+    if name == "/models":
+        return "/model "
+    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model"}:
+        return f"{name} "
+    return name
+
+
+def _slash_command_executes(name: str) -> bool:
+    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/models"}
+
+
+def _provider_palette_entries(command: str, query: str) -> list[PaletteEntry]:
     normalized = query.casefold()
-    providers = sorted(SUPPORTED_PROVIDERS)
+    providers = sorted(
+        SUPPORTED_PROVIDERS,
+        key=lambda item: PROVIDER_SORT_ORDER.get(item, 99),
+    )
     matches = [provider for provider in providers if provider.casefold().startswith(normalized)]
     if not matches:
         matches = providers
     return [
         PaletteEntry(
             value=provider,
-            label=provider,
-            description=f"default model: {PROVIDER_MODEL_HINTS.get(provider, ('custom-model',))[0]}",
-            complete_to=f"/provider {provider}",
+            label=_model_source_label(provider),
+            description=_provider_palette_description(command, provider),
+            complete_to=f"{command} {provider}",
             execute=True,
         )
         for provider in matches
     ]
 
 
+def _provider_palette_description(command: str, provider: str) -> str:
+    if command in {"/apikey", "/key"}:
+        env_name = PROVIDER_API_KEY_ENVS.get(provider)
+        return f"load {env_name}" if env_name else "no API key"
+    if command in {"/login", "/auth"}:
+        return "open account/API keys" if provider in PROVIDER_LOGIN_URLS else "local app"
+    return f"default model: {PROVIDER_MODEL_HINTS.get(provider, ('custom-model',))[0]}"
+
+
 def _model_palette_entries(query: str) -> list[PaletteEntry]:
     normalized = query.casefold()
-    models = sorted({model for hints in PROVIDER_MODEL_HINTS.values() for model in hints})
-    matches = [model for model in models if model.casefold().startswith(normalized)]
+    options = _model_options()
+    matches = [
+        option for option in options
+        if option["model"].casefold().startswith(normalized)
+        or option["provider"].casefold().startswith(normalized)
+    ]
     if not matches:
-        matches = models
+        matches = options
     return [
         PaletteEntry(
-            value=model,
-            label=model,
-            description="switch active provider to this model",
-            complete_to=f"/model {model}",
+            value=f"{option['provider']}/{option['model']}",
+            label=option["model"],
+            description=f"{_model_source_label(option['provider'])}: {_provider_access_label(option['provider'])}",
+            complete_to=f"/model {option['provider']} {option['model']}",
             execute=True,
         )
-        for model in matches
+        for option in matches
     ]
 
 
 def _slash_palette_title(prompt: str) -> str:
+    prompt = _normalized_command_prompt(prompt)
     stripped = prompt.strip()
     parts = stripped.split()
-    if _is_provider_palette_prompt(prompt, parts):
-        return "Providers"
+    if _provider_argument_command(prompt, parts) is not None:
+        return "Model sources"
     if _is_model_palette_prompt(prompt, parts):
         return "Models"
     return "Commands"
 
 
-def _is_provider_palette_prompt(prompt: str, parts: list[str]) -> bool:
-    return (
-        len(parts) <= 2
-        and (prompt.startswith("/provider ") or (len(parts) >= 1 and parts[0].casefold() == "/provider" and prompt.endswith(" ")))
-    )
+def _provider_argument_command(prompt: str, parts: list[str]) -> str | None:
+    if not parts:
+        return None
+    command = parts[0].casefold()
+    if command not in PROVIDER_ARGUMENT_COMMANDS or len(parts) > 2:
+        return None
+    if prompt.startswith(f"{command} ") or prompt.endswith(" "):
+        return command
+    return None
 
 
 def _is_model_palette_prompt(prompt: str, parts: list[str]) -> bool:
@@ -1423,8 +2561,10 @@ def _selected_palette_entry(prompt: str, selected_index: int) -> PaletteEntry | 
 
 
 def _complete_slash_command(prompt: str) -> str | None:
+    prompt = _normalized_command_prompt(prompt)
     selected = _selected_palette_entry(prompt, 0)
-    if selected is not None and (prompt.startswith("/provider ") or prompt.startswith("/model ")):
+    parts = prompt.strip().split()
+    if selected is not None and (_provider_argument_command(prompt, parts) is not None or prompt.startswith("/model ")):
         return selected.complete_to
     if not prompt.startswith("/") or " " in prompt:
         return None
@@ -1433,6 +2573,12 @@ def _complete_slash_command(prompt: str) -> str | None:
     if len(matches) == 1:
         return f"{matches[0]} "
     return None
+
+
+def _normalized_command_prompt(prompt: str) -> str:
+    if prompt.startswith("\\"):
+        return f"/{prompt[1:]}"
+    return prompt
 
 
 def _draw_command_palette(stdscr: Any, y: int, lines: list[str], width: int) -> None:
@@ -1496,7 +2642,7 @@ def _panel_line_attr(line: str) -> int:
         return _tui_attr(COLOR_HEADER, curses.A_BOLD)
     if line.startswith("> "):
         return _tui_attr(COLOR_HEADER, curses.A_BOLD)
-    if line.startswith("Provider") or line.startswith("Model"):
+    if line.startswith("Source") or line.startswith("Provider") or line.startswith("Model"):
         return _tui_attr(COLOR_ASSISTANT, curses.A_BOLD)
     if line.startswith("Context") or line.startswith("Tokens") or line.startswith("Cost"):
         return _tui_attr(COLOR_ASSISTANT, curses.A_BOLD)
@@ -1513,7 +2659,7 @@ def _usage_panel_lines(session: SessionInfo, model: str, provider: str, width: i
     lines = [
         "Usage",
         "",
-        f"Provider   {provider}",
+        f"Source     {_model_source_label(provider)}",
         f"Model      {model}",
         "",
         f"Tokens     {_format_count(total_tokens)}",
@@ -1649,6 +2795,7 @@ def _draw_status_line(
     worker_alive: bool,
     error: str | None,
     usage_summary: str | None = None,
+    auth_active: bool = False,
 ) -> None:
     footer = f" {status}"
     if worker_alive:
@@ -1660,7 +2807,11 @@ def _draw_status_line(
         footer = f"{footer}  {truncate(error, max(0, width - 18))}"
     if usage_summary:
         footer = f"{footer}  {usage_summary}"
-    help_text = "Ctrl+C cancel/exit  PgUp/PgDn scroll  Ctrl+A approve  Ctrl+D deny  Ctrl+N/P select"
+    help_text = (
+        "Enter save key  Ctrl+O open account  Ctrl+C cancel"
+        if auth_active
+        else "Ctrl+C cancel/exit  PgUp/PgDn scroll  Ctrl+A approve  Ctrl+D deny"
+    )
     gap = max(1, width - len(footer) - len(help_text) - 1)
     line = f"{footer}{' ' * gap}{help_text}"
     attr = _tui_attr(COLOR_ERROR, curses.A_BOLD) if error else _tui_attr(COLOR_MUTED)
@@ -1672,8 +2823,9 @@ def _draw_input_line(
     y: int,
     width: int,
     prompt: str,
+    *,
+    label: str = " nym> ",
 ) -> None:
-    label = " nym> "
     body_width = max(0, width - len(label))
     visible_prompt = prompt[-body_width:]
     line = f"{label}{visible_prompt}"

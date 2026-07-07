@@ -46,6 +46,7 @@ create table if not exists sessions (
     cwd text,
     created_at text not null,
     updated_at text not null,
+    provider text,
     model text,
     agent text,
     permission_json text,
@@ -140,6 +141,7 @@ class SessionInfo:
     cwd: str | None
     created_at: str
     updated_at: str
+    provider: str | None
     model: str | None
     agent: str | None
     permission: dict[str, Any] | None
@@ -190,6 +192,7 @@ class SessionStore:
         self,
         *,
         workspace_root: Path,
+        provider: str | None = None,
         model: str | None = None,
         title: str | None = None,
     ) -> SessionInfo:
@@ -205,12 +208,12 @@ class SessionStore:
                 """
                 insert into sessions (
                     id, project_id, workspace_id, title, workspace_root, cwd,
-                    created_at, updated_at, model, agent, permission_json,
+                    created_at, updated_at, provider, model, agent, permission_json,
                     cost_usd, tokens_input, tokens_output, tokens_reasoning,
                     tokens_cache_read, tokens_cache_write,
                     summary, active_root, focus_path, last_prompt, state_json
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0,
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0,
                         null, null, null, null, null)
                 """,
                 (
@@ -222,6 +225,7 @@ class SessionStore:
                     str(workspace_root),
                     now,
                     now,
+                    provider,
                     model,
                     "nym",
                     json.dumps(DEFAULT_PERMISSION, ensure_ascii=False),
@@ -235,7 +239,7 @@ class SessionStore:
             row = conn.execute(
                 """
                 select id, project_id, workspace_id, title, workspace_root, cwd,
-                       created_at, updated_at, model, agent, permission_json,
+                       created_at, updated_at, provider, model, agent, permission_json,
                        cost_usd, tokens_input, tokens_output, tokens_reasoning,
                        tokens_cache_read, tokens_cache_write,
                        summary, active_root, focus_path, last_prompt, state_json
@@ -257,7 +261,7 @@ class SessionStore:
             rows = conn.execute(
                 """
                 select id, project_id, workspace_id, title, workspace_root, cwd,
-                       created_at, updated_at, model, agent, permission_json,
+                       created_at, updated_at, provider, model, agent, permission_json,
                        cost_usd, tokens_input, tokens_output, tokens_reasoning,
                        tokens_cache_read, tokens_cache_write,
                        summary, active_root, focus_path, last_prompt, state_json
@@ -269,6 +273,28 @@ class SessionStore:
             ).fetchall()
 
         return [session_from_row(row) for row in rows]
+
+    def update_llm_config(
+        self,
+        session_id: str,
+        *,
+        provider: str | None,
+        model: str | None,
+    ) -> None:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                update sessions
+                set provider = ?,
+                    model = ?,
+                    updated_at = ?
+                where id = ?
+                """,
+                (provider, model, now, session_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Session not found: {session_id}")
 
     def resolve_session_id(self, prefix: str) -> str:
         prefix = prefix.strip()
@@ -574,6 +600,7 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         "project_id": "text",
         "workspace_id": "text",
         "cwd": "text",
+        "provider": "text",
         "agent": "text",
         "permission_json": "text",
         "cost_usd": "real not null default 0",
@@ -742,6 +769,7 @@ def session_from_row(row: sqlite3.Row) -> SessionInfo:
         cwd=row["cwd"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        provider=row["provider"],
         model=row["model"],
         agent=row["agent"],
         permission=permission if isinstance(permission, dict) else None,
