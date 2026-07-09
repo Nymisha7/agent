@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from nym_agent.main import (
@@ -16,6 +17,8 @@ from nym_agent.main import (
     _render_tui_transcript,
     _slash_command_lines,
     _slash_palette_entries,
+    _tui_bridge_completions,
+    _tui_bridge_snapshot,
     _usage_panel_lines,
     run_tui,
 )
@@ -23,13 +26,25 @@ from nym_agent.session_store import TokenUsage
 
 
 class TuiExitTests(unittest.TestCase):
-    def test_run_tui_handles_ctrl_c_without_error(self) -> None:
+    def test_run_tui_launches_ratatui_subcommand(self) -> None:
+        ctx = SimpleNamespace(
+            rust=SimpleNamespace(rust_bin=Path("/tmp/nym-rust")),
+            session_id="abc123",
+            language_servers=None,
+        )
+
         with (
             patch("nym_agent.main.sys.stdin.isatty", return_value=True),
             patch("nym_agent.main.sys.stdout.isatty", return_value=True),
-            patch("nym_agent.main.curses.wrapper", side_effect=KeyboardInterrupt),
+            patch("nym_agent.main.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run_subprocess,
         ):
-            self.assertEqual(run_tui(SimpleNamespace()), 0)
+            self.assertEqual(run_tui(ctx), 0)
+
+        command = run_subprocess.call_args.args[0]
+        self.assertEqual(command[0], "/tmp/nym-rust")
+        self.assertEqual(command[1], "tui")
+        self.assertIn("--session-id", command)
+        self.assertIn("abc123", command)
 
     def test_queue_status_shows_pending_prompt_count(self) -> None:
         self.assertEqual(_queue_status("Thinking...", 0), "Thinking...")
@@ -37,6 +52,40 @@ class TuiExitTests(unittest.TestCase):
 
 
 class TuiRenderingTests(unittest.TestCase):
+    def test_tui_bridge_completions_returns_model_command_entries(self) -> None:
+        payload = _tui_bridge_completions("/mo")
+
+        self.assertEqual(payload["title"], "Commands")
+        self.assertEqual(payload["entries"][0]["label"], "/model")
+
+    def test_tui_bridge_snapshot_includes_pending_approvals(self) -> None:
+        ctx = SimpleNamespace(
+            session_id="abc123",
+            llm=SimpleNamespace(model="gpt-5.4-mini", provider="openai", mode="hosted", configuration_error=None),
+            session=SimpleNamespace(pending_approvals=[{
+                "id": "req-1",
+                "status": "pending",
+                "tool": "delete_path",
+                "requested_path": "/tmp/example.txt",
+            }]),
+            store=SimpleNamespace(
+                get_session=lambda _session_id: SimpleNamespace(
+                    id="abc123",
+                    title="Test",
+                    workspace_root="/workspace",
+                    updated_at="now",
+                    cost_usd=0.0,
+                    tokens=TokenUsage(),
+                ),
+                list_messages=lambda _session_id, limit=None: [],
+            ),
+        )
+
+        snapshot = _tui_bridge_snapshot(ctx)
+
+        self.assertEqual(snapshot["approvals"][0]["id"], "req-1")
+        self.assertEqual(snapshot["approvals"][0]["tool"], "delete_path")
+
     def test_render_tui_transcript_shows_historical_messages(self) -> None:
         messages = [
             SimpleNamespace(role="user", content="hi", created_at="now"),
@@ -104,7 +153,7 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertIn("Tool: delete_path", text)
         self.assertIn("Guardrail: external_path_requires_approval", text)
 
-    def test_live_turn_does_not_render_raw_reasoning_delta(self) -> None:
+    def test_live_turn_renders_raw_reasoning_before_answer_text(self) -> None:
         live_turn = LiveTurnState()
         live_turn.start("inspect the repo")
         live_turn.update({
@@ -115,7 +164,24 @@ class TuiRenderingTests(unittest.TestCase):
         rendered = _render_tui_transcript([], live_turn.snapshot(), 80)
         text = "\n".join(rendered)
 
-        self.assertIn("Thinking through the next step", text)
+        self.assertIn("private detailed chain of thought", text)
+
+    def test_live_turn_hides_reasoning_after_answer_text_starts(self) -> None:
+        live_turn = LiveTurnState()
+        live_turn.start("inspect the repo")
+        live_turn.update({
+            "kind": "reasoning_delta",
+            "delta": "private detailed chain of thought",
+        })
+        live_turn.update({
+            "kind": "text_delta",
+            "delta": "Here is the answer",
+        })
+
+        rendered = _render_tui_transcript([], live_turn.snapshot(), 80)
+        text = "\n".join(rendered)
+
+        self.assertIn("Here is the answer", text)
         self.assertNotIn("private detailed chain of thought", text)
 
     def test_usage_panel_shows_tokens_context_and_cost(self) -> None:
@@ -172,7 +238,6 @@ class TuiRenderingTests(unittest.TestCase):
         text = "\n".join(lines)
 
         self.assertIn("Commands", text)
-        self.assertIn("/models", text)
         self.assertIn("/model", text)
         self.assertNotIn("/providers", text)
         self.assertNotIn("/provider", text)
@@ -183,13 +248,12 @@ class TuiRenderingTests(unittest.TestCase):
         text = "\n".join(lines)
 
         self.assertIn("/model", text)
-        self.assertIn("/models", text)
         self.assertNotIn("/providers", text)
 
-    def test_models_palette_opens_model_picker(self) -> None:
-        entries = _slash_palette_entries("/models")
+    def test_model_command_opens_model_picker(self) -> None:
+        entries = _slash_palette_entries("/model")
 
-        self.assertEqual(entries[0].value, "/models")
+        self.assertEqual(entries[0].value, "/model")
         self.assertFalse(entries[0].execute)
         self.assertEqual(entries[0].complete_to, "/model ")
 
@@ -215,27 +279,37 @@ class TuiRenderingTests(unittest.TestCase):
         entries = _slash_palette_entries("/model llama")
 
         self.assertEqual(entries[0].value, "ollama/llama3.3")
-        self.assertIn("local app, no login", entries[0].description)
+        self.assertIn("local app, install outside workspace", entries[0].description)
         self.assertEqual(_complete_slash_command("/model llama"), "/model ollama llama3.3")
 
-    def test_model_palette_defaults_to_local_open_models_first(self) -> None:
+    def test_model_palette_defaults_to_hosted_models_first(self) -> None:
         entries = _slash_palette_entries("/model ")
 
-        self.assertEqual(entries[0].value, "ollama/qwen3.6")
-        self.assertIn("local app, no login", entries[0].description)
+        self.assertEqual(entries[0].value, "openai/gpt-5.5")
+        self.assertIn("sign in or API key", entries[0].description)
+
+    def test_model_palette_scrolls_to_selected_entry(self) -> None:
+        entries = _slash_palette_entries("/model ")
+        selected_index = 12
+
+        lines = _slash_command_lines("/model ", 80, selected_index=selected_index)
+        text = "\n".join(lines)
+
+        self.assertIn(f"> {entries[selected_index].label}", text)
+        self.assertNotIn(f"> {entries[0].label}", text)
 
     def test_provider_palette_does_not_override_explicit_model(self) -> None:
         entries = _slash_palette_entries("/provider ollama llama3.1")
 
-        self.assertEqual(entries[0].value, "/models")
+        self.assertEqual(entries[0].value, "/model")
         self.assertFalse(entries[0].execute)
 
 
 class LocalCommandTests(unittest.TestCase):
-    def test_models_command_lists_available_model_sources(self) -> None:
+    def test_model_command_lists_available_model_sources(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o", mode="hosted", endpoint="OpenAI", configuration_error=None))
 
-        result = _handle_local_command(ctx, "/models")
+        result = _handle_local_command(ctx, "/model")
 
         self.assertIsNotNone(result)
         self.assertIn("Model source: OpenAI", result)
@@ -243,16 +317,24 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("DeepSeek", result)
         self.assertIn("GLM", result)
 
-    def test_models_command_does_not_probe_model_endpoints(self) -> None:
+    def test_models_alias_still_opens_model_picker(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o", mode="hosted", endpoint="OpenAI", configuration_error=None))
+
+        result = _handle_local_command(ctx, "/models")
+
+        self.assertIn("Model source: OpenAI", result)
+        self.assertIn("Switch model: /model <model>", result)
+
+    def test_model_command_does_not_probe_model_endpoints(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o", mode="hosted", endpoint="OpenAI", configuration_error=None))
 
         with patch("nym_agent.main._discover_provider_models", side_effect=AssertionError("network probe")):
-            result = _handle_local_command(ctx, "/models")
+            result = _handle_local_command(ctx, "/model")
 
         self.assertIn("gpt-5.5", result)
         self.assertIn("qwen3.6", result)
         self.assertIn("OpenAI", result)
-        self.assertIn("Ollama - local app, no login", result)
+        self.assertIn("Ollama - local app, install outside workspace", result)
 
     def test_provider_command_switches_provider_and_model(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
@@ -416,19 +498,20 @@ class LocalCommandTests(unittest.TestCase):
 
         client.assert_called_once_with(model="llama3.1", provider="ollama")
         self.assertEqual(ctx.llm.provider, "ollama")
-        self.assertIn("local app, no login", result)
+        self.assertIn("local app, install outside workspace", result)
 
-    def test_models_command_lists_provider_model_hints(self) -> None:
+    def test_model_command_lists_provider_model_hints(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="deepseek", model="deepseek-chat"))
 
-        result = _handle_local_command(ctx, "/models")
+        result = _handle_local_command(ctx, "/model")
 
         self.assertIn("Model source: DeepSeek", result)
         self.assertIn("deepseek-v4-flash", result)
         self.assertIn("DeepSeek - sign in or API key", result)
         self.assertIn("qwen3.6", result)
-        self.assertIn("local app, no login", result)
+        self.assertIn("local app, install outside workspace", result)
         self.assertIn("/model <source> <model>", result)
+        self.assertIn("Local models are not installed in this workspace.", result)
 
     def test_status_command_shows_configuration_and_approvals(self) -> None:
         ctx = SimpleNamespace(
@@ -459,6 +542,7 @@ class LocalCommandTests(unittest.TestCase):
 
         self.assertIn("OPENAI_API_KEY", result)
         self.assertIn("Ollama local", result)
+        self.assertIn("not in this workspace", result)
 
     def test_slash_exit_aliases_are_exit_commands(self) -> None:
         self.assertTrue(_is_exit_command("/exit"))

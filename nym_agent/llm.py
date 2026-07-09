@@ -16,7 +16,14 @@ SUPPORTED_PROVIDERS = {
     "openai-compatible",
     "ollama",
     "lmstudio",
+    "copilot",
     "anthropic",
+    "gemini",
+    "groq",
+    "openrouter",
+    "bedrock",
+    "azure",
+    "vertexai",
     "deepseek",
     "glm",
 }
@@ -30,11 +37,15 @@ class LLMClient:
     endpoint: str = field(default="", init=False)
     mode: str = field(default="", init=False)
     configuration_error: str | None = field(default=None, init=False)
+    reasoning_effort: str | None = field(default=None, init=False)
+    reasoning_summary: str | None = field(default=None, init=False)
     turn_usage: dict[str, int] = field(default_factory=lambda: empty_usage(), init=False)
 
     def __post_init__(self) -> None:
         self.provider = _normalize_provider(self.provider or os.environ.get("NYM_LLM_PROVIDER") or "openai")
         self.model = self.model or _default_model_for_provider(self.provider)
+        self.reasoning_effort = _default_reasoning_effort(self.provider, self.model)
+        self.reasoning_summary = _default_reasoning_summary(self.provider, self.model)
         if self.provider == "openai":
             self.endpoint = "OpenAI"
             self.mode = "hosted"
@@ -78,6 +89,54 @@ class LLMClient:
             self.mode = "hosted"
             if not os.environ.get("ANTHROPIC_API_KEY"):
                 self.configuration_error = _provider_configuration_error("Anthropic", "ANTHROPIC_API_KEY")
+        elif self.provider == "gemini":
+            self.endpoint = "Google Gemini"
+            self.mode = "hosted"
+            if not os.environ.get("GOOGLE_API_KEY"):
+                self.configuration_error = _provider_configuration_error("Google Gemini", "GOOGLE_API_KEY")
+            else:
+                self.configuration_error = "Google Gemini transport is not implemented yet."
+        elif self.provider == "groq":
+            self.endpoint = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+            self.mode = "hosted"
+            api_key = os.environ.get("GROQ_API_KEY")
+            if api_key:
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint)
+            else:
+                self.configuration_error = _provider_configuration_error("Groq", "GROQ_API_KEY")
+        elif self.provider == "openrouter":
+            self.endpoint = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+            self.mode = "hosted"
+            api_key = os.environ.get("OPENROUTER_API_KEY")
+            if api_key:
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint)
+            else:
+                self.configuration_error = _provider_configuration_error("OpenRouter", "OPENROUTER_API_KEY")
+        elif self.provider == "azure":
+            self.endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "Azure OpenAI")
+            self.mode = "hosted"
+            if not os.environ.get("AZURE_OPENAI_API_KEY"):
+                self.configuration_error = _provider_configuration_error("Azure OpenAI", "AZURE_OPENAI_API_KEY")
+            else:
+                self.configuration_error = "Azure OpenAI transport is not implemented yet."
+        elif self.provider == "bedrock":
+            self.endpoint = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "AWS Bedrock"
+            self.mode = "hosted"
+            if not _has_bedrock_credentials():
+                self.configuration_error = "AWS Bedrock is not configured. Set AWS_PROFILE, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK."
+            else:
+                self.configuration_error = "AWS Bedrock transport is not implemented yet."
+        elif self.provider == "vertexai":
+            self.endpoint = os.environ.get("VERTEX_LOCATION") or os.environ.get("GOOGLE_CLOUD_LOCATION") or "Google Cloud Vertex AI"
+            self.mode = "hosted"
+            if not (os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT_ID")):
+                self.configuration_error = "Google Cloud Vertex AI is not configured. Set GOOGLE_CLOUD_PROJECT and authenticate with Application Default Credentials."
+            else:
+                self.configuration_error = "Google Cloud Vertex AI transport is not implemented yet."
+        elif self.provider == "copilot":
+            self.endpoint = "GitHub Copilot"
+            self.mode = "hosted"
+            self.configuration_error = "GitHub Copilot sign-in is not implemented yet."
         elif self.provider == "deepseek":
             self.endpoint = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
             self.mode = "hosted"
@@ -134,7 +193,7 @@ class LLMClient:
                 stream=stream,
                 event_handler=event_handler,
             )
-        if self.provider in {"openai-compatible", "ollama", "lmstudio", "deepseek", "glm"}:
+        if self.provider in {"openai-compatible", "ollama", "lmstudio", "groq", "openrouter", "deepseek", "glm"}:
             return self._respond_openai_chat(
                 instructions=instructions,
                 messages=messages,
@@ -170,6 +229,9 @@ class LLMClient:
         }
         if tool_choice is not None:
             request_args["tool_choice"] = tool_choice
+        reasoning = _responses_reasoning_config(self.provider, self.model, self.reasoning_effort, self.reasoning_summary)
+        if reasoning is not None:
+            request_args["reasoning"] = reasoning
 
         if stream:
             try:
@@ -208,6 +270,9 @@ class LLMClient:
         chat_tool_choice = _chat_tool_choice(tool_choice)
         if chat_tool_choice is not None:
             request_args["tool_choice"] = chat_tool_choice
+        reasoning_effort = _chat_reasoning_effort(self.provider, self.model, self.reasoning_effort)
+        if reasoning_effort is not None:
+            request_args["reasoning_effort"] = reasoning_effort
 
         try:
             response = self.client.chat.completions.create(**request_args)
@@ -321,6 +386,24 @@ def _normalize_provider(value: str) -> str:
         "claude": "anthropic",
         "deepseek-ai": "deepseek",
         "deepseek-chat": "deepseek",
+        "github-copilot": "copilot",
+        "github": "copilot",
+        "google": "gemini",
+        "google-gemini": "gemini",
+        "google-ai": "gemini",
+        "google-ai-studio": "gemini",
+        "google-vertex": "vertexai",
+        "google-vertex-ai": "vertexai",
+        "google-cloud-vertex": "vertexai",
+        "google-cloud-vertexai": "vertexai",
+        "gcp-vertex": "vertexai",
+        "vertex": "vertexai",
+        "vertex-ai": "vertexai",
+        "aws": "bedrock",
+        "aws-bedrock": "bedrock",
+        "amazon-bedrock": "bedrock",
+        "azure-openai": "azure",
+        "open-router": "openrouter",
         "z-ai": "glm",
         "z.ai": "glm",
         "zai": "glm",
@@ -342,7 +425,14 @@ def _default_model_for_provider(provider: str) -> str:
         "openai-compatible": os.environ.get("NYM_OPENAI_COMPAT_MODEL") or "local-model",
         "ollama": os.environ.get("OLLAMA_MODEL") or "llama3.1",
         "lmstudio": os.environ.get("LMSTUDIO_MODEL") or "local-model",
+        "copilot": os.environ.get("COPILOT_MODEL") or "gpt-4.1",
         "anthropic": os.environ.get("ANTHROPIC_MODEL") or "claude-3-5-sonnet-latest",
+        "gemini": os.environ.get("GEMINI_MODEL") or os.environ.get("GOOGLE_MODEL") or "gemini-2.5-pro",
+        "groq": os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile",
+        "openrouter": os.environ.get("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5",
+        "bedrock": os.environ.get("BEDROCK_MODEL") or "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "azure": os.environ.get("AZURE_OPENAI_DEPLOYMENT") or os.environ.get("AZURE_OPENAI_MODEL") or "gpt-4.1",
+        "vertexai": os.environ.get("VERTEX_MODEL") or os.environ.get("GOOGLE_VERTEX_MODEL") or "gemini-2.5-pro",
         "deepseek": os.environ.get("DEEPSEEK_MODEL")
         or "deepseek-v4-flash",
         "glm": os.environ.get("GLM_MODEL")
@@ -350,6 +440,70 @@ def _default_model_for_provider(provider: str) -> str:
         or "glm-4",
     }
     return defaults[provider]
+
+
+def _default_reasoning_effort(provider: str, model: str | None) -> str | None:
+    if not _model_supports_reasoning(provider, model):
+        return None
+    raw = (os.environ.get("NYM_REASONING_EFFORT") or "medium").strip().casefold()
+    if raw in {"minimal", "low", "medium", "high"}:
+        return raw
+    return "medium"
+
+
+def _default_reasoning_summary(provider: str, model: str | None) -> str | None:
+    if provider != "openai" or not _model_supports_reasoning(provider, model):
+        return None
+    raw = (os.environ.get("NYM_REASONING_SUMMARY") or "").strip().casefold()
+    if raw in {"auto", "concise", "detailed"}:
+        return raw
+    return None
+
+
+def _model_supports_reasoning(provider: str | None, model: str | None) -> bool:
+    provider_name = (provider or "").strip().casefold()
+    model_name = (model or "").strip().casefold()
+    if not provider_name or not model_name:
+        return False
+
+    reasoning_prefixes = ("gpt-5", "o1", "o3", "o4")
+    if provider_name == "openai":
+        return model_name.startswith(reasoning_prefixes)
+    if provider_name in {"deepseek", "ollama", "lmstudio", "openai-compatible", "groq", "openrouter", "glm"}:
+        return "reason" in model_name or model_name.startswith(("o1", "o3", "o4"))
+    if provider_name == "anthropic":
+        return "thinking" in model_name or "claude-3.7" in model_name or "claude-sonnet-4" in model_name
+    return False
+
+
+def _responses_reasoning_config(
+    provider: str | None,
+    model: str | None,
+    effort: str | None,
+    summary: str | None,
+) -> dict[str, str] | None:
+    if provider != "openai" or not _model_supports_reasoning(provider, model):
+        return None
+    result: dict[str, str] = {}
+    if effort in {"minimal", "low", "medium", "high"}:
+        result["effort"] = effort
+    if summary in {"auto", "concise", "detailed"}:
+        result["summary"] = summary
+    return result or None
+
+
+def _chat_reasoning_effort(
+    provider: str | None,
+    model: str | None,
+    effort: str | None,
+) -> str | None:
+    if provider not in {"openai-compatible", "ollama", "lmstudio", "groq", "openrouter", "deepseek", "glm"}:
+        return None
+    if not _model_supports_reasoning(provider, model):
+        return None
+    if effort in {"minimal", "low", "medium", "high"}:
+        return effort
+    return None
 
 
 def _first_env(*names: str) -> str | None:
@@ -365,6 +519,17 @@ def _required_env(name: str, provider_name: str) -> str:
     if not value:
         raise RuntimeError(_provider_configuration_error(provider_name, name))
     return value
+
+
+def _has_bedrock_credentials() -> bool:
+    return bool(
+        os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+        or os.environ.get("AWS_PROFILE")
+        or (
+            os.environ.get("AWS_ACCESS_KEY_ID")
+            and os.environ.get("AWS_SECRET_ACCESS_KEY")
+        )
+    )
 
 
 def _provider_configuration_error(provider_name: str, env_name: str) -> str:
@@ -563,6 +728,7 @@ def _chat_completion_to_response(response: Any) -> Any:
 def _anthropic_message_to_response(data: dict[str, Any]) -> Any:
     output: list[dict[str, Any]] = []
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     for item in data.get("content", []) or []:
         if not isinstance(item, dict):
             continue
@@ -570,6 +736,10 @@ def _anthropic_message_to_response(data: dict[str, Any]) -> Any:
             text = item.get("text")
             if isinstance(text, str):
                 text_parts.append(text)
+        elif item.get("type") == "thinking":
+            thinking = item.get("thinking")
+            if isinstance(thinking, str):
+                reasoning_parts.append(thinking)
         elif item.get("type") == "tool_use":
             output.append({
                 "type": "function_call",
@@ -580,6 +750,7 @@ def _anthropic_message_to_response(data: dict[str, Any]) -> Any:
     return SimpleNamespace(
         output=output,
         output_text="\n".join(text_parts).strip(),
+        reasoning_text="\n".join(reasoning_parts).strip(),
         usage=data.get("usage"),
     )
 

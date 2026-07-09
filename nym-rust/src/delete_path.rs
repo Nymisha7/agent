@@ -19,21 +19,31 @@ pub struct DeletePathResult {
 }
 
 pub fn delete_path(options: DeletePathOptions) -> Result<DeletePathResult> {
-    let workspace_root = options
-        .workspace_root
-        .canonicalize()
-        .with_context(|| format!("Invalid workspace root: {}", options.workspace_root.display()))?;
+    let workspace_root = options.workspace_root.canonicalize().with_context(|| {
+        format!(
+            "Invalid workspace root: {}",
+            options.workspace_root.display()
+        )
+    })?;
     let target = resolve_target_path(&options.path, &workspace_root)?;
     let resource = relative_display(&target, &workspace_root);
 
-    let metadata = fs::symlink_metadata(&target)
-        .with_context(|| format!("Path does not exist or cannot be inspected: {}", target.display()))?;
+    let metadata = fs::symlink_metadata(&target).with_context(|| {
+        format!(
+            "Path does not exist or cannot be inspected: {}",
+            target.display()
+        )
+    })?;
 
     if metadata.file_type().is_symlink() {
         bail!("Refusing to delete symlink target: {}", target.display());
     }
 
-    let kind = if metadata.is_dir() { "directory" } else { "file" };
+    let kind = if metadata.is_dir() {
+        "directory"
+    } else {
+        "file"
+    };
 
     if metadata.is_dir() {
         let mut entries = fs::read_dir(&target)
@@ -73,7 +83,9 @@ fn resolve_target_path(path: &Path, workspace_root: &Path) -> Result<PathBuf> {
             .with_context(|| format!("Failed to resolve parent path: {}", parent.display()))?;
         ensure_within_workspace(&canonical_parent, workspace_root)?;
 
-        let suffix = candidate.strip_prefix(parent).unwrap_or_else(|_| Path::new(""));
+        let suffix = candidate
+            .strip_prefix(parent)
+            .unwrap_or_else(|_| Path::new(""));
         let resolved = normalize_lexical_path(&canonical_parent.join(suffix));
         ensure_within_workspace(&resolved, workspace_root)?;
         return Ok(resolved);
@@ -87,7 +99,9 @@ fn resolve_target_path(path: &Path, workspace_root: &Path) -> Result<PathBuf> {
                 .with_context(|| format!("Failed to resolve parent path: {}", parent.display()))?;
             ensure_within_workspace(&canonical_parent, workspace_root)?;
 
-            let suffix = candidate.strip_prefix(parent).unwrap_or_else(|_| Path::new(""));
+            let suffix = candidate
+                .strip_prefix(parent)
+                .unwrap_or_else(|_| Path::new(""));
             let resolved = normalize_lexical_path(&canonical_parent.join(suffix));
             ensure_within_workspace(&resolved, workspace_root)?;
             return Ok(resolved);
@@ -99,9 +113,13 @@ fn resolve_target_path(path: &Path, workspace_root: &Path) -> Result<PathBuf> {
 }
 
 fn ensure_within_workspace(path: &Path, workspace_root: &Path) -> Result<()> {
-    path.strip_prefix(workspace_root)
-        .map(|_| ())
-        .map_err(|_| anyhow::anyhow!("Path '{}' is outside workspace root '{}'", path.display(), workspace_root.display()))
+    path.strip_prefix(workspace_root).map(|_| ()).map_err(|_| {
+        anyhow::anyhow!(
+            "Path '{}' is outside workspace root '{}'",
+            path.display(),
+            workspace_root.display()
+        )
+    })
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import curses
 import os
+import subprocess
 import sys
 import uuid
 import textwrap
@@ -82,8 +83,7 @@ DEFAULT_CONTEXT_WINDOWS = {
 
 
 LOCAL_COMMANDS = (
-    ("/models", "Open the model picker"),
-    ("/model", "Switch model"),
+    ("/model", "Open model picker or switch model"),
     ("/status", "Show session and model status"),
     ("/connect", "Set up hosted or local models"),
     ("/help", "Show commands and shortcuts"),
@@ -93,21 +93,39 @@ LOCAL_COMMANDS = (
 PROVIDER_API_KEY_ENVS = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GOOGLE_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "glm": "GLM_API_KEY",
     "openai-compatible": "NYM_OPENAI_COMPAT_API_KEY",
 }
 
 PROVIDER_LOGIN_URLS = {
+    "copilot": "https://github.com/login/device",
     "openai": "https://platform.openai.com/api-keys",
     "anthropic": "https://console.anthropic.com/settings/keys",
+    "gemini": "https://aistudio.google.com/app/apikey",
+    "groq": "https://console.groq.com/keys",
+    "openrouter": "https://openrouter.ai/settings/keys",
+    "bedrock": "https://console.aws.amazon.com/bedrock/home",
+    "azure": "https://ai.azure.com",
+    "vertexai": "https://console.cloud.google.com/vertex-ai",
     "deepseek": "https://platform.deepseek.com/api_keys",
     "glm": "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
     "openai-compatible": "https://platform.openai.com/api-keys",
 }
 PROVIDER_DISPLAY_NAMES = {
+    "copilot": "GitHub Copilot",
     "openai": "OpenAI",
     "anthropic": "Anthropic",
+    "gemini": "Google Gemini",
+    "groq": "Groq",
+    "openrouter": "OpenRouter",
+    "bedrock": "AWS Bedrock",
+    "azure": "Azure OpenAI",
+    "vertexai": "Google Cloud Vertex AI",
     "deepseek": "DeepSeek",
     "glm": "GLM",
     "openai-compatible": "Custom OpenAI-compatible",
@@ -117,15 +135,28 @@ PROVIDER_DISPLAY_NAMES = {
 PROVIDER_ARGUMENT_COMMANDS = {"/provider", "/login", "/auth", "/apikey", "/key"}
 LOCAL_PROVIDERS = {"ollama", "lmstudio"}
 PROVIDER_SORT_ORDER = {
-    "ollama": 0,
-    "lmstudio": 1,
+    "copilot": 0,
+    "anthropic": 1,
     "openai": 2,
-    "anthropic": 3,
-    "deepseek": 4,
-    "glm": 5,
-    "openai-compatible": 6,
+    "gemini": 3,
+    "groq": 4,
+    "openrouter": 5,
+    "bedrock": 6,
+    "azure": 7,
+    "vertexai": 8,
+    "deepseek": 9,
+    "glm": 10,
+    "ollama": 11,
+    "lmstudio": 12,
+    "openai-compatible": 13,
 }
 PROVIDER_MODEL_HINTS = {
+    "copilot": (
+        "gpt-4.1",
+        "gpt-5.4-mini",
+        "claude-sonnet-4.5",
+        "gemini-2.5-pro",
+    ),
     "openai": (
         "gpt-5.5",
         "gpt-5.5-mini",
@@ -140,7 +171,48 @@ PROVIDER_MODEL_HINTS = {
         "o3-mini",
         "o4-mini",
     ),
-    "anthropic": ("claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"),
+    "anthropic": (
+        "claude-sonnet-4.5",
+        "claude-opus-4.1",
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-haiku-latest",
+    ),
+    "gemini": (
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+    ),
+    "groq": (
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b",
+        "moonshotai/kimi-k2-instruct-0905",
+    ),
+    "openrouter": (
+        "anthropic/claude-sonnet-4.5",
+        "openai/gpt-5.4-mini",
+        "google/gemini-2.5-pro",
+        "meta-llama/llama-3.3-70b-instruct",
+    ),
+    "bedrock": (
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "anthropic.claude-opus-4-1-20250805-v1:0",
+        "amazon.nova-pro-v1:0",
+        "meta.llama3-3-70b-instruct-v1:0",
+    ),
+    "azure": (
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4o",
+        "gpt-4o-mini",
+    ),
+    "vertexai": (
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "claude-sonnet-4.5",
+        "claude-opus-4.1",
+    ),
     "ollama": (
         "qwen3.6",
         "qwen3-coder",
@@ -387,10 +459,6 @@ class LiveTurnState:
             self.error = None
 
     def _flush_reasoning(self) -> None:
-        text = self._reasoning_buf.strip()
-        if text:
-            if not self.feed or self.feed[-1] != ("thinking", "Thinking through the next step"):
-                self.feed.append(("thinking", "Thinking through the next step"))
         self._reasoning_buf = ""
 
     def _flush_text(self) -> None:
@@ -399,20 +467,22 @@ class LiveTurnState:
             self.feed.append(("text", text))
         self._text_buf = ""
 
+    def _drop_reasoning(self) -> None:
+        self.feed = [(kind, content) for kind, content in self.feed if kind not in {"thinking", "reasoning"}]
+
     def update(self, event: dict[str, Any]) -> None:
         kind = event.get("kind")
         delta = event.get("delta")
         with self.lock:
             if kind == "reasoning_delta" and isinstance(delta, str):
-                self._flush_text()
                 self._reasoning_buf += delta
                 self.phase = "reasoning"
             elif kind == "text_delta" and isinstance(delta, str):
+                self._drop_reasoning()
                 self._flush_reasoning()
                 self._text_buf += delta
                 self.phase = "responding"
             elif kind == "tool_call_started":
-                self._flush_reasoning()
                 self._flush_text()
                 name = event.get("name", "")
                 self._current_tool = name if isinstance(name, str) else ""
@@ -452,6 +522,7 @@ class LiveTurnState:
         with self.lock:
             self._flush_reasoning()
             self._flush_text()
+            self._drop_reasoning()
             self.active = False
             self.phase = "error" if error else "completed"
             self.error = error
@@ -459,9 +530,8 @@ class LiveTurnState:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             feed_snapshot = list(self.feed)
-            # append live buffers as streaming (not yet flushed) entries
-            if self._reasoning_buf:
-                feed_snapshot.append(("thinking", "Thinking through the next step"))
+            if self._reasoning_buf and not self._text_buf:
+                feed_snapshot.append(("reasoning", self._reasoning_buf))
             if self._text_buf:
                 feed_snapshot.append(("text", self._text_buf))
             if self._current_tool:
@@ -540,6 +610,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--tui",
         action="store_true",
         help="Start the terminal UI instead of the line prompt.",
+    )
+
+    parser.add_argument(
+        "--tui-bridge",
+        choices=("snapshot", "submit", "stream-submit", "complete", "approve", "deny"),
+        help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        "--bridge-session-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        "--bridge-prompt",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        "--bridge-request-id",
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -640,8 +734,9 @@ def default_workspace_root(args: argparse.Namespace) -> Path:
         return Path(args.root).expanduser().resolve()
 
     cwd = Path.cwd().resolve()
-    if cwd == Path("/"):
-        return Path.home().resolve()
+    repo_root = Path(__file__).resolve().parents[1]
+    if cwd == Path("/") and (repo_root / "nym-rust").exists() and (repo_root / "README.md").exists():
+        return repo_root.resolve()
 
     if cwd.name == "nym":
         repo_candidates = [cwd.parent, cwd]
@@ -662,7 +757,7 @@ def parse_search_roots(_workspace_root: Path) -> list[Path]:
 
 
 def load_session_messages(store: SessionStore, session_id: str) -> list[dict[str, str]]:
-    messages = store.list_messages(session_id, limit=None)
+    messages = store.list_messages(session_id, limit=20)
     return [
         {"role": message.role, "content": message.content}
         for message in messages
@@ -677,6 +772,7 @@ def handle_prompt(
     stream_event: Callable[[dict[str, Any]], None] | None = None,
     approval_requester: Callable[[dict[str, Any]], str] | None = None,
 ) -> str:
+    conversation_history = load_session_messages(ctx.store, ctx.session_id)
     ctx.store.update_last_prompt(ctx.session_id, prompt)
     ctx.store.add_message(ctx.session_id, "user", prompt)
     ctx.store.add_event(
@@ -691,8 +787,6 @@ def handle_prompt(
         summary="Assistant stream started",
         data={"prompt": prompt},
     )
-
-    conversation_history = load_session_messages(ctx.store, ctx.session_id)
 
     ctx.llm.reset_turn_usage()
     try:
@@ -988,7 +1082,8 @@ def _models_text(ctx: AppContext) -> str:
         "Switch model: /model <model>",
         "Choose exact source/model: /model <source> <model>",
         "Hosted models open auth automatically when a key is missing.",
-        "Local models require Ollama/LM Studio to be installed, running, and loaded or pulled first.",
+        "Local models are not installed in this workspace.",
+        "Install them in Ollama or LM Studio first, then switch to them here.",
     ])
 
     return "\n".join(lines)
@@ -1343,6 +1438,12 @@ def _provider_base_url(
     if provider == "openai":
         return "https://api.openai.com/v1"
 
+    if provider == "groq":
+        return os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+
+    if provider == "openrouter":
+        return os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
     return ""
 
 
@@ -1385,6 +1486,20 @@ def _discover_provider_models(
             return (
                 _discover_openai_compatible_models(
                     "https://api.openai.com/v1",
+                    api_key=api_key,
+                ),
+                None,
+            )
+
+        if provider in {"groq", "openrouter"}:
+            api_key = os.environ.get(PROVIDER_API_KEY_ENVS.get(provider, ""))
+
+            if not api_key:
+                return [], f"{_model_source_label(provider)} API key is required."
+
+            return (
+                _discover_openai_compatible_models(
+                    base_url,
                     api_key=api_key,
                 ),
                 None,
@@ -1604,11 +1719,15 @@ def _hinted_model_state(
 
 def _provider_access_label(provider: str) -> str:
     if provider in LOCAL_PROVIDERS:
-        return "local app, no login"
+        return "local app, install outside workspace"
     if provider == "openai-compatible":
         return "endpoint required"
-    if provider in {"deepseek", "glm"}:
-        return "sign in or API key"
+    if provider == "copilot":
+        return "GitHub sign-in"
+    if provider in {"bedrock", "vertexai"}:
+        return "cloud credentials"
+    if provider == "azure":
+        return "Azure endpoint and API key"
     return "sign in or API key"
 
 
@@ -1671,13 +1790,21 @@ def _ctx_session_info(ctx: Any) -> SessionInfo | None:
 def _connect_text() -> str:
     return "\n".join([
         "Model setup:",
+        "GitHub Copilot: /login copilot, then /model copilot <model>",
         "OpenAI: /login openai, then /apikey openai (OPENAI_API_KEY)",
         "Anthropic: /login anthropic, then /apikey anthropic (ANTHROPIC_API_KEY)",
+        "Google Gemini: /login gemini, then /apikey gemini (GOOGLE_API_KEY)",
+        "Groq: /login groq, then /apikey groq (GROQ_API_KEY)",
+        "OpenRouter: /login openrouter, then /apikey openrouter (OPENROUTER_API_KEY)",
+        "AWS Bedrock: /login bedrock, configure AWS_PROFILE or AWS credentials, then /model bedrock <model>",
+        "Azure OpenAI: /login azure, set AZURE_OPENAI_ENDPOINT and /apikey azure (AZURE_OPENAI_API_KEY)",
+        "Google Cloud Vertex AI: /login vertexai, set GOOGLE_CLOUD_PROJECT and run gcloud application-default auth",
         "DeepSeek hosted: /login deepseek, then /apikey deepseek (DEEPSEEK_API_KEY)",
         "GLM hosted: /login glm, then /apikey glm (GLM_API_KEY)",
         "Ollama local: install Ollama, run `ollama pull <model>`, then /model ollama <model>",
         "LM Studio local: install LM Studio, load a model, start the local server, then /model lmstudio <model>",
-        "Local models are not bundled with Nym; the local app owns download, storage, and runtime.",
+        "Local models live in the local app, not in this workspace.",
+        "Nym does not download or bundle local models; Ollama or LM Studio owns install, storage, and runtime.",
         "Persistent keys: export the model source environment variable before starting nym.",
     ])
 
@@ -1903,6 +2030,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     store = SessionStore.default()
+
+    if args.tui_bridge:
+        return _run_tui_bridge(args, store)
+
     command = args.session_command.strip() if args.session_command else None
     session_arg = args.session_id.strip() if args.session_id else None
 
@@ -1951,18 +2082,242 @@ def run_tui(ctx: AppContext) -> int:
         print("TUI requires an interactive terminal.")
         return 1
 
+    repo_root = Path(__file__).resolve().parents[1]
+    command = [
+        str(ctx.rust.rust_bin),
+        "tui",
+        "--python",
+        sys.executable,
+        "--repo-root",
+        str(repo_root),
+        "--session-id",
+        ctx.session_id,
+    ]
+    env = os.environ.copy()
+    store_db_path = getattr(getattr(ctx, "store", None), "db_path", None)
+    if store_db_path is not None:
+        env["NYM_SESSION_DB"] = str(store_db_path)
+
     try:
-        curses.wrapper(_run_tui, ctx)
-    except KeyboardInterrupt:
-        print()
-        return 0
-    except curses.error as exc:
-        print(f"Failed to start TUI: {exc}")
+        completed = subprocess.run(command, check=False, env=env)
+    except OSError as exc:
+        print(f"Failed to start Ratatui UI: {exc}")
         return 1
     finally:
         _stop_language_servers(ctx)
 
-    return 0
+    return int(completed.returncode)
+
+
+def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
+    session_id = (args.bridge_session_id or "").strip()
+    if not session_id:
+        print(json.dumps({"ok": False, "error": "Missing bridge session id."}))
+        return 1
+
+    ctx: AppContext | None = None
+    try:
+        session_info = store.get_session(session_id)
+        ctx = build_context(args, store=store, session_info=session_info)
+        if args.tui_bridge == "snapshot":
+            payload = {"ok": True, "snapshot": _tui_bridge_snapshot(ctx)}
+        elif args.tui_bridge == "complete":
+            payload = {
+                "ok": True,
+                "completions": _tui_bridge_completions(args.bridge_prompt or ""),
+            }
+        elif args.tui_bridge in {"approve", "deny"}:
+            request_id = (args.bridge_request_id or "").strip()
+            if not request_id:
+                payload = {"ok": False, "error": "Missing approval request id.", "snapshot": _tui_bridge_snapshot(ctx)}
+            else:
+                decision = "approved" if args.tui_bridge == "approve" else "denied"
+                payload = _tui_bridge_apply_approval_decision(ctx, request_id, decision)
+        elif args.tui_bridge == "stream-submit":
+            prompt = (args.bridge_prompt or "").strip()
+            if not prompt:
+                _bridge_emit({"kind": "final", "ok": False, "error": "Prompt cannot be empty.", "snapshot": _tui_bridge_snapshot(ctx)})
+                return 1
+            _bridge_emit({"kind": "submitted", "prompt": prompt, "snapshot": _tui_bridge_snapshot(ctx)})
+            try:
+                answer = _handle_local_command(ctx, prompt)
+                if answer is None:
+                    answer = handle_prompt(
+                        ctx,
+                        prompt,
+                        stream_event=lambda event: _tui_bridge_stream_event(ctx, event),
+                        approval_requester=lambda request: _tui_bridge_wait_for_approval(ctx, request),
+                    )
+                else:
+                    logged_prompt = _redact_local_command(prompt)
+                    ctx.store.update_last_prompt(ctx.session_id, logged_prompt)
+                    ctx.store.add_message(ctx.session_id, "user", logged_prompt)
+                    ctx.store.add_message(ctx.session_id, "assistant", answer)
+                _bridge_emit({
+                    "kind": "final",
+                    "ok": True,
+                    "answer": answer,
+                    "snapshot": _tui_bridge_snapshot(ctx),
+                })
+                return 0
+            except Exception as exc:
+                _bridge_emit({
+                    "kind": "final",
+                    "ok": False,
+                    "error": str(exc),
+                    "snapshot": _tui_bridge_snapshot(ctx),
+                })
+                return 1
+        else:
+            prompt = (args.bridge_prompt or "").strip()
+            if not prompt:
+                payload = {"ok": False, "error": "Prompt cannot be empty.", "snapshot": _tui_bridge_snapshot(ctx)}
+            else:
+                try:
+                    answer = _handle_local_command(ctx, prompt)
+                    if answer is None:
+                        answer = handle_prompt(ctx, prompt)
+                    else:
+                        logged_prompt = _redact_local_command(prompt)
+                        ctx.store.update_last_prompt(ctx.session_id, logged_prompt)
+                        ctx.store.add_message(ctx.session_id, "user", logged_prompt)
+                        ctx.store.add_message(ctx.session_id, "assistant", answer)
+                    payload = {
+                        "ok": True,
+                        "answer": answer,
+                        "snapshot": _tui_bridge_snapshot(ctx),
+                    }
+                except Exception as exc:
+                    payload = {"ok": False, "error": str(exc), "snapshot": _tui_bridge_snapshot(ctx)}
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
+    finally:
+        try:
+            if ctx is not None:
+                _stop_language_servers(ctx)
+        except Exception:
+            pass
+
+
+def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
+    session = ctx.store.get_session(ctx.session_id)
+    messages = ctx.store.list_messages(ctx.session_id, limit=None)
+    return {
+        "session": {
+            "id": session.id,
+            "title": session.title,
+            "workspace_root": session.workspace_root,
+            "updated_at": session.updated_at,
+            "provider": _active_provider(ctx),
+            "model": ctx.llm.model,
+            "mode": _llm_mode(ctx),
+            "configuration": _llm_configuration(ctx),
+            "cost_usd": session.cost_usd,
+            "tokens": {
+                "input": session.tokens.input,
+                "output": session.tokens.output,
+                "reasoning": session.tokens.reasoning,
+                "cache_read": session.tokens.cache_read,
+                "cache_write": session.tokens.cache_write,
+            },
+        },
+        "approvals": [
+            dict(item)
+            for item in ctx.session.pending_approvals
+            if isinstance(item, dict) and item.get("status") == "pending"
+        ],
+        "messages": [
+            {
+                "role": item.role,
+                "content": item.content,
+                "created_at": item.created_at,
+            }
+            for item in messages
+        ],
+    }
+
+
+def _tui_bridge_completions(prompt: str) -> dict[str, Any]:
+    entries = _slash_palette_entries(prompt)
+    return {
+        "title": _slash_palette_title(prompt) if entries else "",
+        "entries": [
+            {
+                "value": entry.value,
+                "label": entry.label,
+                "description": entry.description,
+                "complete_to": entry.complete_to,
+                "execute": entry.execute,
+            }
+            for entry in entries[:12]
+        ],
+    }
+
+
+def _bridge_emit(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def _tui_bridge_stream_event(ctx: AppContext, event: dict[str, Any]) -> None:
+    persist_agent_state(ctx)
+    _bridge_emit({"kind": "stream_event", "event": event, "snapshot": _tui_bridge_snapshot(ctx)})
+
+
+def _tui_bridge_wait_for_approval(ctx: AppContext, request: dict[str, Any], *, poll_interval: float = 0.1, timeout: float = 1800.0) -> str:
+    request_id = str(request.get("id") or "")
+    if not request_id:
+        return "denied"
+
+    persist_agent_state(ctx)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        session_info = ctx.store.get_session(ctx.session_id)
+        refreshed = agent_session_from_dict(session_info.state)
+        ctx.session.pending_approvals = refreshed.pending_approvals
+        for item in ctx.session.pending_approvals:
+            if not isinstance(item, dict) or item.get("id") != request_id:
+                continue
+            status = str(item.get("status") or "pending")
+            decision = str(item.get("decision") or "")
+            if status != "pending" and decision in {"approved", "denied"}:
+                persist_agent_state(ctx)
+                return decision
+        time.sleep(poll_interval)
+    return "denied"
+
+
+def _tui_bridge_apply_approval_decision(ctx: AppContext, request_id: str, decision: str) -> dict[str, Any]:
+    matched = False
+    for item in ctx.session.pending_approvals:
+        if not isinstance(item, dict) or item.get("id") != request_id:
+            continue
+        item["status"] = decision
+        item["decision"] = decision
+        item["decision_at"] = datetime.now(timezone.utc).isoformat()
+        matched = True
+        break
+
+    if not matched:
+        session_info = ctx.store.get_session(ctx.session_id)
+        refreshed = agent_session_from_dict(session_info.state)
+        ctx.session.pending_approvals = refreshed.pending_approvals
+        for item in ctx.session.pending_approvals:
+            if not isinstance(item, dict) or item.get("id") != request_id:
+                continue
+            item["status"] = decision
+            item["decision"] = decision
+            item["decision_at"] = datetime.now(timezone.utc).isoformat()
+            matched = True
+            break
+
+    if not matched:
+        return {"ok": False, "error": f"Approval request not found: {request_id}", "snapshot": _tui_bridge_snapshot(ctx)}
+
+    persist_agent_state(ctx)
+    return {"ok": True, "snapshot": _tui_bridge_snapshot(ctx)}
 
 
 def _stop_language_servers(ctx: Any) -> None:
@@ -2414,7 +2769,13 @@ def _slash_command_lines(prompt: str, width: int, *, selected_index: int = 0) ->
         return []
     title = _slash_palette_title(prompt)
     lines = [_clip_line(title, width)]
-    for index, entry in enumerate(entries[:8]):
+    visible_count = 8
+    selected_index = min(max(0, selected_index), len(entries) - 1)
+    start = min(
+        max(0, selected_index - visible_count + 1),
+        max(0, len(entries) - visible_count),
+    )
+    for index, entry in enumerate(entries[start : start + visible_count], start=start):
         marker = ">" if index == selected_index else " "
         lines.append(_clip_line(f"{marker} {entry.label:<16} {entry.description}", width))
     return lines
@@ -2461,15 +2822,13 @@ def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
 
 
 def _slash_command_complete_to(name: str) -> str:
-    if name == "/models":
-        return "/model "
     if name in PROVIDER_ARGUMENT_COMMANDS | {"/model"}:
         return f"{name} "
     return name
 
 
 def _slash_command_executes(name: str) -> bool:
-    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/models"}
+    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model"}
 
 
 def _provider_palette_entries(command: str, query: str) -> list[PaletteEntry]:
@@ -2945,3 +3304,7 @@ def _wrap_lines(text: str, width: int, *, indent: str = "") -> list[str]:
         else:
             wrapped.append(indent.rstrip())
     return wrapped
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

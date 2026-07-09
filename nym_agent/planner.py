@@ -17,6 +17,25 @@ from .project_identity import identity_text, resolve_workspace_alias
 from .rust_tools import RustTools
 from .tools import ToolContext, build_tool_registry
 
+FINISH_TASK_TOOL = {
+    "type": "function",
+    "name": "finish_task",
+    "description": (
+        "Finish the current user request only after all necessary inspection, "
+        "verification, and requested tool work is complete."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "answer": {
+                "type": "string",
+                "description": "Final answer for the user.",
+            }
+        },
+        "required": ["answer"],
+    },
+}
+
 
 @dataclass
 class ModelToolCall:
@@ -35,6 +54,7 @@ class AgentSession:
     approved_external_read_roots: list[str] = field(default_factory=list)
     approved_external_write_roots: list[str] = field(default_factory=list)
     approved_external_delete_roots: list[str] = field(default_factory=list)
+    approved_system_commands: list[str] = field(default_factory=list)
     pending_approvals: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -66,17 +86,20 @@ def run_agent(
     effective_search_roots = search_roots if search_roots is not None else []
     system_prompt = load_system_prompt()
     active_session = session or AgentSession()
+    workspace_root_path = Path(workspace_root)
+    _prepare_session_for_prompt(active_session, user_prompt, workspace_root_path)
     tool_ctx = ToolContext(
         rust=rust,
-        workspace_root=Path(workspace_root),
+        workspace_root=workspace_root_path,
         search_roots=[Path(root) for root in effective_search_roots],
         approved_external_read_roots=[Path(root) for root in active_session.approved_external_read_roots],
         approved_external_write_roots=[Path(root) for root in active_session.approved_external_write_roots],
         approved_external_delete_roots=[Path(root) for root in active_session.approved_external_delete_roots],
+        approved_system_commands=list(active_session.approved_system_commands),
         language_servers=language_servers,
     )
     tool_registry = build_tool_registry(tool_ctx)
-    tools = tool_registry.schemas()
+    tools = [*tool_registry.schemas(), FINISH_TASK_TOOL]
     policy = PolicyEngine()
 
     context_text = stored_context.strip() if stored_context else ""
@@ -87,13 +110,14 @@ def run_agent(
         user_prompt=user_prompt,
         conversation_history=conversation_history,
     ))
-    require_tool_use = _requires_tool_use(user_prompt)
+    require_tool_use = _requires_tool_use(user_prompt) or _selects_pending_candidate(active_session, user_prompt)
+    tools_for_turn = tools if _should_offer_tools(user_prompt, active_session) else []
 
     for step in range(max_steps):
         response = llm.respond(
             instructions=system_prompt,
             messages=msg_history,
-            tools=tools,
+            tools=tools_for_turn,
             previous_response_id=None,
             tool_choice="required" if step == 0 and require_tool_use else None,
             stream=stream_event is not None,
@@ -104,17 +128,79 @@ def run_agent(
             else None,
         )
         tool_calls = _tool_calls(response)
+        if not tools_for_turn and not tool_calls:
+            answer = _response_text(response)
+            _record_pending_display_order(active_session, answer)
+            return policy.redact_text(answer)
         if not tool_calls:
-            return policy.redact_text(_response_text(response))
+            partial_text = _raw_response_text(response)
+            if _should_accept_plain_text_response(
+                partial_text,
+                session=active_session,
+                user_prompt=user_prompt,
+            ):
+                answer = _unwrap_final_text(partial_text)
+                _record_pending_display_order(active_session, answer)
+                return policy.redact_text(answer)
+            if partial_text:
+                msg_history.append({
+                    "role": "assistant",
+                    "content": partial_text,
+                })
+            msg_history.append({
+                "role": "user",
+                "content": (
+                    "Continue working on the original request. Do not stop at a partial "
+                    "summary, status update, or list of possible next steps. Use tools when "
+                    "needed, and call finish_task only when the requested work is complete."
+                ),
+            })
+            continue
 
         tool_outputs: list[dict[str, Any]] = []
+        finished_answer: str | None = None
         for call in tool_calls:
+            if call.name == "finish_task":
+                if _selects_pending_candidate(active_session, user_prompt):
+                    tool_outputs.append({
+                        "type": "function_call_output",
+                        "call_id": call.call_id,
+                        "output": _prepare_tool_output({
+                            "ok": False,
+                            "tool": call.name,
+                            "blocked": True,
+                            "recoverable": True,
+                            "reason": "pending_selection_requires_inspection",
+                            "guidance": (
+                                "The user selected a pending target. Inspect that selected "
+                                "target with the appropriate file tools before calling finish_task."
+                            ),
+                        }),
+                    })
+                    continue
+                answer = _finish_task_answer(call.arguments)
+                if answer is not None and len(tool_calls) == 1:
+                    finished_answer = answer
+                    break
+                tool_outputs.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": _prepare_tool_output({
+                        "ok": False,
+                        "tool": call.name,
+                        "error": (
+                            "finish_task must be called by itself and only after all required "
+                            "inspection, verification, and requested work are complete."
+                        ),
+                    }),
+                })
+                continue
             if debug:
                 _debug_event("tool-call", {"name": call.name, "arguments": call.arguments})
             observation = _preflight_tool_call(
                 call,
                 tool_ctx=tool_ctx,
-                session=session,
+                session=active_session,
                 user_prompt=user_prompt,
             )
             if observation is None:
@@ -198,15 +284,14 @@ def run_agent(
             sanitized_observation = policy.sanitize_observation(observation)
             if debug:
                 _debug_event("tool-result", {"name": call.name, "observation": sanitized_observation})
-            if session is not None:
-                _update_session_from_tool_result(
-                    session,
-                    tool=call.name,
-                    args=call.arguments,
-                    observation=observation,
-                    workspace_root=Path(workspace_root),
-                    user_prompt=user_prompt,
-                )
+            _update_session_from_tool_result(
+                active_session,
+                tool=call.name,
+                args=call.arguments,
+                observation=observation,
+                workspace_root=workspace_root_path,
+                user_prompt=user_prompt,
+            )
             if record_event:
                 record_event(
                     event_type="tool_result",
@@ -226,6 +311,9 @@ def run_agent(
                 }
             )
 
+        if finished_answer is not None:
+            _record_pending_display_order(active_session, finished_answer)
+            return policy.redact_text(finished_answer)
         msg_history.extend(_response_output_items(response))
         msg_history.extend(tool_outputs)
 
@@ -245,7 +333,9 @@ def run_agent(
         tools=[],
         previous_response_id=None,
     )
-    return policy.redact_text(_response_text(final_response))
+    answer = _response_text(final_response)
+    _record_pending_display_order(active_session, answer)
+    return policy.redact_text(answer)
 
 
 def _build_initial_messages(
@@ -256,7 +346,7 @@ def _build_initial_messages(
     user_prompt: str,
     conversation_history: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    session_context = _session_context_text(session)
+    session_context = _session_context_text(session, user_prompt=user_prompt)
     workspace_identity = identity_text(Path(workspace_root))
     if conversation_history:
         parts = [f"Workspace root: {workspace_root}"]
@@ -270,6 +360,7 @@ def _build_initial_messages(
         return (
             [{"role": "user", "content": "\n".join(parts)}]
             + _normalize_history(conversation_history)
+            + [{"role": "user", "content": user_prompt}]
         )
 
     parts = [f"Workspace root: {workspace_root}"]
@@ -316,6 +407,9 @@ def _requires_tool_use(user_prompt: str) -> bool:
     if not prompt:
         return False
 
+    if _looks_like_task_continuation(prompt):
+        return True
+
     create_patterns = [
         r"\b(create|create a|make|add|write|save|update|edit|modify|append|touch)\b",
         r"\b(file|files|script|module|config|note|notes)\b",
@@ -351,6 +445,7 @@ def agent_session_from_dict(value: dict[str, Any] | None) -> AgentSession:
         approved_external_read_roots=_string_list(value.get("approved_external_read_roots")),
         approved_external_write_roots=_string_list(value.get("approved_external_write_roots")),
         approved_external_delete_roots=_string_list(value.get("approved_external_delete_roots")),
+        approved_system_commands=_string_list(value.get("approved_system_commands")),
         pending_approvals=_pending_approval_dicts(value.get("pending_approvals")),
     )
 
@@ -365,12 +460,87 @@ def agent_session_to_dict(session: AgentSession) -> dict[str, Any]:
         "approved_external_read_roots": session.approved_external_read_roots,
         "approved_external_write_roots": session.approved_external_write_roots,
         "approved_external_delete_roots": session.approved_external_delete_roots,
+        "approved_system_commands": session.approved_system_commands,
         "pending_approvals": session.pending_approvals,
     }
 
 
 def _requires_workspace_evidence(user_prompt: str) -> bool:
     return _requires_tool_use(user_prompt)
+
+
+def _should_accept_plain_text_response(
+    response_text: str,
+    *,
+    session: AgentSession,
+    user_prompt: str,
+) -> bool:
+    text = response_text.strip()
+    if not text:
+        return False
+
+    pending = session.pending_action
+    if isinstance(pending, dict) and pending.get("status") == "unresolved":
+        if _selected_pending_candidate(pending, user_prompt) is not None:
+            return False
+        return True
+
+    pending_approvals = [
+        item for item in session.pending_approvals
+        if isinstance(item, dict) and item.get("status") == "pending"
+    ]
+    if pending_approvals:
+        return True
+
+    if _is_non_actionable_chat_prompt(user_prompt):
+        return True
+
+    return False
+
+
+def _should_offer_tools(user_prompt: str, session: AgentSession) -> bool:
+    if _requires_tool_use(user_prompt):
+        return True
+    if _selects_pending_candidate(session, user_prompt):
+        return True
+    return False
+
+
+def _selects_pending_candidate(session: AgentSession, user_prompt: str) -> bool:
+    pending = session.pending_action
+    if isinstance(pending, dict) and pending.get("status") == "unresolved":
+        return _selected_pending_candidate(pending, user_prompt) is not None
+    return False
+
+
+def _looks_like_task_continuation(user_prompt: str) -> bool:
+    return bool(re.search(
+        r"\b("
+        r"continue|resume|proceed|go\s+ahead|retry|try\s+again|finish\s+it|"
+        r"do\s+it|apply\s+it|fix\s+it|run\s+it|check\s+again|keep\s+going"
+        r")\b",
+        user_prompt,
+        re.IGNORECASE,
+    ))
+
+
+def _is_non_actionable_chat_prompt(user_prompt: str) -> bool:
+    prompt = " ".join(user_prompt.split()).strip()
+    if not prompt:
+        return True
+    if re.fullmatch(r"[?!.]+", prompt):
+        return True
+    if re.fullmatch(r"(hi|hello|hey|yo|sup|thanks|thank you|help)", prompt, re.IGNORECASE):
+        return True
+    return False
+
+
+def _prepare_session_for_prompt(session: AgentSession, user_prompt: str, workspace_root: Path) -> None:
+    pending = session.pending_action
+    if not isinstance(pending, dict) or pending.get("status") != "unresolved":
+        return
+    if _names_new_scope(user_prompt, pending, workspace_root) or _is_non_actionable_chat_prompt(user_prompt):
+        session.pending_action = None
 
 
 def _is_edit_intent(user_prompt: str) -> bool:
@@ -479,10 +649,16 @@ def _record_pending_approval(session: AgentSession, request: dict[str, Any]) -> 
 
 
 def _apply_approval(session: AgentSession, tool_ctx: ToolContext, request: dict[str, Any]) -> None:
+    operation = _optional_str(request.get("operation")) or "read"
+    if operation == "system":
+        target_key = _approval_path(request)
+        if target_key and target_key not in session.approved_system_commands:
+            session.approved_system_commands.append(target_key)
+        _sync_tool_context_approvals(tool_ctx, session)
+        return
     target_path = _approval_path(request)
     if not target_path:
         return
-    operation = _optional_str(request.get("operation")) or "read"
     roots = {
         "read": session.approved_external_read_roots,
         "write": session.approved_external_write_roots,
@@ -497,6 +673,7 @@ def _sync_tool_context_approvals(tool_ctx: ToolContext, session: AgentSession) -
     tool_ctx.approved_external_read_roots = [Path(path) for path in session.approved_external_read_roots]
     tool_ctx.approved_external_write_roots = [Path(path) for path in session.approved_external_write_roots]
     tool_ctx.approved_external_delete_roots = [Path(path) for path in session.approved_external_delete_roots]
+    tool_ctx.approved_system_commands = list(session.approved_system_commands)
 
 
 def _approval_path(request: dict[str, Any]) -> str | None:
@@ -524,6 +701,7 @@ def _approval_request_from_observation(
         "external_path_requires_approval",
         "external_delete_requires_confirmation",
         "external_windows_path_requires_approval",
+        "system_command_requires_approval",
     }:
         return None
 
@@ -543,7 +721,9 @@ def _approval_request_from_observation(
         "args": dict(call.arguments),
         "workspace_root": str(workspace_root),
     }
-    if request["broad_path"] or not _approval_path(request):
+    if request["broad_path"]:
+        return None
+    if request["reason"] != "system_command_requires_approval" and not _approval_path(request):
         return None
     if request["reason"] == "external_windows_path_requires_approval" and request["translated_path"] is None:
         return None
@@ -559,6 +739,10 @@ def _tool_operation(tool: str) -> str:
         "glob": "read",
         "grep": "read",
         "secret_scan": "read",
+        "system_info": "read",
+        "connected_devices": "read",
+        "process_list": "read",
+        "run_system_command": "system",
         "write_file": "write",
         "edit_file": "write",
         "delete_path": "delete",
@@ -838,14 +1022,15 @@ def _selected_pending_candidate(pending: dict[str, Any], user_prompt: str) -> di
     if not prompt:
         return None
 
-    if _looks_like_meta_question(prompt):
-        return None
-
     ordinal = _ordinal_selection(prompt)
     if ordinal is not None:
         index = ordinal - 1
-        if 0 <= index < len(candidates):
-            return candidates[index]
+        ordered_candidates = _pending_selection_order(pending)
+        if 0 <= index < len(ordered_candidates):
+            return ordered_candidates[index]
+        return None
+
+    if _looks_like_meta_question(prompt):
         return None
 
     normalized_prompt = _normalize_selection_text(prompt)
@@ -866,6 +1051,44 @@ def _selected_pending_candidate(pending: dict[str, Any], user_prompt: str) -> di
         if normalized_prompt in names:
             return candidate
     return None
+
+
+def _pending_selection_order(pending: dict[str, Any]) -> list[dict[str, str]]:
+    displayed = _candidate_dicts(pending.get("display_candidates"))
+    if displayed:
+        return displayed
+    return _candidate_dicts(pending.get("candidates"))
+
+
+def _record_pending_display_order(session: AgentSession, answer: str) -> None:
+    pending = session.pending_action
+    if not isinstance(pending, dict) or pending.get("status") != "unresolved":
+        return
+    if not re.search(r"\b(which one|choose|select|which .* should|which .* do you)\b", answer, re.IGNORECASE):
+        return
+
+    candidates = _candidate_dicts(pending.get("candidates"))
+    if len(candidates) < 2:
+        return
+
+    answer_folded = answer.casefold()
+    positioned: list[tuple[int, int, dict[str, str]]] = []
+    for internal_index, candidate in enumerate(candidates):
+        path = candidate.get("path", "")
+        if not path:
+            continue
+        names = {path.casefold(), Path(path).as_posix().casefold(), Path(path).name.casefold()}
+        positions = [answer_folded.find(name) for name in names if name and answer_folded.find(name) >= 0]
+        if positions:
+            positioned.append((min(positions), internal_index, candidate))
+
+    if len(positioned) < 2:
+        return
+
+    positioned.sort(key=lambda item: (item[0], item[1]))
+    display_candidates = [candidate for _, _, candidate in positioned]
+    pending["display_candidates"] = display_candidates
+
 
 def _names_new_scope(user_prompt: str, pending: dict[str, Any], workspace_root: Path) -> bool:
     scope = _named_project_scope(user_prompt, workspace_root=workspace_root)
@@ -891,7 +1114,27 @@ def _looks_like_meta_question(prompt: str) -> bool:
 
 def _ordinal_selection(prompt: str) -> int | None:
     stripped = prompt.strip().lower()
-    match = re.fullmatch(r"(?:yes|yeah|yup|ok(?:ay)?|sure)?\s*#?(\d{1,2})\.?", stripped)
+    stripped = stripped.replace("isn't", "isnt")
+    stripped = re.sub(r"^(?:yes|yeah|yup|ok(?:ay)?|sure)\b[\s,.:;-]*", "", stripped)
+    stripped = re.sub(
+        r"^(?:isnt|is\s+it|is\s+this|is\s+that|isn'?t\s+it)\b[\s,.:;-]*",
+        "",
+        stripped,
+    )
+    stripped = re.sub(r"[.!?]+$", "", stripped).strip()
+    match = re.fullmatch(
+        r"(?:the\s+)?(?:option\s+|candidate\s+|choice\s+|#\s*)?"
+        r"(\d{1,2})(?:st|nd|rd|th)?"
+        r"(?:\s+(?:one|option|candidate|choice|folder|project))?",
+        stripped,
+    )
+    if not match:
+        match = re.fullmatch(
+            r"(?:the\s+)?(?:option\s+|candidate\s+|choice\s+|#\s*)?"
+            r"(\d{1,2})rth"
+            r"(?:\s+(?:one|option|candidate|choice|folder|project))?",
+            stripped,
+        )
     if match:
         return int(match.group(1))
     words = {
@@ -906,7 +1149,15 @@ def _ordinal_selection(prompt: str) -> int | None:
         "five": 5,
         "fifth": 5,
     }
-    return words.get(stripped)
+    match = re.fullmatch(
+        r"(?:the\s+)?(?:option\s+|candidate\s+|choice\s+)?"
+        r"(one|first|two|second|three|third|four|fourth|five|fifth)"
+        r"(?:\s+(?:one|option|candidate|choice|folder|project))?",
+        stripped,
+    )
+    if match:
+        return words.get(match.group(1))
+    return None
 
 
 def _normalize_selection_text(prompt: str) -> str:
@@ -960,7 +1211,9 @@ def _annotate_tool_observation(tool: str, args: dict[str, Any], observation: Any
     return annotated
 
 
-def _session_context_text(session: AgentSession) -> str:
+def _session_context_text(session: AgentSession, *, user_prompt: str) -> str:
+    if _is_non_actionable_chat_prompt(user_prompt):
+        return ""
     lines: list[str] = []
     if session.active_root:
         lines.append(f"Active root: {session.active_root}")
@@ -1125,6 +1378,8 @@ def _project_level_candidates(
         parts = rel.parts
         if not parts:
             continue
+        if _is_dependency_or_environment_path(rel):
+            continue
         top = parts[0]
         if query_norm and not top.casefold().startswith(query_norm):
             fallback.append(candidate)
@@ -1136,6 +1391,29 @@ def _project_level_candidates(
     if by_top_level:
         return list(by_top_level.values())
     return fallback or candidates
+
+
+def _is_dependency_or_environment_path(path: Path) -> bool:
+    dependency_names = {
+        ".env",
+        "env",
+        ".venv",
+        "venv",
+        "rag_env",
+        "virtualenv",
+        ".virtualenv",
+        "site-packages",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        "target",
+        "dist",
+        "build",
+    }
+    return any(part.casefold() in dependency_names for part in path.parts)
 
 
 def _apply_inspect_target(session: AgentSession, observation: dict[str, Any]) -> None:
@@ -1328,6 +1606,9 @@ def _pending_action_dict(value: Any) -> dict[str, Any] | None:
     candidates = _candidate_dicts(value.get("candidates"))
     if candidates:
         result["candidates"] = candidates
+    display_candidates = _candidate_dicts(value.get("display_candidates"))
+    if display_candidates:
+        result["display_candidates"] = display_candidates
     selected = value.get("selected")
     if isinstance(selected, dict):
         selected_candidates = _candidate_dicts([selected])
@@ -1499,10 +1780,24 @@ def _parse_arguments(raw_args: Any) -> dict[str, Any]:
 
 
 def _response_text(response: Any) -> str:
-    text = _get(response, "output_text", "")
+    text = _raw_response_text(response)
     if isinstance(text, str) and text.strip():
         return _unwrap_final_text(text.strip())
     return "I could not produce a final answer."
+
+
+def _raw_response_text(response: Any) -> str:
+    text = _get(response, "output_text", "")
+    if isinstance(text, str):
+        return text.strip()
+    return ""
+
+
+def _finish_task_answer(arguments: dict[str, Any]) -> str | None:
+    answer = arguments.get("answer")
+    if isinstance(answer, str) and answer.strip():
+        return answer.strip()
+    return None
 
 
 def _unwrap_final_text(text: str) -> str:

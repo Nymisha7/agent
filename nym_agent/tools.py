@@ -24,6 +24,7 @@ class ToolContext:
     approved_external_read_roots: list[Path] = field(default_factory=list)
     approved_external_write_roots: list[Path] = field(default_factory=list)
     approved_external_delete_roots: list[Path] = field(default_factory=list)
+    approved_system_commands: list[str] = field(default_factory=list)
     language_servers: LanguageServerManager | None = None
 
 
@@ -455,6 +456,114 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                     },
                 },
                 required=[],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="system_info",
+            handler=_system_info,
+            schema=_function_schema(
+                name="system_info",
+                description=(
+                    "Inspect the current runtime host and return structured operating-system "
+                    "details such as hostname, uptime, CPU count, memory, disk summary, and "
+                    "whether the agent is running under WSL."
+                ),
+                properties={},
+                required=[],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="connected_devices",
+            handler=_connected_devices,
+            schema=_function_schema(
+                name="connected_devices",
+                description=(
+                    "Count and list devices visible to the current runtime. Returns category "
+                    "counts for USB, storage, network, input, and Bluetooth devices."
+                ),
+                properties={
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "usb", "storage", "network", "input", "bluetooth"],
+                        "description": "Optional device category to focus on.",
+                        "default": "all",
+                    },
+                },
+                required=[],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="process_list",
+            handler=_process_list,
+            schema=_function_schema(
+                name="process_list",
+                description=(
+                    "List running processes visible to the current runtime, sorted by CPU or "
+                    "memory usage."
+                ),
+                properties={
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of processes to return.",
+                        "default": 20,
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["cpu", "memory"],
+                        "description": "Sort order for the process list.",
+                        "default": "cpu",
+                    },
+                },
+                required=[],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="run_system_command",
+            handler=_run_system_command,
+            schema=_function_schema(
+                name="run_system_command",
+                description=(
+                    "Run a narrow allowlisted system command. Read-only commands run "
+                    "immediately. Commands that start, stop, or restart services require "
+                    "explicit approval."
+                ),
+                properties={
+                    "command": {
+                        "type": "string",
+                        "enum": [
+                            "list_block_devices",
+                            "list_network_interfaces",
+                            "list_listening_ports",
+                            "service_status",
+                            "start_service",
+                            "stop_service",
+                            "restart_service",
+                        ],
+                        "description": "Allowlisted system command identifier.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Optional target such as a service name.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of rows/lines to return for list commands.",
+                        "default": 50,
+                    },
+                },
+                required=["command"],
             ),
         )
     )
@@ -1396,6 +1505,86 @@ def _secret_scan(args: dict[str, Any], ctx: ToolContext) -> Any:
     }
 
 
+def _system_info(_args: dict[str, Any], ctx: ToolContext) -> Any:
+    return ctx.rust.system_info()
+
+
+def _connected_devices(args: dict[str, Any], ctx: ToolContext) -> Any:
+    scope = _enum_arg(
+        args.get("scope"),
+        default="all",
+        allowed={"all", "usb", "storage", "network", "input", "bluetooth"},
+    )
+    return ctx.rust.connected_devices(scope=scope)
+
+
+def _process_list(args: dict[str, Any], ctx: ToolContext) -> Any:
+    limit = _int_arg(args.get("limit"), default=20, minimum=1, maximum=200)
+    sort_by = _enum_arg(
+        args.get("sort_by"),
+        default="cpu",
+        allowed={"cpu", "memory"},
+    )
+    return ctx.rust.process_list(limit=limit, sort_by=sort_by)
+
+
+def _run_system_command(args: dict[str, Any], ctx: ToolContext) -> Any:
+    command = _enum_arg(
+        args.get("command"),
+        default="",
+        allowed={
+            "list_block_devices",
+            "list_network_interfaces",
+            "list_listening_ports",
+            "service_status",
+            "start_service",
+            "stop_service",
+            "restart_service",
+        },
+    )
+    if not command:
+        raise ValueError("run_system_command requires non-empty string arg 'command'.")
+
+    target = args.get("target")
+    if target is not None and (not isinstance(target, str) or not target.strip()):
+        raise ValueError("target must be a non-empty string when provided.")
+    target_value = target.strip() if isinstance(target, str) else None
+    limit = _int_arg(args.get("limit"), default=50, minimum=1, maximum=200)
+
+    if command.startswith(("start_", "stop_", "restart_")):
+        if not target_value:
+            return {
+                "ok": False,
+                "tool": "run_system_command",
+                "blocked": True,
+                "recoverable": True,
+                "reason": "system_command_target_required",
+                "operation": "system",
+                "guidance": "This system command requires a concrete target such as a service name.",
+            }
+        approval_key = _system_command_approval_key(command, target_value)
+        if approval_key not in ctx.approved_system_commands:
+            return {
+                "ok": False,
+                "tool": "run_system_command",
+                "blocked": True,
+                "recoverable": True,
+                "reason": "system_command_requires_approval",
+                "operation": "system",
+                "requested_path": approval_key,
+                "guidance": (
+                    "This system command can change the host machine. Ask the user to approve "
+                    "this exact command before retrying."
+                ),
+            }
+
+    return ctx.rust.run_system_command(
+        command=command,
+        target=target_value,
+        limit=limit,
+    )
+
+
 def _read_path(args: dict[str, Any], ctx: ToolContext) -> Any:
     raw_path = args.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
@@ -1941,6 +2130,11 @@ def _bool_arg(value: Any, *, default: bool) -> bool:
         raise ValueError("Expected a boolean value.")
 
     return value
+
+
+def _system_command_approval_key(command: str, target: str | None) -> str:
+    normalized_target = (target or "").strip()
+    return f"{command} {normalized_target}".strip()
 
 
 def _glob_has_matches(result: Any) -> bool:

@@ -48,7 +48,8 @@ pub fn glob_files(options: GlobOptions) -> Result<GlobResult> {
     let mut backend = "ripgrep".to_string();
 
     if options.kind != GlobKind::Directory {
-        if let Ok(rg_matches) = rg_glob_matches(&root, pattern, options.include_hidden, options.kind)
+        if let Ok(rg_matches) =
+            rg_glob_matches(&root, pattern, options.include_hidden, options.kind)
         {
             matches.extend(rg_matches);
         }
@@ -112,7 +113,9 @@ fn rg_glob_matches(
     command.arg(pattern);
     command.arg(root);
 
-    let output = command.output().context("Failed to run ripgrep for glob discovery")?;
+    let output = command
+        .output()
+        .context("Failed to run ripgrep for glob discovery")?;
 
     if !output.status.success() && output.status.code() != Some(1) {
         bail!(String::from_utf8_lossy(&output.stderr).trim().to_string());

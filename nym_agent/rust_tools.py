@@ -241,3 +241,45 @@ class RustTools:
             ],
             timeout=20,
         )
+
+    def system_info(self) -> Any:
+        return self.run_json(["system-info"], timeout=15)
+
+    def connected_devices(self, *, scope: str = "all") -> Any:
+        return self.run_json(
+            [
+                "connected-devices",
+                "--scope",
+                scope,
+            ],
+            timeout=20,
+        )
+
+    def process_list(self, *, limit: int = 20, sort_by: str = "cpu") -> Any:
+        return self.run_json(
+            [
+                "process-list",
+                "--limit",
+                str(limit),
+                "--sort-by",
+                sort_by,
+            ],
+            timeout=20,
+        )
+
+    def run_system_command(
+        self,
+        *,
+        command: str,
+        target: str | None = None,
+        limit: int = 50,
+    ) -> Any:
+        args = [
+            "run-system-command",
+            command,
+            "--limit",
+            str(limit),
+        ]
+        if target is not None:
+            args.extend(["--target", target])
+        return self.run_json(args, timeout=30)

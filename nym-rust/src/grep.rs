@@ -108,7 +108,9 @@ fn rg_grep_matches(root: &Path, pattern: &str, options: &GrepOptions) -> Result<
     command.arg(pattern);
     command.arg(root);
 
-    let output = command.output().context("Failed to run ripgrep for content search")?;
+    let output = command
+        .output()
+        .context("Failed to run ripgrep for content search")?;
     if !output.status.success() && output.status.code() != Some(1) {
         anyhow::bail!(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -121,7 +123,10 @@ fn rg_grep_matches(root: &Path, pattern: &str, options: &GrepOptions) -> Result<
         let text = parts.next().unwrap_or_default();
 
         let line_number = line_number.parse::<usize>().unwrap_or(1);
-        let path = root.join(path).canonicalize().unwrap_or_else(|_| root.join(path));
+        let path = root
+            .join(path)
+            .canonicalize()
+            .unwrap_or_else(|_| root.join(path));
 
         matches.push(GrepMatch {
             path,
@@ -133,7 +138,11 @@ fn rg_grep_matches(root: &Path, pattern: &str, options: &GrepOptions) -> Result<
     Ok(matches)
 }
 
-fn recursive_grep_matches(root: &Path, pattern: &str, options: &GrepOptions) -> Result<Vec<GrepMatch>> {
+fn recursive_grep_matches(
+    root: &Path,
+    pattern: &str,
+    options: &GrepOptions,
+) -> Result<Vec<GrepMatch>> {
     let walker = WalkBuilder::new(root)
         .hidden(!options.include_hidden)
         .follow_links(false)

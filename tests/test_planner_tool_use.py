@@ -12,6 +12,7 @@ from nym_agent.main import default_workspace_root, resolve_rust_bin
 from nym_agent.planner import (
     AgentSession,
     ModelToolCall,
+    _approval_request_from_observation,
     _annotate_tool_observation,
     _build_initial_messages,
     _prepare_tool_output,
@@ -47,9 +48,28 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("named target", prompt)
         self.assertIn("Treat credentials, secrets, API keys", prompt)
         self.assertIn("secret_scan", prompt)
+        self.assertIn("system_info", prompt)
+        self.assertIn("connected_devices", prompt)
+        self.assertIn("run_system_command", prompt)
         self.assertIn("generated, dependency, cache, and build output", prompt)
         self.assertIn("Failed path operations only prove that the attempted path failed", prompt)
         self.assertIn("recent file operations", prompt)
+        self.assertIn("finish_task", prompt)
+        self.assertIn("A partial inspection", prompt)
+
+    def test_build_initial_messages_appends_current_prompt_after_history(self) -> None:
+        messages = _build_initial_messages(
+            workspace_root="/workspace",
+            context_text="",
+            session=AgentSession(),
+            user_prompt="current request",
+            conversation_history=[
+                {"role": "user", "content": "earlier question"},
+                {"role": "assistant", "content": "earlier answer"},
+            ],
+        )
+
+        self.assertEqual(messages[-1], {"role": "user", "content": "current request"})
 
     def test_tool_registry_exposes_edit_and_delete_tools(self) -> None:
         ctx = ToolContext(
@@ -64,6 +84,10 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("delete_path", tool_names)
         self.assertIn("secret_scan", tool_names)
         self.assertIn("language_server", tool_names)
+        self.assertIn("system_info", tool_names)
+        self.assertIn("connected_devices", tool_names)
+        self.assertIn("process_list", tool_names)
+        self.assertIn("run_system_command", tool_names)
 
     def test_language_server_status_tool_reports_configured_servers(self) -> None:
         manager = LanguageServerManager(
@@ -361,6 +385,17 @@ class PlannerToolUseTests(unittest.TestCase):
                 os.chdir(old_cwd)
 
         self.assertEqual(resolved, workspace_root.resolve())
+
+    def test_default_workspace_root_does_not_fall_back_to_home_from_root(self) -> None:
+        old_cwd = Path.cwd()
+        try:
+            os.chdir("/")
+            resolved = default_workspace_root(Namespace(root=None))
+        finally:
+            os.chdir(old_cwd)
+
+        self.assertEqual(resolved, Path(__file__).resolve().parents[1])
+        self.assertNotEqual(resolved, Path.home().resolve())
 
     def test_write_file_ignores_expected_hash_for_new_file(self) -> None:
         class FakeRust:
@@ -1148,6 +1183,7 @@ class PlannerToolUseTests(unittest.TestCase):
                 "action": "delete",
                 "candidates": [{"path": "/workspace/AlphaSuiteClean", "kind": "directory"}],
             },
+            approved_system_commands=["restart_service docker"],
         )
 
         restored = agent_session_from_dict(agent_session_to_dict(session))
@@ -1157,6 +1193,82 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(restored.last_candidates, session.last_candidates)
         self.assertEqual(restored.recent_files, session.recent_files)
         self.assertEqual(restored.pending_action, session.pending_action)
+        self.assertEqual(restored.approved_system_commands, session.approved_system_commands)
+
+    def test_system_command_mutation_requires_approval(self) -> None:
+        ctx = ToolContext(
+            rust=RustTools(Path("/tmp/nym-rust")),
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        registry = build_tool_registry(ctx)
+
+        result = registry.execute(
+            "run_system_command",
+            {"command": "restart_service", "target": "docker"},
+            ctx,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["reason"], "system_command_requires_approval")
+        self.assertEqual(result["requested_path"], "restart_service docker")
+
+    def test_system_command_runs_after_session_approval(self) -> None:
+        class FakeRust:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def run_system_command(self, *, command: str, target: str | None = None, limit: int = 50) -> dict[str, object]:
+                self.calls.append({"command": command, "target": target, "limit": limit})
+                return {"ok": True, "tool": "run_system_command", "command": command, "target": target}
+
+        rust = FakeRust()
+        ctx = ToolContext(
+            rust=rust,  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+            approved_system_commands=["restart_service docker"],
+        )
+        registry = build_tool_registry(ctx)
+
+        result = registry.execute(
+            "run_system_command",
+            {"command": "restart_service", "target": "docker", "limit": 5},
+            ctx,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(rust.calls[0]["command"], "restart_service")
+        self.assertEqual(rust.calls[0]["target"], "docker")
+
+    def test_system_command_approval_request_is_created(self) -> None:
+        call = ModelToolCall(
+            name="run_system_command",
+            call_id="call-1",
+            arguments={"command": "restart_service", "target": "docker"},
+        )
+
+        request = _approval_request_from_observation(
+            call,
+            {
+                "ok": False,
+                "tool": "run_system_command",
+                "blocked": True,
+                "recoverable": True,
+                "reason": "system_command_requires_approval",
+                "operation": "system",
+                "requested_path": "restart_service docker",
+                "guidance": "Ask for approval.",
+            },
+            user_prompt="restart docker",
+            workspace_root=Path("/workspace"),
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request["operation"], "system")
+        self.assertEqual(request["requested_path"], "restart_service docker")
 
     def test_session_remembers_successful_file_mutations(self) -> None:
         session = AgentSession()
@@ -1246,6 +1358,7 @@ class PlannerToolUseTests(unittest.TestCase):
                         "kind": "directory",
                     },
                     {"path": "AlphaSuiteRelease/env", "kind": "directory"},
+                    {"path": "AlphaSuiteRelease/rag_env", "kind": "directory"},
                     {"path": "AlphaSuiteClean", "kind": "directory"},
                     {"path": "AlphaSuiteV2Clean", "kind": "directory"},
                     {"path": "AlphaSuiteRelease", "kind": "directory"},
@@ -1261,9 +1374,44 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(
             session.pending_action["candidates"],
             [
-                {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
                 {"path": "/workspace/AlphaSuiteClean", "kind": "directory"},
                 {"path": "/workspace/AlphaSuiteV2Clean", "kind": "directory"},
+                {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
+            ],
+        )
+
+    def test_project_candidate_filter_excludes_virtualenv_subdirectories(self) -> None:
+        session = AgentSession()
+
+        _update_session_from_tool_result(
+            session,
+            tool="inspect_target",
+            args={"path": "ra", "kind": "directory"},
+            observation={
+                "status": "candidates",
+                "query": "ra",
+                "candidates": [
+                    {
+                        "path": "browser/env/lib/python3.12/site-packages/django/contrib/gis/gdal/raster",
+                        "kind": "directory",
+                    },
+                    {"path": "RA_publish/rag_env", "kind": "directory"},
+                    {"path": "RA_clean", "kind": "directory"},
+                    {"path": "RA2_clean", "kind": "directory"},
+                    {"path": "RA_publish", "kind": "directory"},
+                ],
+            },
+            workspace_root=Path("/home/pssintern"),
+            user_prompt="can you tell me about ra project",
+        )
+
+        self.assertIsNotNone(session.pending_action)
+        self.assertEqual(
+            session.pending_action["candidates"],
+            [
+                {"path": "/home/pssintern/RA_clean", "kind": "directory"},
+                {"path": "/home/pssintern/RA2_clean", "kind": "directory"},
+                {"path": "/home/pssintern/RA_publish", "kind": "directory"},
             ],
         )
 
@@ -1384,6 +1532,28 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIsNotNone(observation)
         self.assertTrue(observation["blocked"])
         self.assertEqual(observation["reason"], "pending_target_clarification_unresolved")
+
+    def test_non_actionable_prompt_does_not_include_pending_action_context(self) -> None:
+        messages = _build_initial_messages(
+            workspace_root="/workspace",
+            context_text="",
+            session=AgentSession(
+                pending_action={
+                    "status": "unresolved",
+                    "action": "delete",
+                    "candidates": [
+                        {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
+                        {"path": "/workspace/AlphaSuiteClean", "kind": "directory"},
+                    ],
+                }
+            ),
+            user_prompt="?",
+            conversation_history=None,
+        )
+
+        content = messages[0]["content"]
+        self.assertNotIn("Pending unresolved action", content)
+        self.assertIn("User request: ?", content)
 
     def test_preflight_blocks_workspace_file_search_for_named_project_mutation(self) -> None:
         ctx = ToolContext(
@@ -1986,6 +2156,74 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(session.active_root, "/workspace/sample_project")
         self.assertEqual(session.focus_paths, ["/workspace/sample_project"])
         self.assertEqual(session.last_candidates, [{"path": "/workspace/sample_project", "kind": "directory"}])
+
+    def test_run_agent_does_not_accept_partial_prose_as_completion(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(output=[], output_text="A few things stood out.")
+                return SimpleNamespace(
+                    output=[
+                        {
+                            "type": "function_call",
+                            "name": "finish_task",
+                            "call_id": "finish-1",
+                            "arguments": '{"answer":"final answer"}',
+                        }
+                    ],
+                    output_text="",
+                )
+
+        answer = run_agent(
+            llm=FakeLLM(),  # type: ignore[arg-type]
+            rust=object(),
+            workspace_root="/workspace",
+            user_prompt="inspect the repo",
+        )
+
+        self.assertEqual(answer, "final answer")
+
+    def test_run_agent_accepts_plain_text_completion_when_pending_target_selection_blocks(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                return SimpleNamespace(
+                    output=[],
+                    output_text=(
+                        "Your workspace contains multiple possible RA projects. "
+                        "Choose one target before I continue."
+                    ),
+                )
+
+        session = AgentSession(
+            pending_action={
+                "status": "unresolved",
+                "action": "answer",
+                "query": "RA",
+                "candidates": [
+                    {"path": "/workspace/RA_publish", "kind": "directory"},
+                    {"path": "/workspace/RA_clean", "kind": "directory"},
+                    {"path": "/workspace/RA2_clean", "kind": "directory"},
+                ],
+            }
+        )
+
+        answer = run_agent(
+            llm=FakeLLM(),  # type: ignore[arg-type]
+            rust=object(),
+            workspace_root="/workspace",
+            user_prompt="tell me about RA",
+            session=session,
+        )
+
+        self.assertIn("multiple possible RA projects", answer)
 
     def test_run_agent_waits_for_approval_before_external_delete(self) -> None:
         class FakeLLM:

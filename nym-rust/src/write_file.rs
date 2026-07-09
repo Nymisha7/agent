@@ -30,10 +30,12 @@ pub struct WriteFileResult {
 }
 
 pub fn write_file(options: WriteFileOptions) -> Result<WriteFileResult> {
-    let workspace_root = options
-        .workspace_root
-        .canonicalize()
-        .with_context(|| format!("Invalid workspace root: {}", options.workspace_root.display()))?;
+    let workspace_root = options.workspace_root.canonicalize().with_context(|| {
+        format!(
+            "Invalid workspace root: {}",
+            options.workspace_root.display()
+        )
+    })?;
     let target = resolve_target_path(&options.path, &workspace_root)?;
     let resource = relative_display(&target, &workspace_root);
 
@@ -60,9 +62,12 @@ pub fn write_file(options: WriteFileOptions) -> Result<WriteFileResult> {
     };
 
     if let Some(expected_sha256) = options.expected_sha256.as_deref() {
-        let current = existing
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Expected file hash provided, but target does not exist: {}", target.display()))?;
+        let current = existing.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Expected file hash provided, but target does not exist: {}",
+                target.display()
+            )
+        })?;
         let current_sha256 = sha256_hex(current);
         if current_sha256 != expected_sha256 {
             bail!(
@@ -82,8 +87,9 @@ pub fn write_file(options: WriteFileOptions) -> Result<WriteFileResult> {
         .ok_or_else(|| anyhow::anyhow!("Path has no parent: {}", target.display()))?;
     if !parent.exists() {
         if options.create_dirs {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create parent directories: {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent directories: {}", parent.display())
+            })?;
         } else {
             bail!("Parent directory does not exist: {}", parent.display());
         }
@@ -167,7 +173,9 @@ fn resolve_target_path(path: &Path, workspace_root: &Path) -> Result<PathBuf> {
             .with_context(|| format!("Failed to resolve parent path: {}", parent.display()))?;
         ensure_within_workspace(&canonical_parent, workspace_root)?;
 
-        let suffix = candidate.strip_prefix(parent).unwrap_or_else(|_| Path::new(""));
+        let suffix = candidate
+            .strip_prefix(parent)
+            .unwrap_or_else(|_| Path::new(""));
         let resolved = normalize_lexical_path(&canonical_parent.join(suffix));
         ensure_within_workspace(&resolved, workspace_root)?;
         return Ok(resolved);
@@ -181,7 +189,9 @@ fn resolve_target_path(path: &Path, workspace_root: &Path) -> Result<PathBuf> {
                 .with_context(|| format!("Failed to resolve parent path: {}", parent.display()))?;
             ensure_within_workspace(&canonical_parent, workspace_root)?;
 
-            let suffix = candidate.strip_prefix(parent).unwrap_or_else(|_| Path::new(""));
+            let suffix = candidate
+                .strip_prefix(parent)
+                .unwrap_or_else(|_| Path::new(""));
             let resolved = normalize_lexical_path(&canonical_parent.join(suffix));
             ensure_within_workspace(&resolved, workspace_root)?;
             return Ok(resolved);
@@ -197,7 +207,13 @@ fn ensure_within_workspace(path: &Path, workspace_root: &Path) -> Result<()> {
     resolved_path
         .strip_prefix(workspace_root)
         .map(|_| ())
-        .map_err(|_| anyhow::anyhow!("Path '{}' is outside workspace root '{}'", path.display(), workspace_root.display()))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Path '{}' is outside workspace root '{}'",
+                path.display(),
+                workspace_root.display()
+            )
+        })
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -276,7 +292,10 @@ fn temp_write_path(parent: &Path) -> Result<PathBuf> {
         }
     }
 
-    bail!("Failed to allocate temporary write path in {}", parent.display())
+    bail!(
+        "Failed to allocate temporary write path in {}",
+        parent.display()
+    )
 }
 
 fn write_temp_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -336,7 +355,10 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(fs::read_to_string(dir.join("src/nested/file.txt")).unwrap(), "hello\nworld");
+        assert_eq!(
+            fs::read_to_string(dir.join("src/nested/file.txt")).unwrap(),
+            "hello\nworld"
+        );
         assert!(!result.created || result.before_sha256.is_none());
         assert_eq!(result.resource, "src/nested/file.txt");
         cleanup(&dir);

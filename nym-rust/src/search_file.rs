@@ -134,7 +134,12 @@ fn is_generated_artifact(relative_path: &Path) -> bool {
                 | ".tox"
                 | ".venv"
                 | "venv"
+                | "env"
+                | ".env"
+                | "virtualenv"
+                | ".virtualenv"
                 | "node_modules"
+                | "site-packages"
                 | ".git"
                 | ".hg"
                 | ".svn"
@@ -186,6 +191,12 @@ fn should_prune_path(path: &Path) -> bool {
                 | "node_modules"
                 | "venv"
                 | ".venv"
+                | "env"
+                | "rag_env"
+                | ".env"
+                | "virtualenv"
+                | ".virtualenv"
+                | "site-packages"
                 | "__pycache__"
                 | "target"
                 | "dist"
@@ -254,12 +265,12 @@ pub fn search_files_staged(
 ) -> Result<Vec<StagedSearchResult>> {
     let query = options.query.trim();
     if query.is_empty() {
-        return Ok(
-            strategies
-                .iter()
-                .map(|_| StagedSearchResult { matches: Vec::new() })
-                .collect(),
-        );
+        return Ok(strategies
+            .iter()
+            .map(|_| StagedSearchResult {
+                matches: Vec::new(),
+            })
+            .collect());
     }
 
     let mut collectors = strategies
@@ -313,17 +324,15 @@ enum SearchCollectorInner {
 impl SearchCollector {
     fn new(query: &str, strategy: SearchStrategy, limit: NonZeroUsize) -> Self {
         let inner = match strategy {
-            SearchStrategy::ExactName => SearchCollectorInner::Exact(ExactCollector::new(
-                query.to_lowercase(),
-                limit,
-            )),
-            SearchStrategy::ContainsName => SearchCollectorInner::Contains(
-                ScoredCollector::new(query.to_lowercase(), limit),
-            ),
-            SearchStrategy::FuzzyPath => SearchCollectorInner::Fuzzy(FuzzyCollector::new(
-                query,
-                limit,
-            )),
+            SearchStrategy::ExactName => {
+                SearchCollectorInner::Exact(ExactCollector::new(query.to_lowercase(), limit))
+            }
+            SearchStrategy::ContainsName => {
+                SearchCollectorInner::Contains(ScoredCollector::new(query.to_lowercase(), limit))
+            }
+            SearchStrategy::FuzzyPath => {
+                SearchCollectorInner::Fuzzy(FuzzyCollector::new(query, limit))
+            }
         };
         Self { inner }
     }
@@ -403,7 +412,8 @@ impl ScoredCollector {
         };
 
         let position_score = 10_000u32.saturating_sub((position as u32) * 100);
-        let length_bonus = 1_000u32.saturating_sub(name.len().saturating_sub(self.query.len()) as u32);
+        let length_bonus =
+            1_000u32.saturating_sub(name.len().saturating_sub(self.query.len()) as u32);
         let score = 500 + position_score + length_bonus;
 
         self.push(ScoredCandidate::new(score, candidate));
@@ -446,7 +456,8 @@ impl FuzzyCollector {
             return;
         };
 
-        self.heap.push(Reverse(ScoredCandidate::new(score, candidate)));
+        self.heap
+            .push(Reverse(ScoredCandidate::new(score, candidate)));
         if self.heap.len() > self.limit.get() {
             self.heap.pop();
         }
@@ -537,7 +548,11 @@ fn expand_tilde(path: &Path) -> PathBuf {
 //     Ok(())
 // }
 
-fn collect_candidates<F>(root: &Path, options: &FileSearchOptions, mut on_candidate: F) -> Result<()>
+fn collect_candidates<F>(
+    root: &Path,
+    options: &FileSearchOptions,
+    mut on_candidate: F,
+) -> Result<()>
 where
     F: FnMut(Candidate),
 {

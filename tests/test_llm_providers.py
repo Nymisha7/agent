@@ -5,10 +5,15 @@ from unittest.mock import patch
 from nym_agent.llm import (
     LLMClient,
     _anthropic_message_to_response,
+    _chat_reasoning_effort,
     _chat_completion_to_response,
     _default_model_for_provider,
+    _default_reasoning_effort,
+    _default_reasoning_summary,
     _friendly_llm_error,
+    _model_supports_reasoning,
     _normalize_provider,
+    _responses_reasoning_config,
     _responses_messages_to_anthropic,
     _responses_messages_to_chat,
     _responses_tools_to_anthropic,
@@ -30,6 +35,31 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(_default_model_for_provider("deepseek"), "deepseek-v4-flash")
         self.assertEqual(_default_model_for_provider("glm"), "glm-4")
         self.assertEqual(_default_model_for_provider("ollama"), "llama3.1")
+
+    def test_reasoning_capability_detection_is_provider_specific(self) -> None:
+        self.assertTrue(_model_supports_reasoning("openai", "gpt-5.4-mini"))
+        self.assertTrue(_model_supports_reasoning("deepseek", "deepseek-reasoner"))
+        self.assertFalse(_model_supports_reasoning("openai", "gpt-4o"))
+        self.assertFalse(_model_supports_reasoning("anthropic", "claude-3-5-haiku-latest"))
+
+    def test_reasoning_defaults_apply_only_to_reasoning_models(self) -> None:
+        self.assertEqual(_default_reasoning_effort("openai", "gpt-5.4-mini"), "medium")
+        self.assertIsNone(_default_reasoning_effort("openai", "gpt-4o"))
+        self.assertIsNone(_default_reasoning_summary("deepseek", "deepseek-reasoner"))
+
+    def test_openai_responses_reasoning_config_matches_sdk_shape(self) -> None:
+        self.assertEqual(
+            _responses_reasoning_config("openai", "gpt-5.4-mini", "high", "auto"),
+            {"effort": "high", "summary": "auto"},
+        )
+        self.assertIsNone(_responses_reasoning_config("openai", "gpt-4o", "high", "auto"))
+
+    def test_chat_reasoning_effort_applies_only_to_reasoning_chat_models(self) -> None:
+        self.assertEqual(
+            _chat_reasoning_effort("deepseek", "deepseek-reasoner", "low"),
+            "low",
+        )
+        self.assertIsNone(_chat_reasoning_effort("deepseek", "deepseek-chat", "low"))
 
     def test_missing_deepseek_key_is_deferred_until_request(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -131,6 +161,7 @@ class LLMProviderTests(unittest.TestCase):
         response = _anthropic_message_to_response(
             {
                 "content": [
+                    {"type": "thinking", "thinking": "internal reasoning"},
                     {"type": "text", "text": "Checking"},
                     {"type": "tool_use", "id": "toolu_1", "name": "grep", "input": {"pattern": "auth"}},
                 ],
@@ -139,6 +170,7 @@ class LLMProviderTests(unittest.TestCase):
         )
 
         self.assertEqual(response.output_text, "Checking")
+        self.assertEqual(response.reasoning_text, "internal reasoning")
         self.assertEqual(response.output[0]["call_id"], "toolu_1")
         self.assertEqual(response.output[0]["arguments"], {"pattern": "auth"})
 
