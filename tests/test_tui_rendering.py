@@ -58,6 +58,13 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual(payload["title"], "Commands")
         self.assertEqual(payload["entries"][0]["label"], "/model")
 
+    def test_tui_bridge_model_completions_are_not_capped(self) -> None:
+        payload = _tui_bridge_completions("/model ")
+        expected_count = len(_slash_palette_entries("/model "))
+
+        self.assertGreater(expected_count, 12)
+        self.assertEqual(len(payload["entries"]), expected_count)
+
     def test_tui_bridge_snapshot_includes_pending_approvals(self) -> None:
         ctx = SimpleNamespace(
             session_id="abc123",
@@ -153,7 +160,7 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertIn("Tool: delete_path", text)
         self.assertIn("Guardrail: external_path_requires_approval", text)
 
-    def test_live_turn_renders_raw_reasoning_before_answer_text(self) -> None:
+    def test_live_turn_renders_reasoning_state_without_raw_chain_of_thought(self) -> None:
         live_turn = LiveTurnState()
         live_turn.start("inspect the repo")
         live_turn.update({
@@ -164,7 +171,8 @@ class TuiRenderingTests(unittest.TestCase):
         rendered = _render_tui_transcript([], live_turn.snapshot(), 80)
         text = "\n".join(rendered)
 
-        self.assertIn("private detailed chain of thought", text)
+        self.assertIn("Reasoning", text)
+        self.assertNotIn("private detailed chain of thought", text)
 
     def test_live_turn_hides_reasoning_after_answer_text_starts(self) -> None:
         live_turn = LiveTurnState()
@@ -282,6 +290,14 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertIn("local app, install outside workspace", entries[0].description)
         self.assertEqual(_complete_slash_command("/model llama"), "/model ollama llama3.3")
 
+    def test_install_palette_offers_explicit_ollama_download_action(self) -> None:
+        entries = _slash_palette_entries("/install llama")
+
+        self.assertEqual(entries[0].value, "ollama/llama3.3")
+        self.assertEqual(entries[0].complete_to, "/install ollama llama3.3")
+        self.assertTrue(entries[0].execute)
+        self.assertIn("no login", entries[0].description)
+
     def test_model_palette_defaults_to_hosted_models_first(self) -> None:
         entries = _slash_palette_entries("/model ")
 
@@ -347,9 +363,7 @@ class LocalCommandTests(unittest.TestCase):
 
         self.assertEqual(ctx.llm.provider, "ollama")
         self.assertEqual(ctx.llm.model, "llama3.1")
-        self.assertIn("Model switched to llama3.1", result)
-        self.assertIn("Source: Ollama", result)
-        self.assertIn("Configuration: ready", result)
+        self.assertEqual(result, "Ollama · llama3.1")
 
     def test_provider_command_persists_provider_and_model(self) -> None:
         store = SimpleNamespace(update_llm_config=Mock())
@@ -380,39 +394,149 @@ class LocalCommandTests(unittest.TestCase):
         client.assert_called_once_with(model="deepseek-chat", provider="deepseek")
         self.assertEqual(ctx.llm.provider, "deepseek")
         self.assertEqual(ctx.llm.model, "deepseek-chat")
-        self.assertIn("Source: DeepSeek", result)
+        self.assertEqual(result, "DeepSeek · deepseek-chat")
 
     def test_deepseek_hosted_model_prompts_for_api_key(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="ollama", model="llama3.1"))
 
-        with patch(
-            "nym_agent.main.LLMClient",
-            return_value=SimpleNamespace(
-                provider="deepseek",
-                model="deepseek-v4-flash",
-                configuration_error="DeepSeek is not configured. Set DEEPSEEK_API_KEY.",
+        with (
+            patch(
+                "nym_agent.main.LLMClient",
+                return_value=SimpleNamespace(
+                    provider="deepseek",
+                    model="deepseek-v4-flash",
+                    configuration_error="DeepSeek is not configured. Set DEEPSEEK_API_KEY.",
+                ),
             ),
+            patch("nym_agent.main.webbrowser.open", return_value=True) as open_browser,
         ):
             result = _handle_local_command(ctx, "/model deepseek deepseek-v4-flash")
 
-        self.assertIn("deepseek-v4-flash needs authentication", result)
+        self.assertIn("Status: API key required", result)
         self.assertIn("/apikey deepseek", result)
+        self.assertIn("Opened DeepSeek API-key page", result)
+        open_browser.assert_called_once_with("https://platform.deepseek.com/api_keys", new=2, autoraise=True)
 
     def test_provider_command_surfaces_configuration_error(self) -> None:
-        ctx = SimpleNamespace(llm=SimpleNamespace(provider="ollama", model="llama3.1"))
+        store = SimpleNamespace(update_llm_config=Mock())
+        ctx = SimpleNamespace(
+            session_id="session-1",
+            store=store,
+            llm=SimpleNamespace(provider="ollama", model="llama3.1"),
+        )
 
-        with patch(
-            "nym_agent.main.LLMClient",
-            return_value=SimpleNamespace(
-                provider="openai",
-                model="gpt-4o",
-                configuration_error="OpenAI is not configured. Set OPENAI_API_KEY.",
+        with (
+            patch(
+                "nym_agent.main.LLMClient",
+                return_value=SimpleNamespace(
+                    provider="openai",
+                    model="gpt-4o",
+                    configuration_error="OpenAI is not configured. Set OPENAI_API_KEY.",
+                ),
             ),
+            patch("nym_agent.main.webbrowser.open", return_value=True) as open_browser,
         ):
             result = _handle_local_command(ctx, "/model openai gpt-5.5")
 
-        self.assertIn("gpt-5.5 needs authentication", result)
+        self.assertIn("Status: API key required", result)
         self.assertIn("/apikey openai", result)
+        self.assertIn("Opened OpenAI API-key page", result)
+        self.assertEqual(ctx.llm.provider, "openai")
+        self.assertEqual(ctx.llm.model, "gpt-4o")
+        store.update_llm_config.assert_called_once_with(
+            "session-1",
+            provider="openai",
+            model="gpt-4o",
+        )
+        open_browser.assert_called_once_with("https://platform.openai.com/api-keys", new=2, autoraise=True)
+
+    def test_anthropic_selection_stays_active_while_key_is_missing(self) -> None:
+        store = SimpleNamespace(update_llm_config=Mock())
+        ctx = SimpleNamespace(
+            session_id="session-1",
+            store=store,
+            llm=SimpleNamespace(provider="openai", model="gpt-4o"),
+        )
+
+        candidate = SimpleNamespace(
+            provider="anthropic",
+            model="claude-sonnet-4.5",
+            configuration_error="Anthropic is not configured. Set ANTHROPIC_API_KEY.",
+        )
+        with (
+            patch("nym_agent.main.LLMClient", return_value=candidate),
+            patch("nym_agent.main.webbrowser.open", return_value=True),
+        ):
+            result = _handle_local_command(
+                ctx,
+                "/model anthropic claude-sonnet-4.5",
+            )
+
+        self.assertEqual(ctx.llm, candidate)
+        self.assertEqual(ctx.pending_provider, "anthropic")
+        self.assertEqual(ctx.pending_model, "claude-sonnet-4.5")
+        self.assertIn("Anthropic · claude-sonnet-4.5", result)
+        self.assertIn("/apikey anthropic", result)
+        store.update_llm_config.assert_called_once_with(
+            "session-1",
+            provider="anthropic",
+            model="claude-sonnet-4.5",
+        )
+
+    def test_cloud_provider_selection_opens_setup_without_api_key_prompt(self) -> None:
+        store = SimpleNamespace(update_llm_config=Mock())
+        ctx = SimpleNamespace(
+            session_id="session-1",
+            store=store,
+            llm=SimpleNamespace(provider="openai", model="gpt-4o"),
+        )
+        candidate = SimpleNamespace(
+            provider="bedrock",
+            model="amazon.nova-pro-v1:0",
+            configuration_error="AWS Bedrock credentials are missing.",
+        )
+
+        with (
+            patch("nym_agent.main.LLMClient", return_value=candidate),
+            patch("nym_agent.main.webbrowser.open", return_value=True) as browser,
+        ):
+            result = _handle_local_command(
+                ctx,
+                "/model bedrock amazon.nova-pro-v1:0",
+            )
+
+        self.assertEqual(ctx.llm, candidate)
+        self.assertIn("provider sign-in or cloud credentials required", result)
+        self.assertIn("Opened AWS Bedrock setup page", result)
+        self.assertNotIn("/apikey bedrock", result)
+        browser.assert_called_once()
+
+    def test_unimplemented_provider_transport_is_unavailable_not_auth_required(self) -> None:
+        store = SimpleNamespace(update_llm_config=Mock())
+        ctx = SimpleNamespace(
+            session_id="session-1",
+            store=store,
+            llm=SimpleNamespace(provider="openai", model="gpt-4o"),
+        )
+        candidate = SimpleNamespace(
+            provider="gemini",
+            model="gemini-2.5-pro",
+            configuration_error="Google Gemini transport is not implemented yet.",
+        )
+
+        with (
+            patch.dict("os.environ", {"GOOGLE_API_KEY": "test"}, clear=True),
+            patch("nym_agent.main.LLMClient", return_value=candidate),
+            patch("nym_agent.main.webbrowser.open") as browser,
+        ):
+            result = _handle_local_command(
+                ctx,
+                "/model gemini gemini-2.5-pro",
+            )
+
+        self.assertIn("Status: unavailable", result)
+        self.assertNotIn("API key required", result)
+        browser.assert_not_called()
 
     def test_api_key_command_sets_key_and_reloads_active_provider(self) -> None:
         ctx = SimpleNamespace(
@@ -432,10 +556,25 @@ class LocalCommandTests(unittest.TestCase):
     def test_api_key_command_without_key_prompts_for_hidden_tui_entry(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="anthropic", model="claude-3-5-sonnet-latest"))
 
-        result = _handle_local_command(ctx, "/apikey anthropic")
+        with patch.dict("os.environ", {}, clear=True):
+            result = _handle_local_command(ctx, "/apikey anthropic")
 
         self.assertIn("hidden TUI prompt", result)
         self.assertEqual(_api_key_prompt_provider("/apikey anthropic"), "anthropic")
+
+    def test_api_key_command_uses_process_scoped_key_from_environment(self) -> None:
+        ctx = SimpleNamespace(
+            session_id="abc123",
+            store=SimpleNamespace(update_llm_config=Mock()),
+            llm=SimpleNamespace(provider="anthropic", model="claude-sonnet-4.5"),
+        )
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True):
+            result = _handle_local_command(ctx, "/apikey anthropic")
+
+        self.assertIn("Anthropic key loaded", result)
+        self.assertEqual(ctx.llm.provider, "anthropic")
+        self.assertEqual(ctx.llm.model, "claude-sonnet-4.5")
 
     def test_api_key_command_is_redacted_for_history(self) -> None:
         self.assertEqual(
@@ -485,20 +624,76 @@ class LocalCommandTests(unittest.TestCase):
             result = _handle_local_command(ctx, "/model new-model")
 
         self.assertEqual(ctx.llm.model, "new-model")
-        self.assertIn("Model switched to new-model", result)
+        self.assertEqual(result, "LM Studio · new-model")
 
     def test_model_command_switches_known_local_model_to_ollama(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="anthropic", model="claude-3-5-sonnet-latest"))
 
         with (
-            patch("nym_agent.main._resolve_local_model_name", side_effect=AssertionError("local probe")),
+            patch("nym_agent.main._resolve_local_model_name", return_value=("llama3.1", None)),
             patch("nym_agent.main.LLMClient", return_value=SimpleNamespace(provider="ollama", model="llama3.1", configuration_error=None)) as client,
         ):
             result = _handle_local_command(ctx, "/model llama3.1")
 
         client.assert_called_once_with(model="llama3.1", provider="ollama")
         self.assertEqual(ctx.llm.provider, "ollama")
-        self.assertIn("local app, install outside workspace", result)
+        self.assertEqual(result, "Ollama · llama3.1")
+
+    def test_missing_ollama_model_offers_install_action_without_login(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        with patch(
+            "nym_agent.main._discover_provider_models",
+            return_value=(["qwen3:latest"], None),
+        ):
+            result = _handle_local_command(ctx, "/model ollama llama3.3")
+
+        self.assertIn("Status: model not installed", result)
+        self.assertIn("/install ollama llama3.3", result)
+        self.assertNotIn("login", result.casefold())
+
+    def test_offline_ollama_runtime_is_reported_as_unavailable(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        with patch(
+            "nym_agent.main._discover_provider_models",
+            return_value=([], "connection refused"),
+        ):
+            result = _handle_local_command(ctx, "/model ollama llama3.3")
+
+        self.assertIn("Status: runtime unavailable", result)
+        self.assertIn("https://ollama.com/download", result)
+        self.assertIn("/install ollama llama3.3", result)
+
+    def test_install_ollama_model_pulls_then_selects_it(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+        completed = SimpleNamespace(returncode=0, stdout="success", stderr="")
+
+        with (
+            patch("nym_agent.main.shutil.which", return_value="/usr/bin/ollama"),
+            patch("nym_agent.main.subprocess.run", return_value=completed) as run,
+            patch("nym_agent.main._switch_model", return_value="Ollama · llama3.3") as switch,
+        ):
+            result = _handle_local_command(ctx, "/install ollama llama3.3")
+
+        run.assert_called_once_with(
+            ["ollama", "pull", "llama3.3"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        switch.assert_called_once_with(ctx, model="llama3.3", provider="ollama")
+        self.assertIn("Installed `llama3.3`", result)
+
+    def test_install_local_model_without_standard_installer_shows_manual_setup(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        result = _handle_local_command(ctx, "/install llamacpp coder.gguf")
+
+        self.assertIn("Automatic installation is not available for llama.cpp", result)
+        self.assertIn("compatible GGUF", result)
+        self.assertNotIn("login", result.casefold())
 
     def test_model_command_lists_provider_model_hints(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="deepseek", model="deepseek-chat"))
@@ -543,6 +738,15 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("OPENAI_API_KEY", result)
         self.assertIn("Ollama local", result)
         self.assertIn("not in this workspace", result)
+
+    def test_local_open_source_provider_never_opens_login(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="llamacpp", model="local-model"))
+
+        with patch("nym_agent.main.webbrowser.open") as open_browser:
+            result = _handle_local_command(ctx, "/login llamacpp")
+
+        open_browser.assert_not_called()
+        self.assertIn("needs no login", result)
 
     def test_slash_exit_aliases_are_exit_commands(self) -> None:
         self.assertTrue(_is_exit_command("/exit"))

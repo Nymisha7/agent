@@ -1,7 +1,9 @@
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from nym_agent.main import _selected_model
 from nym_agent.session_store import SessionStore
@@ -38,6 +40,40 @@ class SessionStoreTests(unittest.TestCase):
             updated = store.get_session(session.id)
             self.assertEqual(updated.provider, "deepseek")
             self.assertEqual(updated.model, "deepseek-chat")
+
+    def test_default_falls_back_to_workspace_db_when_default_db_is_unusable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg_home = Path(tmp) / "xdg"
+            preferred = xdg_home / "nym" / "sessions.sqlite3"
+            fallback = Path.cwd() / ".nym-session.sqlite3"
+
+            def fake_init(store: SessionStore, db_path: Path) -> None:
+                store.db_path = Path(db_path)
+                if Path(db_path) == preferred:
+                    raise sqlite3.OperationalError("attempt to write a readonly database")
+
+            with (
+                patch.dict("os.environ", {"XDG_DATA_HOME": str(xdg_home)}, clear=True),
+                patch.object(SessionStore, "__init__", fake_init),
+            ):
+                store = SessionStore.default()
+
+            self.assertEqual(store.db_path, fallback)
+
+    def test_default_respects_explicit_session_db_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            explicit = Path(tmp) / "explicit.sqlite3"
+
+            def fake_init(store: SessionStore, db_path: Path) -> None:
+                store.db_path = Path(db_path)
+                raise sqlite3.OperationalError("attempt to write a readonly database")
+
+            with (
+                patch.dict("os.environ", {"NYM_SESSION_DB": str(explicit)}, clear=True),
+                patch.object(SessionStore, "__init__", fake_init),
+                self.assertRaises(sqlite3.OperationalError),
+            ):
+                SessionStore.default()
 
 
 class ModelSelectionTests(unittest.TestCase):

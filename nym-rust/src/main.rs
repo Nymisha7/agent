@@ -20,12 +20,13 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::{Child, Command as ProcessCommand, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -322,6 +323,11 @@ struct TuiArgs {
 
     #[arg(long)]
     session_id: String,
+
+    /// API keys entered in the masked TUI prompt. They live only for this
+    /// process and are forwarded to bridge children through their environment.
+    #[arg(skip)]
+    api_keys: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -348,7 +354,6 @@ struct BridgeSession {
     id: String,
     title: String,
     workspace_root: String,
-    updated_at: String,
     provider: String,
     model: String,
     mode: String,
@@ -426,8 +431,6 @@ struct BridgeEvent {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    arguments: Option<String>,
-    #[serde(default)]
     summary: Option<String>,
 }
 
@@ -435,6 +438,13 @@ struct BridgeEvent {
 struct ActivityLine {
     kind: String,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct UiNotice {
+    title: String,
+    text: String,
+    error: bool,
 }
 
 #[derive(Debug)]
@@ -457,7 +467,13 @@ struct TuiApp {
     reasoning_text: String,
     streaming_text: String,
     running_prompt: Option<String>,
+    secret_provider: Option<String>,
+    secret_input: String,
+    notices: Vec<UiNotice>,
+    setup_required: bool,
 }
+
+const PALETTE_PAGE_SIZE: usize = 12;
 
 fn parse_strategy(raw: &str) -> SearchStrategy {
     match raw {
@@ -1044,6 +1060,27 @@ fn run_tui(args: TuiArgs) -> Result<()> {
     let snapshot = initial
         .snapshot
         .ok_or_else(|| anyhow::anyhow!("Bridge did not return a snapshot."))?;
+    let initial_secret_provider =
+        configuration_needs_api_key(&snapshot.session).then(|| snapshot.session.provider.clone());
+    let initial_needs_setup = snapshot.session.configuration != "ready";
+    let initial_status = if let Some(provider) = initial_secret_provider.as_deref() {
+        format!("{} needs an API key", provider_display_name(provider))
+    } else if initial_needs_setup {
+        format!(
+            "{} needs setup",
+            provider_display_name(&snapshot.session.provider)
+        )
+    } else {
+        String::from("Ready")
+    };
+    let initial_notices = if initial_needs_setup {
+        vec![provider_setup_notice(
+            &snapshot.session.provider,
+            &snapshot.session.configuration,
+        )]
+    } else {
+        Vec::new()
+    };
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1057,7 +1094,7 @@ fn run_tui(args: TuiArgs) -> Result<()> {
         TuiApp {
             snapshot,
             input: String::new(),
-            status: String::from("Ready"),
+            status: initial_status,
             scroll: 0,
             auto_follow: true,
             submitting: false,
@@ -1069,6 +1106,10 @@ fn run_tui(args: TuiArgs) -> Result<()> {
             reasoning_text: String::new(),
             streaming_text: String::new(),
             running_prompt: None,
+            secret_provider: initial_secret_provider,
+            secret_input: String::new(),
+            notices: initial_notices,
+            setup_required: initial_needs_setup,
         },
     );
 
@@ -1105,7 +1146,21 @@ fn run_tui_loop(
         }
 
         match key.code {
-            KeyCode::Esc => break,
+            KeyCode::Esc => {
+                if app.secret_provider.is_some() {
+                    app.secret_provider = None;
+                    app.secret_input.clear();
+                    app.status = String::from("API key entry cancelled");
+                    continue;
+                }
+                if palette_is_open(&app) || !app.input.is_empty() {
+                    app.input.clear();
+                    app.palette = BridgeCompletions::default();
+                    app.palette_selected = 0;
+                    continue;
+                }
+                break;
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 apply_approval_action(&args, &mut app, "approve");
@@ -1125,10 +1180,51 @@ fn run_tui_loop(
                 }
             }
             KeyCode::Backspace => {
-                app.input.pop();
-                refresh_palette(&args, &mut app);
+                if app.secret_provider.is_some() {
+                    app.secret_input.pop();
+                } else {
+                    app.input.pop();
+                    refresh_palette(&args, &mut app);
+                }
             }
             KeyCode::Enter => {
+                if let Some(provider) = app.secret_provider.take() {
+                    let api_key = app.secret_input.trim().to_string();
+                    app.secret_input.clear();
+                    if api_key.is_empty() {
+                        app.status = String::from("API key entry cancelled");
+                        continue;
+                    }
+                    let Some(env_name) = provider_api_key_env(&provider) else {
+                        app.status = format!("No API-key setup is available for {provider}");
+                        continue;
+                    };
+                    if let Ok(mut api_keys) = args.api_keys.lock() {
+                        api_keys.insert(env_name.to_string(), api_key);
+                    } else {
+                        app.status = String::from("Could not hold the API key in memory");
+                        continue;
+                    }
+
+                    let prompt = format!("/apikey {provider}");
+                    app.submitting = true;
+                    app.status = format!("Configuring {}", provider_display_name(&provider));
+                    app.running_prompt = None;
+                    app.activity.clear();
+                    app.reasoning_text.clear();
+                    app.streaming_text.clear();
+                    app.current_tool = None;
+                    let tx_clone = tx.clone();
+                    let err_tx = tx.clone();
+                    let args_clone = args.clone();
+                    thread::spawn(move || {
+                        let result = stream_bridge_submit(&args_clone, &prompt, tx_clone);
+                        if let Err(err) = result {
+                            let _ = err_tx.send(AppEvent::StreamFrame(Err(err)));
+                        }
+                    });
+                    continue;
+                }
                 if !app.palette.entries.is_empty() && app.input.starts_with('/') {
                     let selected = app.palette.entries.get(app.palette_selected).cloned();
                     if let Some(entry) = selected {
@@ -1170,7 +1266,7 @@ fn run_tui_loop(
                 });
             }
             KeyCode::Up => {
-                if !app.palette.entries.is_empty() && app.input.starts_with('/') {
+                if palette_is_open(&app) {
                     app.palette_selected = app.palette_selected.saturating_sub(1);
                 } else {
                     app.auto_follow = false;
@@ -1178,7 +1274,7 @@ fn run_tui_loop(
                 }
             }
             KeyCode::Down => {
-                if !app.palette.entries.is_empty() && app.input.starts_with('/') {
+                if palette_is_open(&app) {
                     let max_index = app.palette.entries.len().saturating_sub(1);
                     app.palette_selected = (app.palette_selected + 1).min(max_index);
                 } else {
@@ -1186,20 +1282,41 @@ fn run_tui_loop(
                 }
             }
             KeyCode::PageUp => {
-                app.auto_follow = false;
-                app.scroll = app.scroll.saturating_sub(10);
+                if palette_is_open(&app) {
+                    app.palette_selected = app.palette_selected.saturating_sub(PALETTE_PAGE_SIZE);
+                } else {
+                    app.auto_follow = false;
+                    app.scroll = app.scroll.saturating_sub(10);
+                }
             }
             KeyCode::PageDown => {
-                app.scroll = app.scroll.saturating_add(10);
+                if palette_is_open(&app) {
+                    let max_index = app.palette.entries.len().saturating_sub(1);
+                    app.palette_selected =
+                        (app.palette_selected + PALETTE_PAGE_SIZE).min(max_index);
+                } else {
+                    app.scroll = app.scroll.saturating_add(10);
+                }
             }
             KeyCode::Home => {
-                app.scroll = 0;
-                app.auto_follow = false;
+                if palette_is_open(&app) {
+                    app.palette_selected = 0;
+                } else {
+                    app.scroll = 0;
+                    app.auto_follow = false;
+                }
             }
             KeyCode::End => {
-                app.auto_follow = true;
+                if palette_is_open(&app) {
+                    app.palette_selected = app.palette.entries.len().saturating_sub(1);
+                } else {
+                    app.auto_follow = true;
+                }
             }
             KeyCode::Tab => {
+                if app.secret_provider.is_some() {
+                    continue;
+                }
                 if let Some(entry) = app.palette.entries.get(app.palette_selected) {
                     app.input = entry.complete_to.clone();
                     refresh_palette(&args, &mut app);
@@ -1207,8 +1324,12 @@ fn run_tui_loop(
             }
             KeyCode::Char(ch) => {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                    app.input.push(ch);
-                    refresh_palette(&args, &mut app);
+                    if app.secret_provider.is_some() {
+                        app.secret_input.push(ch);
+                    } else {
+                        app.input.push(ch);
+                        refresh_palette(&args, &mut app);
+                    }
                 }
             }
             _ => {}
@@ -1246,7 +1367,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
     let header_lines = vec![
         Line::from(vec![
             Span::styled(
-                " nym ",
+                " NYM ",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -1259,13 +1380,14 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("  {}", clip_status(&session.workspace_root, 42)),
-                Style::default().fg(Color::DarkGray),
-            ),
         ]),
         Line::from(vec![
-            Span::styled(" session ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" workspace ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                clip_status(&session.workspace_root, 34),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled("  session ", Style::default().fg(Color::DarkGray)),
             Span::styled(session.id.clone(), Style::default().fg(Color::Gray)),
             Span::styled("  model ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -1274,8 +1396,6 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
             ),
             Span::styled("  mode ", Style::default().fg(Color::DarkGray)),
             Span::styled(session.mode.clone(), Style::default().fg(Color::Magenta)),
-            Span::styled("  updated ", Style::default().fg(Color::DarkGray)),
-            Span::styled(session.updated_at.clone(), Style::default().fg(Color::Gray)),
         ]),
     ];
     frame.render_widget(
@@ -1301,7 +1421,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
     let transcript_title = if app.submitting {
         format!(" {} ", clip_status(&app.status, 42))
     } else {
-        String::from(" transcript ")
+        String::from(" conversation ")
     };
     let transcript = Paragraph::new(transcript_lines)
         .block(
@@ -1322,16 +1442,13 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         draw_sidebar(frame, body[1], app);
     }
 
+    let (state_label, state_color) = ui_state_badge(app);
     let status = Line::from(vec![
         Span::styled(
-            format!(" {} ", if app.submitting { "running" } else { "ready" }),
+            format!(" {state_label} "),
             Style::default()
                 .fg(Color::Black)
-                .bg(if app.submitting {
-                    Color::Cyan
-                } else {
-                    Color::Green
-                })
+                .bg(state_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
@@ -1352,8 +1469,10 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         Span::styled(
             format!(
                 "  {}",
-                if app.snapshot.approvals.is_empty() {
-                    "Enter submit  / commands  Tab complete  End follow  Esc exit"
+                if app.secret_provider.is_some() {
+                    "Enter save key  Esc cancel  input hidden"
+                } else if app.snapshot.approvals.is_empty() {
+                    "Enter send  / commands  Tab complete  End follow  Esc close"
                 } else {
                     "Ctrl+A approve  Ctrl+D deny  Ctrl+N/P select"
                 }
@@ -1363,12 +1482,22 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
     ]);
     frame.render_widget(Paragraph::new(status), chunks[2]);
 
-    let input_title = if app.submitting {
-        " compose (busy) "
+    let input_title = if let Some(provider) = app.secret_provider.as_deref() {
+        format!(
+            " {} API key (kept in memory) ",
+            provider_display_name(provider)
+        )
+    } else if app.submitting {
+        String::from(" message (agent working) ")
     } else if !app.palette.entries.is_empty() && app.input.starts_with('/') {
-        " command "
+        String::from(" command ")
     } else {
-        " compose "
+        String::from(" message ")
+    };
+    let visible_input = if app.secret_provider.is_some() {
+        "•".repeat(app.secret_input.chars().count())
+    } else {
+        app.input.clone()
     };
     let input_text = Line::from(vec![
         Span::styled(
@@ -1377,7 +1506,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(app.input.as_str()),
+        Span::raw(visible_input.as_str()),
     ]);
     let input = Paragraph::new(input_text)
         .block(
@@ -1385,6 +1514,8 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(if app.submitting {
                     Color::DarkGray
+                } else if app.secret_provider.is_some() {
+                    Color::Yellow
                 } else {
                     Color::Cyan
                 }))
@@ -1393,8 +1524,10 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         .wrap(Wrap { trim: false });
     frame.render_widget(input, chunks[3]);
 
-    if !app.palette.entries.is_empty() && app.input.starts_with('/') {
-        let popup_height = (app.palette.entries.len() as u16 + 2).min(11);
+    if palette_is_open(app) {
+        let max_popup_height = chunks[3].y.saturating_sub(area.y).clamp(3, 20);
+        let popup_height = (app.palette.entries.len() as u16 + 2).min(max_popup_height);
+        let visible_count = popup_height.saturating_sub(2) as usize;
         let popup_y = chunks[3].y.saturating_sub(popup_height);
         let popup_area = Rect {
             x: chunks[3].x,
@@ -1406,6 +1539,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         let popup = Paragraph::new(palette_text(
             &app.palette,
             app.palette_selected,
+            visible_count,
             popup_area.width,
         ))
         .block(
@@ -1421,7 +1555,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
     let cursor_x = chunks[3]
         .x
         .saturating_add(3)
-        .saturating_add(app.input.chars().count() as u16);
+        .saturating_add(visible_input.chars().count() as u16);
     let cursor_y = chunks[3].y.saturating_add(1);
     frame.set_cursor_position((cursor_x.min(chunks[3].right().saturating_sub(2)), cursor_y));
 }
@@ -1474,14 +1608,19 @@ fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn session_panel_text(app: &TuiApp) -> Text<'static> {
     let session = &app.snapshot.session;
+    let configuration_ready = session.configuration == "ready";
     let lines = vec![
         metric_line("Source", &session.provider, Color::Cyan),
         metric_line("Model", &clip_status(&session.model, 20), Color::White),
         metric_line("Mode", &session.mode, Color::Magenta),
         metric_line(
             "Config",
-            &clip_status(&session.configuration, 20),
-            Color::Yellow,
+            configuration_summary(session),
+            if configuration_ready {
+                Color::Green
+            } else {
+                Color::Yellow
+            },
         ),
         Line::from(""),
         metric_line(
@@ -1597,15 +1736,12 @@ fn activity_panel_text(app: &TuiApp) -> Text<'static> {
     } else if !app.reasoning_text.trim().is_empty() {
         lines.push(Line::from(vec![
             Span::styled(
-                "~ ",
+                "· ",
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                clip_status(&app.reasoning_text, 28),
-                Style::default().fg(Color::Blue),
-            ),
+            Span::styled("Reasoning", Style::default().fg(Color::Blue)),
         ]));
     }
     Text::from(lines)
@@ -1690,6 +1826,28 @@ fn transcript_text(snapshot: &BridgeSnapshot, app: &TuiApp) -> Text<'static> {
         }
         lines.push(Line::from(""));
     }
+    for notice in &app.notices {
+        let color = if notice.error {
+            Color::Red
+        } else {
+            Color::Cyan
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if notice.error { " ERROR " } else { " SETUP " },
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(notice.title.clone(), Style::default().fg(color)),
+        ]));
+        for line in notice.text.lines() {
+            lines.push(message_body_line(line));
+        }
+        lines.push(Line::from(""));
+    }
     if let Some(prompt) = &app.running_prompt {
         lines.push(role_header("user", "in progress"));
         lines.push(message_body_line(prompt));
@@ -1712,25 +1870,51 @@ fn transcript_text(snapshot: &BridgeSnapshot, app: &TuiApp) -> Text<'static> {
         }
         lines.push(Line::from(""));
     } else if !app.reasoning_text.trim().is_empty() {
-        lines.push(role_header("assistant", "thinking"));
-        for line in app.reasoning_text.lines() {
-            lines.push(message_body_line(line));
-        }
+        lines.push(Line::from(vec![
+            Span::styled("  · ", Style::default().fg(Color::Blue)),
+            Span::styled("Reasoning", Style::default().fg(Color::DarkGray)),
+        ]));
         lines.push(Line::from(""));
     }
     if lines.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "No messages yet. Start with a prompt or type / for commands.",
+            "What would you like to build? Type / for commands.",
             Style::default().fg(Color::DarkGray),
         )]));
     }
     Text::from(lines)
 }
 
-fn palette_text(palette: &BridgeCompletions, selected: usize, width: u16) -> Text<'static> {
+fn palette_is_open(app: &TuiApp) -> bool {
+    app.secret_provider.is_none() && !app.palette.entries.is_empty() && app.input.starts_with('/')
+}
+
+fn palette_visible_start(total: usize, selected: usize, visible_count: usize) -> usize {
+    if total <= visible_count || visible_count == 0 {
+        return 0;
+    }
+    let selected = selected.min(total.saturating_sub(1));
+    let max_start = total.saturating_sub(visible_count);
+    selected
+        .saturating_sub(visible_count.saturating_sub(1))
+        .min(max_start)
+}
+
+fn palette_text(
+    palette: &BridgeCompletions,
+    selected: usize,
+    visible_count: usize,
+    width: u16,
+) -> Text<'static> {
     let mut lines = Vec::new();
     let label_width = if width > 64 { 24 } else { 16 };
-    for (index, entry) in palette.entries.iter().enumerate() {
+    let total = palette.entries.len();
+    let selected = selected.min(total.saturating_sub(1));
+    let visible_count = visible_count.max(1);
+    let start = palette_visible_start(total, selected, visible_count);
+    let end = (start + visible_count).min(total);
+    for (index, entry) in palette.entries[start..end].iter().enumerate() {
+        let index = start + index;
         let selected_style = if index == selected {
             Style::default()
                 .fg(Color::Black)
@@ -1772,6 +1956,24 @@ fn bullet_for_kind(kind: &str) -> &'static str {
         "guardrail" => "!",
         "text" => ":",
         _ => "-",
+    }
+}
+
+fn tool_activity_label(tool: &str) -> String {
+    match tool {
+        "read_path" => String::from("Reading files"),
+        "list_path" => String::from("Listing files"),
+        "inspect_tree" => String::from("Exploring the workspace"),
+        "inspect_target" => String::from("Inspecting a target"),
+        "glob" => String::from("Finding files"),
+        "grep" => String::from("Searching code"),
+        "language_server" => String::from("Checking code intelligence"),
+        "write_file" => String::from("Writing a file"),
+        "edit_file" => String::from("Editing a file"),
+        "delete_path" => String::from("Deleting a path"),
+        "run_system_command" => String::from("Running a command"),
+        "finish_task" => String::from("Preparing the response"),
+        _ => format!("Running {tool}"),
     }
 }
 
@@ -1861,8 +2063,8 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                 }
             }
             "final" => {
+                let completed_prompt = app.running_prompt.take();
                 app.submitting = false;
-                app.running_prompt = None;
                 app.current_tool = None;
                 app.reasoning_text.clear();
                 app.streaming_text.clear();
@@ -1871,20 +2073,45 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     let max_index = app.snapshot.approvals.len().saturating_sub(1);
                     app.approval_selected = app.approval_selected.min(max_index);
                 }
-                app.status =
-                    if frame.error.is_some() || !frame.error.as_deref().unwrap_or("").is_empty() {
-                        frame
-                            .error
-                            .as_deref()
-                            .map(|text| format!("Error: {}", clip_status(text, 96)))
-                            .unwrap_or_else(|| String::from("Ready"))
+                let error = frame.error.as_deref().filter(|text| !text.is_empty());
+                if let Some(error) = error {
+                    push_notice(app, "Request failed", error, true);
+                    app.status = String::from("Error — details shown in conversation");
+                } else if let Some(answer) = frame.answer.as_deref() {
+                    let answer_needs_setup = local_answer_needs_setup(answer);
+                    app.setup_required =
+                        app.snapshot.session.configuration != "ready" || answer_needs_setup;
+                    let is_local_command = completed_prompt
+                        .as_deref()
+                        .is_some_and(|prompt| prompt.trim_start().starts_with('/'));
+                    if is_local_command && !answer.trim().is_empty() {
+                        let title = if app.setup_required {
+                            format!(
+                                "{} setup",
+                                provider_display_name(&app.snapshot.session.provider)
+                            )
+                        } else {
+                            String::from("Command result")
+                        };
+                        push_notice(app, &title, answer, false);
+                    }
+                    app.status = if answer.contains("Status: model not installed") {
+                        String::from("Model not installed — use /install when available")
+                    } else if answer.contains("Status: runtime unavailable") {
+                        String::from("Local runtime unavailable — setup details shown above")
                     } else {
-                        frame
-                            .answer
-                            .as_deref()
-                            .map(|text| clip_status(text, 96))
-                            .unwrap_or_else(|| String::from("Ready"))
+                        clip_status(answer, 72)
                     };
+                } else {
+                    app.status = String::from("Ready");
+                    app.setup_required = app.snapshot.session.configuration != "ready";
+                }
+                if configuration_needs_api_key(&app.snapshot.session) {
+                    let provider = app.snapshot.session.provider.clone();
+                    app.secret_provider = Some(provider.clone());
+                    app.secret_input.clear();
+                    app.status = format!("{} needs an API key", provider_display_name(&provider));
+                }
                 if !matches!(app.activity.last(), Some(ActivityLine { kind, .. }) if kind == "thinking")
                 {
                     app.activity.push(ActivityLine {
@@ -1900,17 +2127,18 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             app.running_prompt = None;
             app.current_tool = None;
             app.reasoning_text.clear();
-            app.status = format!("Error: {}", clip_status(&err.to_string(), 96));
+            push_notice(app, "Bridge failed", &err.to_string(), true);
+            app.status = String::from("Error — details shown in conversation");
         }
     }
 }
 
 fn apply_bridge_event(app: &mut TuiApp, event: BridgeEvent) {
     match event.kind.as_str() {
-        "reasoning_delta" => {
-            if let Some(delta) = event.delta {
-                app.reasoning_text.push_str(&delta);
-            }
+        "reasoning_delta" | "reasoning_started" => {
+            // Raw chain-of-thought is private. Keep only a visible activity
+            // indicator and render tool/results as the inspectable trace.
+            app.reasoning_text = String::from("Reasoning");
         }
         "text_delta" => {
             if let Some(delta) = event.delta {
@@ -1928,10 +2156,9 @@ fn apply_bridge_event(app: &mut TuiApp, event: BridgeEvent) {
                 .current_tool
                 .take()
                 .unwrap_or_else(|| String::from("tool"));
-            let args = event.arguments.unwrap_or_default();
             app.activity.push(ActivityLine {
                 kind: String::from("tool"),
-                text: format!("{}({})", tool, clip_status(&args, 56)),
+                text: tool_activity_label(&tool),
             });
         }
         "tool_result" | "approval_request" | "approval_decision" => {
@@ -1952,6 +2179,148 @@ fn apply_bridge_event(app: &mut TuiApp, event: BridgeEvent) {
     }
 }
 
+fn provider_api_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "gemini" => Some("GOOGLE_API_KEY"),
+        "groq" => Some("GROQ_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "azure" => Some("AZURE_OPENAI_API_KEY"),
+        "deepseek" => Some("DEEPSEEK_API_KEY"),
+        "glm" => Some("GLM_API_KEY"),
+        _ => None,
+    }
+}
+
+fn provider_display_name(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic",
+        "gemini" => "Google Gemini",
+        "groq" => "Groq",
+        "openrouter" => "OpenRouter",
+        "azure" => "Azure OpenAI",
+        "bedrock" => "AWS Bedrock",
+        "vertexai" => "Vertex AI",
+        "copilot" => "GitHub Copilot",
+        "openai-compatible" => "OpenAI-compatible",
+        "ollama" => "Ollama",
+        "lmstudio" => "LM Studio",
+        "llamacpp" => "llama.cpp",
+        "vllm" => "vLLM",
+        "localai" => "LocalAI",
+        "deepseek" => "DeepSeek",
+        "glm" => "GLM",
+        _ => "Provider",
+    }
+}
+
+fn provider_setup_url(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("https://platform.openai.com/api-keys"),
+        "anthropic" => Some("https://console.anthropic.com/settings/keys"),
+        "gemini" => Some("https://aistudio.google.com/app/apikey"),
+        "groq" => Some("https://console.groq.com/keys"),
+        "openrouter" => Some("https://openrouter.ai/settings/keys"),
+        "azure" => Some("https://ai.azure.com"),
+        "bedrock" => Some("https://console.aws.amazon.com/bedrock/home"),
+        "vertexai" => Some("https://console.cloud.google.com/vertex-ai"),
+        "copilot" => Some("https://github.com/login/device"),
+        "deepseek" => Some("https://platform.deepseek.com/api_keys"),
+        "glm" => Some("https://bigmodel.cn/usercenter/proj-mgmt/apikeys"),
+        _ => None,
+    }
+}
+
+fn provider_setup_notice(provider: &str, configuration: &str) -> UiNotice {
+    let mut text = configuration.to_string();
+    let configuration_lower = configuration.to_ascii_lowercase();
+    let needs_api_key = provider_api_key_env(provider).is_some()
+        && (configuration_lower.contains("not configured")
+            || configuration_lower.contains("api key")
+            || configuration_lower.contains("api_key"));
+    if needs_api_key {
+        text.push_str("\nPaste the API key in the masked input below.");
+    } else if provider == "openai-compatible" {
+        text.push_str("\nConfigure NYM_OPENAI_COMPAT_BASE_URL, then restart Nym.");
+    } else {
+        text.push_str("\nComplete the provider setup, then return to Nym.");
+    }
+    if let Some(url) = provider_setup_url(provider) {
+        text.push_str("\nAccount/API keys: ");
+        text.push_str(url);
+    }
+    UiNotice {
+        title: format!("{} setup", provider_display_name(provider)),
+        text,
+        error: false,
+    }
+}
+
+fn push_notice(app: &mut TuiApp, title: &str, text: &str, error: bool) {
+    const MAX_NOTICES: usize = 20;
+    if app.notices.len() >= MAX_NOTICES {
+        app.notices.remove(0);
+    }
+    app.notices.push(UiNotice {
+        title: title.to_string(),
+        text: text.to_string(),
+        error,
+    });
+}
+
+fn ui_state_badge(app: &TuiApp) -> (&'static str, Color) {
+    if app.submitting {
+        return ("running", Color::Cyan);
+    }
+    if app.secret_provider.is_some() {
+        return ("setup", Color::Yellow);
+    }
+    if app.status.starts_with("Error") || app.status.starts_with("Could not") {
+        return ("error", Color::Red);
+    }
+    if app.setup_required || app.snapshot.session.configuration != "ready" {
+        return ("setup", Color::Yellow);
+    }
+    ("ready", Color::Green)
+}
+
+fn configuration_needs_api_key(session: &BridgeSession) -> bool {
+    if provider_api_key_env(&session.provider).is_none() {
+        return false;
+    }
+    let configuration = session.configuration.to_ascii_lowercase();
+    configuration.contains("not configured")
+        || configuration.contains("api key")
+        || configuration.contains("api_key")
+}
+
+fn configuration_summary(session: &BridgeSession) -> &'static str {
+    if session.configuration == "ready" {
+        "Ready"
+    } else if configuration_needs_api_key(session) {
+        "API key required"
+    } else {
+        "Setup required"
+    }
+}
+
+fn local_answer_needs_setup(answer: &str) -> bool {
+    answer.contains("Status: runtime unavailable")
+        || answer.contains("Status: model not installed")
+        || answer.contains("Automatic installation is not available")
+        || answer.contains("runtime is not installed")
+}
+
+fn apply_bridge_credentials(command: &mut ProcessCommand, args: &TuiArgs) {
+    if let Ok(api_keys) = args.api_keys.lock() {
+        for (env_name, api_key) in api_keys.iter() {
+            command.env(env_name, api_key);
+        }
+    }
+}
+
 fn call_bridge(args: &TuiArgs, action: &str, prompt: Option<&str>) -> Result<BridgeResponse> {
     let mut command = ProcessCommand::new(&args.python);
     command
@@ -1962,6 +2331,7 @@ fn call_bridge(args: &TuiArgs, action: &str, prompt: Option<&str>) -> Result<Bri
         .arg("--bridge-session-id")
         .arg(&args.session_id)
         .current_dir(&args.repo_root);
+    apply_bridge_credentials(&mut command, args);
     if let Some(prompt) = prompt {
         command.arg("--bridge-prompt").arg(prompt);
     }
@@ -2022,6 +2392,7 @@ fn call_bridge_with_request_id(
         .arg("--bridge-request-id")
         .arg(request_id)
         .current_dir(&args.repo_root);
+    apply_bridge_credentials(&mut command, args);
 
     let output = command.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -2064,7 +2435,16 @@ fn stream_bridge_submit(args: &TuiArgs, prompt: &str, tx: mpsc::Sender<AppEvent>
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("Bridge stdout was not captured."))?;
+    let stderr = child.stderr.take();
+    let stderr_reader = stderr.map(|mut pipe| {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            text
+        })
+    });
     let reader = BufReader::new(stdout);
+    let mut saw_final_frame = false;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -2077,14 +2457,27 @@ fn stream_bridge_submit(args: &TuiArgs, prompt: &str, tx: mpsc::Sender<AppEvent>
                 line
             )
         })?;
+        if parsed.kind == "final" {
+            saw_final_frame = true;
+        }
         let _ = tx.send(AppEvent::StreamFrame(Ok(parsed)));
     }
     let status = child.wait()?;
-    if !status.success() {
-        let _ = tx.send(AppEvent::StreamFrame(Err(anyhow::anyhow!(
-            "Bridge exited with {}",
-            status
-        ))));
+    if !status.success() && !saw_final_frame {
+        let stderr = stderr_reader
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        let detail = stderr.trim();
+        let message = if detail.is_empty() {
+            format!("Bridge exited with {}", status)
+        } else {
+            format!(
+                "Bridge exited with {}: {}",
+                status,
+                clip_status(detail, 160)
+            )
+        };
+        let _ = tx.send(AppEvent::StreamFrame(Err(anyhow::anyhow!(message))));
     }
     Ok(())
 }
@@ -2101,6 +2494,7 @@ fn spawn_bridge(args: &TuiArgs, action: &str, prompt: Option<&str>) -> Result<Ch
         .current_dir(&args.repo_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_bridge_credentials(&mut command, args);
     if let Some(prompt) = prompt {
         command.arg("--bridge-prompt").arg(prompt);
     }

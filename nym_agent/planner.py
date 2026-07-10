@@ -730,23 +730,52 @@ def _approval_request_from_observation(
     return request
 
 
+# def _tool_operation(tool: str) -> str:
+#     return {
+#         "read_path": "read",
+#         "list_path": "read",
+#         "inspect_target": "read",
+#         "inspect_tree": "read",
+#         "glob": "read",
+#         "grep": "read",
+#         "secret_scan": "read",
+#         "system_info": "read",
+#         "connected_devices": "read",
+#         "process_list": "read",
+#         "run_system_command": "system",
+#         "write_file": "write",
+#         "edit_file": "write",
+#         "delete_path": "delete",
+#     }.get(tool, "read")
+
 def _tool_operation(tool: str) -> str:
     return {
+        # File content access
         "read_path": "read",
-        "list_path": "read",
-        "inspect_target": "read",
-        "inspect_tree": "read",
-        "glob": "read",
-        "grep": "read",
-        "secret_scan": "read",
-        "system_info": "read",
-        "connected_devices": "read",
-        "process_list": "read",
+
+        # File-system discovery
+        "list_path": "list",
+        "inspect_target": "inspect",
+        "inspect_tree": "inspect",
+        "glob": "search",
+        "grep": "search",
+
+        # Security inspection
+        "secret_scan": "security_scan",
+
+        # System inspection
+        "system_info": "system_info",
+        "connected_devices": "device_query",
+        "process_list": "process_query",
+
+        # System mutation / execution
         "run_system_command": "system",
+
+        # File mutations
         "write_file": "write",
         "edit_file": "write",
         "delete_path": "delete",
-    }.get(tool, "read")
+    }.get(tool, "unknown")
 
 
 def _summarize_approval_request(request: dict[str, Any]) -> str:
@@ -1840,9 +1869,10 @@ def _normalize_stream_event(event: Any) -> dict[str, Any] | None:
         return None
 
     if event_type == "response.reasoning_text.delta":
+        # Do not forward private chain-of-thought to UI clients. They receive
+        # a state transition and the inspectable tool/result trace instead.
         return {
-            "kind": "reasoning_delta",
-            "delta": _get(event, "delta", ""),
+            "kind": "reasoning_started",
             "item_id": _get(event, "item_id"),
             "sequence_number": _get(event, "sequence_number"),
         }

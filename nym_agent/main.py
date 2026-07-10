@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import curses
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -83,11 +84,12 @@ DEFAULT_CONTEXT_WINDOWS = {
 
 
 LOCAL_COMMANDS = (
-    ("/model", "Open model picker or switch model"),
-    ("/status", "Show session and model status"),
-    ("/connect", "Set up hosted or local models"),
-    ("/help", "Show commands and shortcuts"),
-    ("/exit", "Exit Nym"),
+    ("/model", "Choose a model or local runtime"),
+    ("/install", "Install an Ollama model"),
+    ("/status", "Show model, context, and session usage"),
+    ("/setup", "Set up local runtimes or hosted providers"),
+    ("/help", "Show commands and keyboard shortcuts"),
+    ("/exit", "Close Nym"),
 )
 
 PROVIDER_API_KEY_ENVS = {
@@ -131,9 +133,12 @@ PROVIDER_DISPLAY_NAMES = {
     "openai-compatible": "Custom OpenAI-compatible",
     "ollama": "Ollama",
     "lmstudio": "LM Studio",
+    "llamacpp": "llama.cpp",
+    "vllm": "vLLM",
+    "localai": "LocalAI",
 }
 PROVIDER_ARGUMENT_COMMANDS = {"/provider", "/login", "/auth", "/apikey", "/key"}
-LOCAL_PROVIDERS = {"ollama", "lmstudio"}
+LOCAL_PROVIDERS = {"ollama", "lmstudio", "llamacpp", "vllm", "localai"}
 PROVIDER_SORT_ORDER = {
     "copilot": 0,
     "anthropic": 1,
@@ -148,7 +153,29 @@ PROVIDER_SORT_ORDER = {
     "glm": 10,
     "ollama": 11,
     "lmstudio": 12,
-    "openai-compatible": 13,
+    "llamacpp": 13,
+    "vllm": 14,
+    "localai": 15,
+    "openai-compatible": 16,
+}
+MODEL_PICKER_SORT_ORDER = {
+    "openai": 0,
+    "anthropic": 1,
+    "ollama": 2,
+    "lmstudio": 3,
+    "llamacpp": 4,
+    "vllm": 5,
+    "localai": 6,
+    "groq": 7,
+    "openrouter": 8,
+    "deepseek": 9,
+    "glm": 10,
+    "gemini": 11,
+    "copilot": 12,
+    "bedrock": 13,
+    "azure": 14,
+    "vertexai": 15,
+    "openai-compatible": 16,
 }
 PROVIDER_MODEL_HINTS = {
     "copilot": (
@@ -251,6 +278,24 @@ PROVIDER_MODEL_HINTS = {
         "glm-4.7-flash",
     ),
     "lmstudio": ("local-model",),
+    "llamacpp": (
+        "local-model",
+        "qwen2.5-coder-7b-instruct",
+        "deepseek-coder-v2-lite-instruct",
+        "codellama-13b-instruct",
+    ),
+    "vllm": (
+        "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+        "meta-llama/Llama-3.3-70B-Instruct",
+        "mistralai/Codestral-22B-v0.1",
+    ),
+    "localai": (
+        "qwen2.5-coder",
+        "deepseek-coder",
+        "llama-3.1-instruct",
+        "codestral",
+    ),
     "openai-compatible": ("local-model",),
     "deepseek": (
         "deepseek-v4-flash",
@@ -442,7 +487,7 @@ class LiveTurnState:
     phase: str = "idle"
     prompt: str = ""
     feed: list[tuple[str, str]] = field(default_factory=list)
-    _reasoning_buf: str = field(default="", init=False, repr=False)
+    _reasoning_active: bool = field(default=False, init=False, repr=False)
     _text_buf: str = field(default="", init=False, repr=False)
     _current_tool: str | None = field(default=None, init=False, repr=False)
     error: str | None = None
@@ -453,13 +498,13 @@ class LiveTurnState:
             self.phase = "thinking"
             self.prompt = prompt
             self.feed = []
-            self._reasoning_buf = ""
+            self._reasoning_active = False
             self._text_buf = ""
             self._current_tool = None
             self.error = None
 
     def _flush_reasoning(self) -> None:
-        self._reasoning_buf = ""
+        self._reasoning_active = False
 
     def _flush_text(self) -> None:
         text = self._text_buf.strip()
@@ -475,7 +520,12 @@ class LiveTurnState:
         delta = event.get("delta")
         with self.lock:
             if kind == "reasoning_delta" and isinstance(delta, str):
-                self._reasoning_buf += delta
+                # Never retain or render raw chain-of-thought. The UI shows a
+                # concise activity state and user-facing results instead.
+                self._reasoning_active = True
+                self.phase = "reasoning"
+            elif kind == "reasoning_started":
+                self._reasoning_active = True
                 self.phase = "reasoning"
             elif kind == "text_delta" and isinstance(delta, str):
                 self._drop_reasoning()
@@ -488,8 +538,7 @@ class LiveTurnState:
                 self._current_tool = name if isinstance(name, str) else ""
                 self.phase = "tool_call"
             elif kind == "tool_call_arguments_done":
-                args = event.get("arguments") or ""
-                label = f"Tool: {self._current_tool}({truncate(args, 72)})"
+                label = _tool_activity_label(self._current_tool)
                 self.feed.append(("tool", label))
                 self._current_tool = None
                 self.phase = "tool_call"
@@ -515,8 +564,9 @@ class LiveTurnState:
             elif kind == "response_completed":
                 self._flush_reasoning()
                 self._flush_text()
-                self.active = False
-                self.phase = "completed"
+                # A model response may be followed by tool execution and another
+                # model step. The worker marks the whole agent turn complete.
+                self.phase = "working"
 
     def finish(self, error: str | None = None) -> None:
         with self.lock:
@@ -530,12 +580,12 @@ class LiveTurnState:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             feed_snapshot = list(self.feed)
-            if self._reasoning_buf and not self._text_buf:
-                feed_snapshot.append(("reasoning", self._reasoning_buf))
+            if self._reasoning_active and not self._text_buf:
+                feed_snapshot.append(("thinking", "Reasoning"))
             if self._text_buf:
                 feed_snapshot.append(("text", self._text_buf))
             if self._current_tool:
-                feed_snapshot.append(("tool", f"Tool: {self._current_tool}(...)"))
+                feed_snapshot.append(("tool", _tool_activity_label(self._current_tool)))
             return {
                 "active": self.active,
                 "phase": self.phase,
@@ -543,6 +593,25 @@ class LiveTurnState:
                 "feed": feed_snapshot,
                 "error": self.error,
             }
+
+
+def _tool_activity_label(name: str | None) -> str:
+    tool = (name or "tool").strip()
+    labels = {
+        "read_path": "Reading files",
+        "list_path": "Listing files",
+        "inspect_tree": "Exploring the workspace",
+        "inspect_target": "Inspecting a target",
+        "glob": "Finding files",
+        "grep": "Searching code",
+        "language_server": "Checking code intelligence",
+        "write_file": "Writing a file",
+        "edit_file": "Editing a file",
+        "delete_path": "Deleting a path",
+        "run_system_command": "Running a command",
+        "finish_task": "Preparing the response",
+    }
+    return labels.get(tool, f"Running {tool}")
 
 
 def _live_tool_result_feed_item(event: dict[str, Any]) -> tuple[str, str]:
@@ -596,7 +665,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted(SUPPORTED_PROVIDERS),
         help=(
             "LLM provider. Defaults to NYM_LLM_PROVIDER or openai. "
-            "Use ollama/lmstudio/deepseek/glm for local no-login providers when no hosted API key is set."
+            "Use ollama, lmstudio, llamacpp, vllm, or localai for no-login local models."
         ),
     )
 
@@ -944,10 +1013,17 @@ def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
         if not provider:
             return "Usage: /apikey <provider> [api-key]"
         if not api_key:
-            return (
-                f"Paste the key using the hidden TUI prompt: /apikey {provider}\n"
-                f"Non-TUI fallback: /apikey {provider} <api-key>"
-            )
+            try:
+                normalized = _normalize_provider(provider)
+            except ValueError as exc:
+                return str(exc)
+            env_name = PROVIDER_API_KEY_ENVS.get(normalized)
+            api_key = os.environ.get(env_name, "") if env_name else ""
+            if not api_key:
+                return (
+                    f"Paste the key using the hidden TUI prompt: /apikey {provider}\n"
+                    f"Non-TUI fallback: /apikey {provider} <api-key>"
+                )
         return _set_provider_api_key(ctx, provider, api_key)
 
     if command in {"/models", "/model"} and len(parts) == 1:
@@ -968,10 +1044,15 @@ def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
             model = parts[1]
         return _switch_model(ctx, model=model, provider=provider)
 
+    if command == "/install":
+        if len(parts) != 3:
+            return "Usage: /install ollama <model>"
+        return _install_local_model(ctx, provider=parts[1], model=parts[2])
+
     if command == "/status":
         return _status_text(ctx)
 
-    if command == "/connect":
+    if command in {"/setup", "/connect"}:
         return _connect_text()
 
     if command == "/help":
@@ -984,10 +1065,11 @@ def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
 
 
 def _slash_help_text() -> str:
-    lines = ["Local commands:"]
+    lines = ["Commands"]
     lines.extend(f"{name} - {description}" for name, description in LOCAL_COMMANDS)
-    lines.append("Ctrl+P - open command palette")
-    lines.append("Tab - complete a unique slash command")
+    lines.append("")
+    lines.append("Type / to open the command menu. Use Up/Down to select and Tab to complete.")
+    lines.append("Enter sends · Esc exits · PgUp/PgDn scrolls")
     return "\n".join(lines)
 
 
@@ -1081,9 +1163,10 @@ def _models_text(ctx: AppContext) -> str:
         "",
         "Switch model: /model <model>",
         "Choose exact source/model: /model <source> <model>",
-        "Hosted models open auth automatically when a key is missing.",
+        "Hosted providers ask for a key only when one is required.",
+        "Open-source models run through local runtimes and never require Nym login.",
         "Local models are not installed in this workspace.",
-        "Install them in Ollama or LM Studio first, then switch to them here.",
+        "Start Ollama, LM Studio, llama.cpp, vLLM, or LocalAI first, then select its loaded model.",
     ])
 
     return "\n".join(lines)
@@ -1131,13 +1214,20 @@ def _resolve_local_model_name(
     installed = ", ".join(discovered) or "none"
 
     message = (
-        f"Local model `{requested_model}` is not installed. "
+        f"{_model_source_label(provider)} · {requested_model}\n"
+        "Status: model not installed\n"
         f"Installed models: {installed}."
     )
     if provider == "ollama":
-        message = f"{message} Install it with: ollama pull {requested_model}"
+        message = (
+            f"{message}\n"
+            f"Install now: /install ollama {requested_model}\n"
+            f"Terminal alternative: ollama pull {requested_model}"
+        )
     elif provider == "lmstudio":
-        message = f"{message} Download or load it in LM Studio first."
+        message = f"{message}\nDownload or load it in LM Studio first; no login is required."
+    else:
+        message = f"{message}\n{_manual_local_install_text(provider, requested_model)}"
     return None, message
 
 
@@ -1145,15 +1235,27 @@ def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
     source = _model_source_label(provider)
     if provider == "ollama":
         return (
-            f"{source} is not ready for `{model}`.\n"
-            "Install and start Ollama, then pull the model first:\n"
-            f"ollama pull {model}\n"
+            f"{source} · {model}\n"
+            "Status: runtime unavailable\n"
+            "Start Ollama if it is installed. Otherwise install it from:\n"
+            "https://ollama.com/download\n"
+            f"Once it is running, install the model here: /install ollama {model}\n"
             f"Details: {detail}"
         )
     if provider == "lmstudio":
         return (
-            f"{source} is not ready for `{model}`.\n"
+            f"{source} · {model}\n"
+            "Status: runtime unavailable\n"
             "Install LM Studio, load the model, and start its local server first.\n"
+            "Download: https://lmstudio.ai/download\n"
+            f"Details: {detail}"
+        )
+    if provider in {"llamacpp", "vllm", "localai"}:
+        return (
+            f"{source} · {model}\n"
+            "Status: runtime unavailable\n"
+            f"Start the {source} OpenAI-compatible server with that model loaded.\n"
+            f"{_manual_local_install_text(provider, model)}\n"
             f"Details: {detail}"
         )
     return detail
@@ -1169,6 +1271,17 @@ def _switch_model(
         model,
         _active_provider(ctx),
     )
+
+    if resolved_provider in LOCAL_PROVIDERS:
+        resolved_model, setup_error = _resolve_local_model_name(
+            ctx,
+            resolved_provider,
+            model,
+        )
+        if setup_error:
+            return setup_error
+        if resolved_model:
+            model = resolved_model
 
     try:
         candidate = LLMClient(
@@ -1190,17 +1303,62 @@ def _switch_model(
         if resolved_provider in LOCAL_PROVIDERS:
             return _handle_model_setup(candidate)
 
-        # Remember what the user selected while authentication happens.
-        ctx.pending_provider = resolved_provider
-        ctx.pending_model = model
+        # Make the selected hosted model active even while it waits for
+        # credentials. TUI bridge commands run in separate processes, so an
+        # in-memory-only pending selection would snap back to the prior model
+        # as soon as this command completes.
+        previous_llm = ctx.llm
+        try:
+            ctx.llm = candidate
+            _persist_llm_config(ctx)
+        except Exception as exc:
+            ctx.llm = previous_llm
+            return f"Could not save model `{model}`: {exc}"
 
-        lines = [
-            f"{model} needs authentication.\n"
-            f"Set key: /apikey {resolved_provider}",
-        ]
-        if resolved_provider in PROVIDER_LOGIN_URLS:
-            lines.append(f"Open account/API keys: /login {resolved_provider}")
-        lines.append(f"Complete the secure {_model_source_label(resolved_provider)} key prompt to continue.")
+        ctx.pending_provider = resolved_provider
+        ctx.pending_model = str(getattr(candidate, "model", None) or model)
+
+        env_name = PROVIDER_API_KEY_ENVS.get(resolved_provider)
+        missing_api_key = bool(
+            env_name
+            and (
+                not os.environ.get(env_name)
+                or env_name.casefold() in str(configuration_error).casefold()
+            )
+        )
+        browser_setup = resolved_provider in {"bedrock", "vertexai", "copilot"}
+        opened_url = (
+            _open_provider_setup_url(resolved_provider)
+            if missing_api_key or browser_setup
+            else None
+        )
+        open_line = None
+        if opened_url:
+            opened, url = opened_url
+            verb = "Opened" if opened else "Open"
+            page_kind = "API-key" if missing_api_key else "setup"
+            open_line = f"{verb} {_model_source_label(resolved_provider)} {page_kind} page: {url}"
+
+        lines = [f"{_model_source_label(resolved_provider)} · {model}"]
+        if missing_api_key:
+            lines.extend([
+                "Status: API key required",
+                f"Set key: /apikey {resolved_provider}",
+            ])
+        elif browser_setup:
+            lines.extend([
+                "Status: provider sign-in or cloud credentials required",
+                f"Details: {configuration_error}",
+            ])
+        else:
+            lines.extend([
+                "Status: unavailable",
+                f"Details: {configuration_error}",
+            ])
+        if open_line:
+            lines.append(open_line)
+        if missing_api_key:
+            lines.append(f"Complete the secure {_model_source_label(resolved_provider)} key prompt to continue.")
         return "\n".join(lines)
 
     previous_llm = ctx.llm
@@ -1215,6 +1373,91 @@ def _switch_model(
         return f"Could not save model `{model}`: {exc}"
 
     return _model_switch_text(ctx)
+
+
+def _install_local_model(ctx: Any, *, provider: str, model: str) -> str:
+    try:
+        normalized = _normalize_provider(provider)
+    except ValueError as exc:
+        return str(exc)
+
+    if normalized not in LOCAL_PROVIDERS:
+        return (
+            f"{_model_source_label(normalized)} is hosted; models are not installed locally. "
+            f"Choose it with: /model {normalized} {model}"
+        )
+
+    if normalized != "ollama":
+        return _manual_local_install_text(normalized, model)
+
+    if shutil.which("ollama") is None:
+        return (
+            "Status: runtime not installed\n"
+            "Ollama runtime is not installed.\n"
+            "Install Ollama: https://ollama.com/download\n"
+            "Start Ollama, then run this command again:\n"
+            f"/install ollama {model}"
+        )
+
+    try:
+        completed = subprocess.run(
+            ["ollama", "pull", model],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            "Status: install incomplete\n"
+            f"Installing `{model}` is still taking too long. "
+            f"Continue in another terminal with: ollama pull {model}"
+        )
+    except OSError as exc:
+        return f"Status: install failed\nCould not start Ollama: {exc}"
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "Ollama pull failed.").strip()
+        return (
+            "Status: install failed\n"
+            f"Could not install `{model}` with Ollama.\n"
+            f"{truncate(detail, 1000)}\n"
+            f"Retry: /install ollama {model}"
+        )
+
+    switch_result = _switch_model(ctx, model=model, provider="ollama")
+    return f"Installed `{model}` with Ollama.\n{switch_result}"
+
+
+def _manual_local_install_text(provider: str, model: str) -> str:
+    source = _model_source_label(provider)
+    if provider == "lmstudio":
+        return (
+            "Status: manual setup required\n"
+            f"Automatic installation is not available for {source}.\n"
+            "Open LM Studio, download and load the model, then start the local server.\n"
+            f"After it is loaded: /model lmstudio {model}"
+        )
+    if provider == "llamacpp":
+        return (
+            "Status: manual setup required\n"
+            f"Automatic installation is not available for {source}.\n"
+            "Download a compatible GGUF model and start llama.cpp with it.\n"
+            f"Then run: /model llamacpp {model}"
+        )
+    if provider == "vllm":
+        return (
+            "Status: manual setup required\n"
+            f"Start vLLM with `{model}` so it can download/load the model from its configured registry.\n"
+            f"Then run: /model vllm {model}"
+        )
+    if provider == "localai":
+        return (
+            "Status: manual setup required\n"
+            f"Install `{model}` through the LocalAI model gallery and start the LocalAI server.\n"
+            f"Then run: /model localai {model}"
+        )
+    return f"{source} cannot install `{model}` automatically."
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -1426,7 +1669,25 @@ def _provider_base_url(
     if provider == "lmstudio":
         return os.environ.get(
             "NYM_LMSTUDIO_BASE_URL",
-            "http://localhost:1234/v1",
+            os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
+        )
+
+    if provider == "llamacpp":
+        return os.environ.get(
+            "NYM_LLAMACPP_BASE_URL",
+            os.environ.get("LLAMACPP_BASE_URL", "http://localhost:8080/v1"),
+        )
+
+    if provider == "vllm":
+        return os.environ.get(
+            "NYM_VLLM_BASE_URL",
+            os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1"),
+        )
+
+    if provider == "localai":
+        return os.environ.get(
+            "NYM_LOCALAI_BASE_URL",
+            os.environ.get("LOCALAI_BASE_URL", "http://localhost:8080/v1"),
         )
 
     if provider == "openai-compatible":
@@ -1458,8 +1719,17 @@ def _discover_provider_models(
         if provider == "ollama":
             return _discover_ollama_models(base_url), None
 
-        if provider == "lmstudio":
-            return _discover_openai_compatible_models(base_url), None
+        if provider in {"lmstudio", "llamacpp", "vllm", "localai"}:
+            key_env = {
+                "lmstudio": "LMSTUDIO_API_KEY",
+                "llamacpp": "LLAMACPP_API_KEY",
+                "vllm": "VLLM_API_KEY",
+                "localai": "LOCALAI_API_KEY",
+            }[provider]
+            return _discover_openai_compatible_models(
+                base_url,
+                api_key=os.environ.get(key_env),
+            ), None
 
         if provider == "openai-compatible":
             if not base_url:
@@ -1550,6 +1820,12 @@ def _handle_model_setup(candidate: Any) -> str:
             "Start the LM Studio server and load the model first."
         )
 
+    if provider in {"llamacpp", "vllm", "localai"}:
+        return (
+            f"`{model}` is not ready locally.\n"
+            f"Start the {_model_source_label(provider)} server with the model loaded; no login is required."
+        )
+
     if provider in PROVIDER_API_KEY_ENVS:
         return (
             f"`{model}` needs an API key.\n"
@@ -1562,17 +1838,22 @@ def _model_switch_text(ctx: Any) -> str:
     provider = _active_provider(ctx)
     model = getattr(getattr(ctx, "llm", None), "model", None)
     configuration = _llm_configuration(ctx)
-    lines = [
-        f"Model switched to {model}.",
-        f"Source: {_model_source_label(provider)}",
-        f"Access: {_provider_access_label(provider)}",
-    ]
     if configuration == "ready":
-        lines.append("Configuration: ready")
-        return "\n".join(lines)
-    lines.append("")
-    lines.append(_provider_switch_text(ctx))
-    return "\n".join(lines)
+        return f"{_model_source_label(provider)} · {model}"
+    return _provider_switch_text(ctx)
+
+
+def _open_provider_setup_url(provider: str) -> tuple[bool, str] | None:
+    if provider in LOCAL_PROVIDERS:
+        return None
+    url = PROVIDER_LOGIN_URLS.get(provider)
+    if not url:
+        return None
+    try:
+        opened = bool(webbrowser.open(url, new=2, autoraise=True))
+    except Exception:
+        opened = False
+    return opened, url
 
 
 def _provider_for_model(model: str, active_provider: str) -> str:
@@ -1659,7 +1940,7 @@ def _model_options() -> list[dict[str, Any]]:
 
     for provider in sorted(
         SUPPORTED_PROVIDERS,
-        key=lambda item: PROVIDER_SORT_ORDER.get(
+        key=lambda item: MODEL_PICKER_SORT_ORDER.get(
             item,
             99,
         ),
@@ -1719,7 +2000,7 @@ def _hinted_model_state(
 
 def _provider_access_label(provider: str) -> str:
     if provider in LOCAL_PROVIDERS:
-        return "local app, install outside workspace"
+        return "local app, install outside workspace · no login"
     if provider == "openai-compatible":
         return "endpoint required"
     if provider == "copilot":
@@ -1789,7 +2070,17 @@ def _ctx_session_info(ctx: Any) -> SessionInfo | None:
 
 def _connect_text() -> str:
     return "\n".join([
-        "Model setup:",
+        "Model setup",
+        "",
+        "Open-source · local · no Nym login",
+        "Ollama local: `ollama pull <model>`, then /model ollama <model>",
+        "LM Studio local: load a model and start Local Server, then /model lmstudio <model>",
+        "llama.cpp: start llama-server (port 8080), then /model llamacpp <model>",
+        "vLLM: start its OpenAI API server (port 8000), then /model vllm <model>",
+        "LocalAI: start its API server (port 8080), then /model localai <model>",
+        "Set NYM_LLAMACPP_BASE_URL, NYM_VLLM_BASE_URL, or NYM_LOCALAI_BASE_URL to override endpoints.",
+        "",
+        "Hosted · API key or cloud credentials",
         "GitHub Copilot: /login copilot, then /model copilot <model>",
         "OpenAI: /login openai, then /apikey openai (OPENAI_API_KEY)",
         "Anthropic: /login anthropic, then /apikey anthropic (ANTHROPIC_API_KEY)",
@@ -1801,10 +2092,8 @@ def _connect_text() -> str:
         "Google Cloud Vertex AI: /login vertexai, set GOOGLE_CLOUD_PROJECT and run gcloud application-default auth",
         "DeepSeek hosted: /login deepseek, then /apikey deepseek (DEEPSEEK_API_KEY)",
         "GLM hosted: /login glm, then /apikey glm (GLM_API_KEY)",
-        "Ollama local: install Ollama, run `ollama pull <model>`, then /model ollama <model>",
-        "LM Studio local: install LM Studio, load a model, start the local server, then /model lmstudio <model>",
-        "Local models live in the local app, not in this workspace.",
-        "Nym does not download or bundle local models; Ollama or LM Studio owns install, storage, and runtime.",
+        "",
+        "Local models live in their runtime, not in this workspace; Nym never asks them to log in.",
         "Persistent keys: export the model source environment variable before starting nym.",
     ])
 
@@ -1913,8 +2202,8 @@ def _login_provider(ctx: Any, provider: str) -> str:
     url = PROVIDER_LOGIN_URLS.get(normalized)
     display_name = PROVIDER_DISPLAY_NAMES.get(normalized, normalized)
     if url is None:
-        if normalized in {"ollama", "lmstudio"}:
-            return f"{display_name} is local. Start its local server, then use /model {normalized} <model>."
+        if normalized in LOCAL_PROVIDERS:
+            return f"{display_name} is local and needs no login. Start its server, then use /model {normalized} <model>."
         return f"No login URL is configured for {normalized}."
 
     opened = False
@@ -1935,7 +2224,8 @@ def _api_key_prompt_provider(text: str) -> str | None:
     if len(parts) != 2 or parts[0].casefold() not in {"/apikey", "/key"}:
         return None
     try:
-        return _normalize_provider(parts[1])
+        provider = _normalize_provider(parts[1])
+        return None if provider in LOCAL_PROVIDERS else provider
     except ValueError:
         return None
 
@@ -2137,7 +2427,7 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
             prompt = (args.bridge_prompt or "").strip()
             if not prompt:
                 _bridge_emit({"kind": "final", "ok": False, "error": "Prompt cannot be empty.", "snapshot": _tui_bridge_snapshot(ctx)})
-                return 1
+                return 0
             _bridge_emit({"kind": "submitted", "prompt": prompt, "snapshot": _tui_bridge_snapshot(ctx)})
             try:
                 answer = _handle_local_command(ctx, prompt)
@@ -2148,11 +2438,6 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
                         stream_event=lambda event: _tui_bridge_stream_event(ctx, event),
                         approval_requester=lambda request: _tui_bridge_wait_for_approval(ctx, request),
                     )
-                else:
-                    logged_prompt = _redact_local_command(prompt)
-                    ctx.store.update_last_prompt(ctx.session_id, logged_prompt)
-                    ctx.store.add_message(ctx.session_id, "user", logged_prompt)
-                    ctx.store.add_message(ctx.session_id, "assistant", answer)
                 _bridge_emit({
                     "kind": "final",
                     "ok": True,
@@ -2167,7 +2452,7 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
                     "error": str(exc),
                     "snapshot": _tui_bridge_snapshot(ctx),
                 })
-                return 1
+                return 0
         else:
             prompt = (args.bridge_prompt or "").strip()
             if not prompt:
@@ -2177,11 +2462,6 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
                     answer = _handle_local_command(ctx, prompt)
                     if answer is None:
                         answer = handle_prompt(ctx, prompt)
-                    else:
-                        logged_prompt = _redact_local_command(prompt)
-                        ctx.store.update_last_prompt(ctx.session_id, logged_prompt)
-                        ctx.store.add_message(ctx.session_id, "user", logged_prompt)
-                        ctx.store.add_message(ctx.session_id, "assistant", answer)
                     payload = {
                         "ok": True,
                         "answer": answer,
@@ -2252,7 +2532,7 @@ def _tui_bridge_completions(prompt: str) -> dict[str, Any]:
                 "complete_to": entry.complete_to,
                 "execute": entry.execute,
             }
-            for entry in entries[:12]
+            for entry in entries
         ],
     }
 
@@ -2791,6 +3071,8 @@ def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
     provider_command = _provider_argument_command(prompt, parts)
     if provider_command is not None:
         return _provider_palette_entries(provider_command, parts[1] if len(parts) >= 2 else "")
+    if _is_install_palette_prompt(prompt, parts):
+        return _install_palette_entries(parts[1] if len(parts) >= 2 else "")
     if _is_model_palette_prompt(prompt, parts):
         return _model_palette_entries(parts[1] if len(parts) >= 2 else "")
 
@@ -2822,13 +3104,13 @@ def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
 
 
 def _slash_command_complete_to(name: str) -> str:
-    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model"}:
+    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install"}:
         return f"{name} "
     return name
 
 
 def _slash_command_executes(name: str) -> bool:
-    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model"}
+    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install"}
 
 
 def _provider_palette_entries(command: str, query: str) -> list[PaletteEntry]:
@@ -2883,12 +3165,35 @@ def _model_palette_entries(query: str) -> list[PaletteEntry]:
     ]
 
 
+def _install_palette_entries(query: str) -> list[PaletteEntry]:
+    normalized = query.casefold()
+    models = [
+        model
+        for model in PROVIDER_MODEL_HINTS.get("ollama", ())
+        if model.casefold().startswith(normalized)
+    ]
+    if not models:
+        models = list(PROVIDER_MODEL_HINTS.get("ollama", ()))
+    return [
+        PaletteEntry(
+            value=f"ollama/{model}",
+            label=model,
+            description="Ollama: download and select locally · no login",
+            complete_to=f"/install ollama {model}",
+            execute=True,
+        )
+        for model in models
+    ]
+
+
 def _slash_palette_title(prompt: str) -> str:
     prompt = _normalized_command_prompt(prompt)
     stripped = prompt.strip()
     parts = stripped.split()
     if _provider_argument_command(prompt, parts) is not None:
         return "Model sources"
+    if _is_install_palette_prompt(prompt, parts):
+        return "Install with Ollama"
     if _is_model_palette_prompt(prompt, parts):
         return "Models"
     return "Commands"
@@ -2912,6 +3217,20 @@ def _is_model_palette_prompt(prompt: str, parts: list[str]) -> bool:
     )
 
 
+def _is_install_palette_prompt(prompt: str, parts: list[str]) -> bool:
+    return (
+        len(parts) <= 2
+        and (
+            prompt.startswith("/install ")
+            or (
+                len(parts) >= 1
+                and parts[0].casefold() == "/install"
+                and prompt.endswith(" ")
+            )
+        )
+    )
+
+
 def _selected_palette_entry(prompt: str, selected_index: int) -> PaletteEntry | None:
     entries = _slash_palette_entries(prompt)
     if not entries:
@@ -2923,7 +3242,11 @@ def _complete_slash_command(prompt: str) -> str | None:
     prompt = _normalized_command_prompt(prompt)
     selected = _selected_palette_entry(prompt, 0)
     parts = prompt.strip().split()
-    if selected is not None and (_provider_argument_command(prompt, parts) is not None or prompt.startswith("/model ")):
+    if selected is not None and (
+        _provider_argument_command(prompt, parts) is not None
+        or prompt.startswith("/model ")
+        or prompt.startswith("/install ")
+    ):
         return selected.complete_to
     if not prompt.startswith("/") or " " in prompt:
         return None
@@ -3261,7 +3584,7 @@ def _render_live_turn(live_turn: dict[str, Any], width: int) -> list[str]:
         if kind in {"thinking", "reasoning"}:
             if prev_kind not in {"thinking", "reasoning"}:
                 lines.append("  Activity")
-            lines.extend(_wrap_lines(str(content), width, indent="    Thinking: "))
+            lines.extend(_wrap_lines(str(content), width, indent="    · "))
         elif kind == "text":
             for para in content.splitlines() or [""]:
                 pieces = textwrap.wrap(para, width=max(1, width - 2), break_long_words=True) or [""]
@@ -3280,7 +3603,7 @@ def _render_live_turn(live_turn: dict[str, Any], width: int) -> list[str]:
 
     if active and not feed:
         lines.append("  Activity")
-        lines.append("    Thinking: starting")
+        lines.append("    · Working")
 
     error = live_turn.get("error")
     if error:

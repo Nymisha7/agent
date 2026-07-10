@@ -16,6 +16,9 @@ SUPPORTED_PROVIDERS = {
     "openai-compatible",
     "ollama",
     "lmstudio",
+    "llamacpp",
+    "vllm",
+    "localai",
     "copilot",
     "anthropic",
     "gemini",
@@ -77,9 +80,33 @@ class LLMClient:
             self.endpoint = base_url
             self.mode = "local"
         elif self.provider == "lmstudio":
-            base_url = os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+            base_url = os.environ.get("NYM_LMSTUDIO_BASE_URL") or os.environ.get("LMSTUDIO_BASE_URL") or "http://localhost:1234/v1"
             self.client = OpenAI(
                 api_key=os.environ.get("LMSTUDIO_API_KEY") or "lmstudio",
+                base_url=base_url,
+            )
+            self.endpoint = base_url
+            self.mode = "local"
+        elif self.provider == "llamacpp":
+            base_url = os.environ.get("NYM_LLAMACPP_BASE_URL") or os.environ.get("LLAMACPP_BASE_URL") or "http://localhost:8080/v1"
+            self.client = OpenAI(
+                api_key=os.environ.get("LLAMACPP_API_KEY") or "local",
+                base_url=base_url,
+            )
+            self.endpoint = base_url
+            self.mode = "local"
+        elif self.provider == "vllm":
+            base_url = os.environ.get("NYM_VLLM_BASE_URL") or os.environ.get("VLLM_BASE_URL") or "http://localhost:8000/v1"
+            self.client = OpenAI(
+                api_key=os.environ.get("VLLM_API_KEY") or "local",
+                base_url=base_url,
+            )
+            self.endpoint = base_url
+            self.mode = "local"
+        elif self.provider == "localai":
+            base_url = os.environ.get("NYM_LOCALAI_BASE_URL") or os.environ.get("LOCALAI_BASE_URL") or "http://localhost:8080/v1"
+            self.client = OpenAI(
+                api_key=os.environ.get("LOCALAI_API_KEY") or "local",
                 base_url=base_url,
             )
             self.endpoint = base_url
@@ -193,12 +220,14 @@ class LLMClient:
                 stream=stream,
                 event_handler=event_handler,
             )
-        if self.provider in {"openai-compatible", "ollama", "lmstudio", "groq", "openrouter", "deepseek", "glm"}:
+        if self.provider in {"openai-compatible", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "groq", "openrouter", "deepseek", "glm"}:
             return self._respond_openai_chat(
                 instructions=instructions,
                 messages=messages,
                 tools=tools,
                 tool_choice=tool_choice,
+                stream=stream,
+                event_handler=event_handler,
             )
         if self.provider == "anthropic":
             return self._respond_anthropic(
@@ -259,6 +288,8 @@ class LLMClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         tool_choice: str | dict[str, Any] | None,
+        stream: bool,
+        event_handler: Callable[[Any], None] | None,
     ) -> Any:
         request_args: dict[str, Any] = {
             "model": self.model,
@@ -275,11 +306,111 @@ class LLMClient:
             request_args["reasoning_effort"] = reasoning_effort
 
         try:
-            response = self.client.chat.completions.create(**request_args)
+            if stream:
+                response = self._stream_openai_chat(
+                    request_args,
+                    event_handler=event_handler,
+                )
+            else:
+                completion = self.client.chat.completions.create(**request_args)
+                response = _chat_completion_to_response(completion)
         except Exception as exc:
             raise RuntimeError(_friendly_llm_error(exc, self.provider, self.model, self.endpoint, self.mode)) from exc
         self._record_usage(response)
-        return _chat_completion_to_response(response)
+        return response
+
+    def _stream_openai_chat(
+        self,
+        request_args: dict[str, Any],
+        *,
+        event_handler: Callable[[Any], None] | None,
+    ) -> Any:
+        chunks = self.client.chat.completions.create(**request_args, stream=True)
+        text_parts: list[str] = []
+        calls: dict[int, dict[str, Any]] = {}
+        usage: Any = None
+        sequence = 0
+
+        def emit(event: dict[str, Any]) -> None:
+            nonlocal sequence
+            event["sequence_number"] = sequence
+            sequence += 1
+            if event_handler is not None:
+                event_handler(event)
+
+        emit({"type": "response.in_progress"})
+        for chunk in chunks:
+            chunk_usage = _get(chunk, "usage")
+            if chunk_usage is not None:
+                usage = chunk_usage
+            choices = _get(chunk, "choices", []) or []
+            if not choices:
+                continue
+            delta = _get(choices[0], "delta") or {}
+            reasoning = _get(delta, "reasoning_content") or _get(delta, "reasoning")
+            if isinstance(reasoning, str) and reasoning:
+                emit({"type": "response.reasoning_text.delta", "delta": reasoning})
+            content = _get(delta, "content")
+            if isinstance(content, str) and content:
+                text_parts.append(content)
+                emit({"type": "response.output_text.delta", "delta": content})
+
+            for call_delta in _get(delta, "tool_calls", []) or []:
+                index = _get(call_delta, "index", 0)
+                index = index if isinstance(index, int) else 0
+                call = calls.setdefault(index, {
+                    "id": f"call_{index}",
+                    "name": "",
+                    "arguments": "",
+                    "emitted": False,
+                })
+                call_id = _get(call_delta, "id")
+                if isinstance(call_id, str) and call_id:
+                    call["id"] = call_id
+                function = _get(call_delta, "function") or {}
+                name = _get(function, "name")
+                if isinstance(name, str) and name:
+                    call["name"] = name
+                if call["name"] and not call["emitted"]:
+                    emit({
+                        "type": "response.output_item.added",
+                        "item": {
+                            "type": "function_call",
+                            "id": call["id"],
+                            "call_id": call["id"],
+                            "name": call["name"],
+                        },
+                    })
+                    call["emitted"] = True
+                arguments = _get(function, "arguments")
+                if isinstance(arguments, str) and arguments:
+                    call["arguments"] += arguments
+                    emit({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": call["id"],
+                        "delta": arguments,
+                    })
+
+        output: list[dict[str, Any]] = []
+        for index in sorted(calls):
+            call = calls[index]
+            emit({
+                "type": "response.function_call_arguments.done",
+                "item_id": call["id"],
+                "arguments": call["arguments"],
+            })
+            output.append({
+                "type": "function_call",
+                "call_id": call["id"],
+                "name": call["name"],
+                "arguments": call["arguments"] or "{}",
+            })
+        emit({"type": "response.completed"})
+        return SimpleNamespace(
+            output=output,
+            output_text="".join(text_parts),
+            usage=usage,
+        )
 
     def _respond_anthropic(
         self,
@@ -382,6 +513,11 @@ def _normalize_provider(value: str) -> str:
         "compatible": "openai-compatible",
         "openai-compatible-chat": "openai-compatible",
         "lm-studio": "lmstudio",
+        "llama.cpp": "llamacpp",
+        "llama-cpp": "llamacpp",
+        "llama_cpp": "llamacpp",
+        "v-llm": "vllm",
+        "local-ai": "localai",
         "anthropic-claude": "anthropic",
         "claude": "anthropic",
         "deepseek-ai": "deepseek",
@@ -425,6 +561,9 @@ def _default_model_for_provider(provider: str) -> str:
         "openai-compatible": os.environ.get("NYM_OPENAI_COMPAT_MODEL") or "local-model",
         "ollama": os.environ.get("OLLAMA_MODEL") or "llama3.1",
         "lmstudio": os.environ.get("LMSTUDIO_MODEL") or "local-model",
+        "llamacpp": os.environ.get("LLAMACPP_MODEL") or "local-model",
+        "vllm": os.environ.get("VLLM_MODEL") or "local-model",
+        "localai": os.environ.get("LOCALAI_MODEL") or "local-model",
         "copilot": os.environ.get("COPILOT_MODEL") or "gpt-4.1",
         "anthropic": os.environ.get("ANTHROPIC_MODEL") or "claude-3-5-sonnet-latest",
         "gemini": os.environ.get("GEMINI_MODEL") or os.environ.get("GOOGLE_MODEL") or "gemini-2.5-pro",
@@ -469,7 +608,7 @@ def _model_supports_reasoning(provider: str | None, model: str | None) -> bool:
     reasoning_prefixes = ("gpt-5", "o1", "o3", "o4")
     if provider_name == "openai":
         return model_name.startswith(reasoning_prefixes)
-    if provider_name in {"deepseek", "ollama", "lmstudio", "openai-compatible", "groq", "openrouter", "glm"}:
+    if provider_name in {"deepseek", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "openai-compatible", "groq", "openrouter", "glm"}:
         return "reason" in model_name or model_name.startswith(("o1", "o3", "o4"))
     if provider_name == "anthropic":
         return "thinking" in model_name or "claude-3.7" in model_name or "claude-sonnet-4" in model_name
@@ -497,7 +636,7 @@ def _chat_reasoning_effort(
     model: str | None,
     effort: str | None,
 ) -> str | None:
-    if provider not in {"openai-compatible", "ollama", "lmstudio", "groq", "openrouter", "deepseek", "glm"}:
+    if provider not in {"openai-compatible", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "groq", "openrouter", "deepseek", "glm"}:
         return None
     if not _model_supports_reasoning(provider, model):
         return None
@@ -580,7 +719,12 @@ def _friendly_llm_error(
 
 
 def _ollama_base_url() -> str:
-    raw = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+    raw = (
+        os.environ.get("NYM_OLLAMA_BASE_URL")
+        or os.environ.get("OLLAMA_BASE_URL")
+        or os.environ.get("OLLAMA_HOST")
+        or "http://localhost:11434"
+    )
     raw = raw.rstrip("/")
     if raw.endswith("/v1"):
         return raw

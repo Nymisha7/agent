@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from nym_agent.llm import (
     LLMClient,
@@ -26,6 +26,9 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(_normalize_provider("openai"), "openai")
         self.assertEqual(_normalize_provider("compatible"), "openai-compatible")
         self.assertEqual(_normalize_provider("lm-studio"), "lmstudio")
+        self.assertEqual(_normalize_provider("llama.cpp"), "llamacpp")
+        self.assertEqual(_normalize_provider("v-llm"), "vllm")
+        self.assertEqual(_normalize_provider("local-ai"), "localai")
         self.assertEqual(_normalize_provider("claude"), "anthropic")
         self.assertEqual(_normalize_provider("deepseek-ai"), "deepseek")
         self.assertEqual(_normalize_provider("zai"), "glm")
@@ -35,6 +38,59 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(_default_model_for_provider("deepseek"), "deepseek-v4-flash")
         self.assertEqual(_default_model_for_provider("glm"), "glm-4")
         self.assertEqual(_default_model_for_provider("ollama"), "llama3.1")
+        self.assertEqual(_default_model_for_provider("llamacpp"), "local-model")
+        self.assertEqual(_default_model_for_provider("vllm"), "local-model")
+        self.assertEqual(_default_model_for_provider("localai"), "local-model")
+
+    def test_open_source_local_providers_need_no_login_or_api_key(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            clients = {
+                provider: LLMClient(provider=provider)
+                for provider in ("ollama", "lmstudio", "llamacpp", "vllm", "localai")
+            }
+
+        for client in clients.values():
+            self.assertEqual(client.mode, "local")
+            self.assertIsNone(client.configuration_error)
+            self.assertIsNotNone(client.client)
+
+    def test_local_provider_streams_text_and_tool_activity(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5-coder")
+        chunks = iter([
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content="Checking ", reasoning_content="private",
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content="files", reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+        ])
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=Mock(return_value=chunks)),
+            ),
+        )
+        events = []
+
+        response = client.respond(
+            instructions="Be useful",
+            messages=[{"role": "user", "content": "Inspect"}],
+            tools=[],
+            stream=True,
+            event_handler=events.append,
+        )
+
+        self.assertEqual(response.output_text, "Checking files")
+        self.assertEqual(events[0]["type"], "response.in_progress")
+        self.assertTrue(any(event["type"] == "response.output_text.delta" for event in events))
+        self.assertEqual(events[-1]["type"], "response.completed")
 
     def test_reasoning_capability_detection_is_provider_specific(self) -> None:
         self.assertTrue(_model_supports_reasoning("openai", "gpt-5.4-mini"))

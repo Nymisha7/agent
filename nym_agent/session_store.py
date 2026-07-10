@@ -186,7 +186,17 @@ class SessionStore:
 
     @classmethod
     def default(cls) -> SessionStore:
-        return cls(default_db_path())
+        explicit_path = _env_path("NYM_SESSION_DB")
+        if explicit_path is not None:
+            return cls(explicit_path)
+
+        preferred_path = default_db_path()
+        try:
+            return cls(preferred_path)
+        except (OSError, sqlite3.OperationalError) as exc:
+            if not _is_unusable_default_db_error(exc):
+                raise
+            return cls(workspace_db_path())
 
     def create_session(
         self,
@@ -559,10 +569,11 @@ class SessionStore:
 
 
 def default_db_path() -> Path:
-    if path := _env_path("NYM_SESSION_DB"):
-        return path
-
     return data_home() / "nym" / "sessions.sqlite3"
+
+
+def workspace_db_path() -> Path:
+    return Path.cwd() / ".nym-session.sqlite3"
 
 
 def data_home() -> Path:
@@ -851,3 +862,19 @@ def _env_path(name: str) -> Path | None:
     if not value:
         return None
     return Path(value).expanduser()
+
+
+def _is_unusable_default_db_error(exc: BaseException) -> bool:
+    if isinstance(exc, OSError):
+        return True
+    text = str(exc).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "attempt to write a readonly database",
+            "readonly database",
+            "unable to open database file",
+            "permission denied",
+            "disk i/o error",
+        )
+    )
