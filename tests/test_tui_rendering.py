@@ -459,7 +459,7 @@ class TuiRenderingTests(unittest.TestCase):
     def test_complete_bridge_skips_full_agent_context_and_runtime_probes(self) -> None:
         args = SimpleNamespace(
             bridge_session_id="palette-session",
-            bridge_prompt="/model ",
+            bridge_prompt="/mo",
             tui_bridge="complete",
         )
         output = io.StringIO()
@@ -474,7 +474,7 @@ class TuiRenderingTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(result, 0)
         self.assertTrue(payload["ok"])
-        self.assertGreater(len(payload["completions"]["entries"]), 12)
+        self.assertEqual(payload["completions"]["entries"][0]["value"], "/model")
         build_context.assert_not_called()
         discover.assert_not_called()
 
@@ -518,6 +518,9 @@ class TuiRenderingTests(unittest.TestCase):
             entries["gemini/gemini-2.5-pro"]["description"],
             "Google Gemini · Unavailable",
         )
+        labels = [entry["label"] for entry in payload["entries"]]
+        self.assertIn("── Ready / installed ──", labels)
+        self.assertIn("── Needs setup / not installed ──", labels)
 
     def test_model_completions_put_ready_installed_local_models_first(self) -> None:
         ctx = SimpleNamespace(
@@ -540,8 +543,9 @@ class TuiRenderingTests(unittest.TestCase):
         ):
             payload = _tui_bridge_completions("/model ", ctx=ctx)
 
-        values = [entry["value"] for entry in payload["entries"]]
+        values = [entry["value"] for entry in payload["entries"] if entry["execute"]]
         ready_values = {
+            "openai/gpt-5.5",
             "ollama/qwen3",
             "ollama/qwen3:latest",
             "ollama/custom-local:latest",
@@ -559,6 +563,62 @@ class TuiRenderingTests(unittest.TestCase):
             values.index("llamacpp/qwen2.5-coder-7b-instruct"),
             values.index("llamacpp/gemma-3-1b-it"),
         )
+
+    def test_model_completions_select_current_model_first(self) -> None:
+        ctx = SimpleNamespace(
+            llm=SimpleNamespace(
+                provider="ollama",
+                model="qwen3",
+                configuration_error=None,
+            )
+        )
+        availability = {
+            provider: ([], "offline")
+            for provider in {"ollama", "lmstudio", "llamacpp", "vllm", "localai"}
+        }
+        availability["ollama"] = (["qwen3:latest"], None)
+
+        with patch(
+            "agent.main._discover_local_provider_availability",
+            return_value=availability,
+        ):
+            payload = _tui_bridge_completions("/model ", ctx=ctx)
+
+        selected = payload["entries"][payload["selected_index"]]
+        self.assertEqual(selected["value"], "ollama/qwen3")
+        self.assertTrue(selected["execute"])
+
+    def test_model_complete_bridge_uses_stored_session_model(self) -> None:
+        args = SimpleNamespace(
+            bridge_session_id="palette-session",
+            bridge_prompt="/model ",
+            tui_bridge="complete",
+        )
+        store = SimpleNamespace(
+            get_session=lambda _session_id: SimpleNamespace(
+                provider="ollama",
+                model="qwen3",
+            )
+        )
+        output = io.StringIO()
+        availability = {
+            provider: ([], "offline")
+            for provider in {"ollama", "lmstudio", "llamacpp", "vllm", "localai"}
+        }
+        availability["ollama"] = (["qwen3:latest"], None)
+
+        with (
+            patch("agent.main.build_context") as build_context,
+            patch("agent.main._discover_local_provider_availability", return_value=availability),
+            redirect_stdout(output),
+        ):
+            result = _run_tui_bridge(args, store)
+
+        payload = json.loads(output.getvalue())
+        selected = payload["completions"]["entries"][payload["completions"]["selected_index"]]
+        self.assertEqual(result, 0)
+        self.assertEqual(selected["value"], "ollama/qwen3")
+        build_context.assert_not_called()
 
     def test_tui_bridge_snapshot_includes_pending_approvals(self) -> None:
         seen_limits: list[int | None] = []
@@ -911,21 +971,6 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertIn("open source · local runtime/install · no login", entries[0].description)
         self.assertEqual(_complete_slash_command("/model llama"), "/model ollama llama3.3")
 
-    def test_model_palette_filters_inside_selected_provider(self) -> None:
-        entries = _slash_palette_entries("/model ollama qwen")
-
-        self.assertTrue(entries)
-        self.assertTrue(all(entry.value.startswith("ollama/") for entry in entries))
-        self.assertTrue(entries[0].complete_to.startswith("/model ollama qwen"))
-        self.assertIn("params", entries[0].description)
-        self.assertTrue(_complete_slash_command("/model ollama qwen").startswith("/model ollama qwen"))
-
-    def test_model_palette_shows_provider_models_after_provider_space(self) -> None:
-        entries = _slash_palette_entries("/model anthropic ")
-
-        self.assertTrue(entries)
-        self.assertTrue(all(entry.value.startswith("anthropic/") for entry in entries))
-
     def test_install_palette_offers_explicit_ollama_download_action(self) -> None:
         entries = _slash_palette_entries("/install ollama")
 
@@ -955,14 +1000,6 @@ class TuiRenderingTests(unittest.TestCase):
         )
         self.assertTrue(all("installs locally" in entry.description for entry in entries))
         self.assertTrue(all("no login" in entry.description for entry in entries))
-
-    def test_install_palette_filters_inside_selected_provider(self) -> None:
-        entries = _slash_palette_entries("/install llamacpp qwen")
-
-        self.assertTrue(entries)
-        self.assertTrue(all(entry.value.startswith("llamacpp/") for entry in entries))
-        self.assertEqual(entries[0].complete_to, "/install llamacpp qwen2.5-coder-7b-instruct")
-        self.assertIn("7B params", entries[0].description)
 
     def test_reasoning_palette_exposes_effort_without_raw_thinking(self) -> None:
         entries = _slash_palette_entries("/reasoning ")

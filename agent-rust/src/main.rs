@@ -592,6 +592,8 @@ struct BridgeApproval {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct BridgeCompletions {
     title: String,
+    #[serde(default)]
+    selected_index: Option<usize>,
     entries: Vec<BridgeCompletionEntry>,
 }
 
@@ -2546,6 +2548,18 @@ fn palette_text(
     let end = (start + visible_count).min(total);
     for (index, entry) in palette.entries[start..end].iter().enumerate() {
         let index = start + index;
+        if !entry.execute {
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    clip_status(&entry.label, width.saturating_sub(4) as usize),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            continue;
+        }
         let selected_style = if index == selected {
             Style::default()
                 .fg(Color::Black)
@@ -2679,7 +2693,11 @@ fn refresh_palette(args: &TuiArgs, app: &mut TuiApp) {
         Ok(response) => {
             app.palette = response.completions.unwrap_or_default();
             let max_index = app.palette.entries.len().saturating_sub(1);
-            app.palette_selected = app.palette_selected.min(max_index);
+            app.palette_selected = app
+                .palette
+                .selected_index
+                .unwrap_or(app.palette_selected)
+                .min(max_index);
         }
         Err(err) => {
             app.status = format!("Error: {}", clip_status(&err.to_string(), 96));
@@ -3881,6 +3899,7 @@ mod tui_tests {
     fn model_palette_title_shows_visible_range_and_navigation() {
         let mut palette = BridgeCompletions {
             title: String::from("Models"),
+            selected_index: None,
             entries: Vec::new(),
         };
         for index in 0..30 {

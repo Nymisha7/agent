@@ -1442,9 +1442,15 @@ def _providers_text(ctx: AppContext) -> str:
 
 def _models_text(ctx: AppContext) -> str:
     active_provider = _active_provider(ctx)
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for option in _model_options_for_display(ctx):
-        grouped.setdefault(option["provider"], []).append(option)
+    options = _model_options_for_display(ctx)
+    ready_options = [
+        option for option in options
+        if option.get("state") == ModelState.READY
+    ]
+    setup_options = [
+        option for option in options
+        if option.get("state") != ModelState.READY
+    ]
 
     lines = [
         f"Active model: {ctx.llm.model}",
@@ -1455,27 +1461,8 @@ def _models_text(ctx: AppContext) -> str:
         "Open-source models use a local runtime and are installed on this computer; they never require login.",
     ]
 
-    for provider in sorted(
-        grouped,
-        key=lambda item: PROVIDER_SORT_ORDER.get(item, 99),
-    ):
-        lines.append("")
-        lines.append(
-            f"{_model_source_label(provider)} - {_provider_access_label(provider)}"
-        )
-        for option in grouped[provider]:
-            marker = (
-                "*"
-                if (
-                    option["provider"] == active_provider
-                    and option["model"] == ctx.llm.model
-                )
-                else " "
-            )
-            lines.append(
-                f"{marker} {option['model']}  "
-                f"{_model_state_label(option)}{_model_metadata_suffix(option['provider'], option['model'])}"
-            )
+    _append_model_text_section(lines, "Ready / installed", ready_options, ctx)
+    _append_model_text_section(lines, "Needs setup / not installed", setup_options, ctx)
 
     lines.extend([
         "",
@@ -1487,6 +1474,37 @@ def _models_text(ctx: AppContext) -> str:
     ])
 
     return "\n".join(lines)
+
+
+def _append_model_text_section(
+    lines: list[str],
+    heading: str,
+    options: list[dict[str, Any]],
+    ctx: Any,
+) -> None:
+    if not options:
+        return
+    active_provider = _active_provider(ctx)
+    active_model = getattr(getattr(ctx, "llm", None), "model", None)
+    lines.append("")
+    lines.append(f"{heading}:")
+    current_provider: str | None = None
+    for option in options:
+        provider = option["provider"]
+        if provider != current_provider:
+            current_provider = provider
+            lines.append(
+                f"{_model_source_label(provider)} - {_provider_access_label(provider)}"
+            )
+        marker = (
+            "*"
+            if option["provider"] == active_provider and option["model"] == active_model
+            else " "
+        )
+        lines.append(
+            f"{marker} {option['model']}  "
+            f"{_model_state_label(option)}{_model_metadata_suffix(option['provider'], option['model'])}"
+        )
 
 def _resolve_local_model_name(
     ctx: Any,
@@ -2803,13 +2821,14 @@ def _model_options_for_display(ctx: Any) -> list[dict[str, Any]]:
                 active_provider,
                 active_model,
             )
+        option["active"] = provider == active_provider and model == active_model
         option["selectable"] = True
         option["error"] = None
 
     return sorted(options, key=_model_display_sort_key)
 
 
-def _model_display_sort_key(option: dict[str, Any]) -> tuple[int, int, int, str]:
+def _model_display_sort_key(option: dict[str, Any]) -> tuple[int, int, int, int, str]:
     provider = str(option.get("provider") or "")
     model = str(option.get("model") or "")
     state = option.get("state")
@@ -2826,7 +2845,9 @@ def _model_display_sort_key(option: dict[str, Any]) -> tuple[int, int, int, str]
         ModelState.INCOMPATIBLE: 5,
     }
     local_order = 0 if provider in LOCAL_PROVIDERS else 1
+    active_order = 0 if option.get("active") is True else 1
     return (
+        active_order,
         state_order.get(state, 6),
         local_order,
         MODEL_PICKER_SORT_ORDER.get(provider, 99),
@@ -3722,9 +3743,17 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
         return 1
 
     if args.tui_bridge == "complete":
+        prompt = args.bridge_prompt or ""
+        normalized_prompt = _normalized_command_prompt(prompt)
+        prompt_parts = normalized_prompt.strip().split()
+        completion_ctx = (
+            _completion_context_from_session(store, session_id)
+            if _is_model_palette_prompt(normalized_prompt, prompt_parts)
+            else None
+        )
         payload = {
             "ok": True,
-            "completions": _tui_bridge_completions(args.bridge_prompt or ""),
+            "completions": _tui_bridge_completions(prompt, ctx=completion_ctx),
         }
         print(json.dumps(payload, ensure_ascii=False))
         return 0
@@ -3822,6 +3851,7 @@ def _tui_bridge_completions(prompt: str, *, ctx: Any | None = None) -> dict[str,
     entries = _slash_palette_entries(prompt, ctx=ctx)
     return {
         "title": _slash_palette_title(prompt) if entries else "",
+        "selected_index": _palette_selected_index(prompt, entries),
         "entries": [
             {
                 "value": entry.value,
@@ -3833,6 +3863,36 @@ def _tui_bridge_completions(prompt: str, *, ctx: Any | None = None) -> dict[str,
             for entry in entries
         ],
     }
+
+
+def _palette_selected_index(prompt: str, entries: list[PaletteEntry]) -> int:
+    if not entries:
+        return 0
+    if _normalized_command_prompt(prompt).startswith("/model"):
+        for index, entry in enumerate(entries):
+            if entry.execute:
+                return index
+    return 0
+
+
+def _completion_context_from_session(store: Any, session_id: str) -> Any | None:
+    try:
+        session_info = store.get_session(session_id)
+    except Exception:
+        return None
+    provider = getattr(session_info, "provider", None)
+    model = getattr(session_info, "model", None)
+    if not provider and not model:
+        return None
+    return argparse.Namespace(
+        llm=argparse.Namespace(
+            provider=provider or "openai",
+            model=model or "",
+            configuration_error=None,
+            mode="unknown",
+            endpoint="",
+        )
+    )
 
 
 def _bridge_emit(payload: dict[str, Any]) -> None:
@@ -4403,11 +4463,9 @@ def _slash_palette_entries(prompt: str, *, ctx: Any | None = None) -> list[Palet
     if provider_command is not None:
         return _provider_palette_entries(provider_command, parts[1] if len(parts) >= 2 else "")
     if _is_install_palette_prompt(prompt, parts):
-        provider, query = _palette_provider_and_query(prompt, parts, LOCAL_PROVIDERS)
-        return _install_palette_entries(query, provider=provider)
+        return _install_palette_entries(parts[1] if len(parts) >= 2 else "")
     if _is_model_palette_prompt(prompt, parts):
-        provider, query = _palette_provider_and_query(prompt, parts, set(PROVIDER_MODEL_HINTS))
-        return _model_palette_entries(query, provider=provider, ctx=ctx)
+        return _model_palette_entries(parts[1] if len(parts) >= 2 else "", ctx=ctx)
     if _is_reasoning_palette_prompt(prompt, parts):
         return _reasoning_palette_entries(parts[1] if len(parts) >= 2 else "")
 
@@ -4478,80 +4536,77 @@ def _provider_palette_description(command: str, provider: str) -> str:
     return f"default model: {PROVIDER_MODEL_HINTS.get(provider, ('custom-model',))[0]}"
 
 
-def _palette_provider_and_query(
-    prompt: str,
-    parts: list[str],
-    allowed_providers: set[str],
-) -> tuple[str | None, str]:
-    if len(parts) < 2:
-        return None, ""
-    candidate = parts[1].casefold()
-    if candidate not in allowed_providers:
-        return None, parts[1]
-    if len(parts) >= 3:
-        return candidate, parts[2]
-    if prompt.endswith(" "):
-        return candidate, ""
-    return None, parts[1]
-
-
 def _model_palette_entries(
     query: str,
     *,
-    provider: str | None = None,
     ctx: Any | None = None,
 ) -> list[PaletteEntry]:
     normalized = query.casefold()
     options = _model_options_for_display(ctx) if ctx is not None else _model_options()
     matches = [
         option for option in options
-        if (provider is None or option["provider"] == provider)
-        and (
-            option["model"].casefold().startswith(normalized)
-            or option["provider"].casefold().startswith(normalized)
-        )
+        if option["model"].casefold().startswith(normalized)
+        or option["provider"].casefold().startswith(normalized)
     ]
     if not matches:
-        matches = [
-            option for option in options
-            if provider is None or option["provider"] == provider
-        ]
-    return [
-        PaletteEntry(
-            value=f"{option['provider']}/{option['model']}",
-            label=option["model"],
-            description=(
-                f"{_model_source_label(option['provider'])} · {_model_state_label(option)}"
-                f"{_model_metadata_suffix(option['provider'], option['model'])}"
-                if ctx is not None
-                else (
-                    f"{_model_source_label(option['provider'])}: {_provider_access_label(option['provider'])}"
-                    f"{_model_metadata_suffix(option['provider'], option['model'])}"
-                )
-            ),
-            complete_to=f"/model {option['provider']} {option['model']}",
-            execute=True,
-        )
-        for option in matches
-    ]
+        matches = options
+
+    entries = [_model_palette_entry(option, with_state=ctx is not None) for option in matches]
+    if ctx is None:
+        return entries
+
+    ready = [entry for entry, option in zip(entries, matches) if option.get("state") == ModelState.READY]
+    rest = [entry for entry, option in zip(entries, matches) if option.get("state") != ModelState.READY]
+    grouped: list[PaletteEntry] = []
+    if ready:
+        grouped.append(_palette_section("Ready / installed", "/model "))
+        grouped.extend(ready)
+    if rest:
+        grouped.append(_palette_section("Needs setup / not installed", "/model "))
+        grouped.extend(rest)
+    return grouped
 
 
-def _install_palette_entries(query: str, *, provider: str | None = None) -> list[PaletteEntry]:
+def _model_palette_entry(option: dict[str, Any], *, with_state: bool) -> PaletteEntry:
+    provider = option["provider"]
+    model = option["model"]
+    return PaletteEntry(
+        value=f"{provider}/{model}",
+        label=model,
+        description=(
+            f"{_model_source_label(provider)} · {_model_state_label(option)}"
+            f"{_model_metadata_suffix(provider, model)}"
+            if with_state
+            else (
+                f"{_model_source_label(provider)}: {_provider_access_label(provider)}"
+                f"{_model_metadata_suffix(provider, model)}"
+            )
+        ),
+        complete_to=f"/model {provider} {model}",
+        execute=True,
+    )
+
+
+def _palette_section(label: str, complete_to: str) -> PaletteEntry:
+    return PaletteEntry(
+        value=f"section:{label.casefold().replace(' ', '-')}",
+        label=f"── {label} ──",
+        description="",
+        complete_to=complete_to,
+        execute=False,
+    )
+
+
+def _install_palette_entries(query: str) -> list[PaletteEntry]:
     normalized = query.casefold()
     entries = [
         entry
         for entry in LOCAL_INSTALL_CATALOG
-        if (provider is None or entry["provider"] == provider)
-        and (
-            entry["model"].casefold().startswith(normalized)
-            or entry["provider"].casefold().startswith(normalized)
-        )
+        if entry["model"].casefold().startswith(normalized)
+        or entry["provider"].casefold().startswith(normalized)
     ]
     if not entries:
-        entries = [
-            entry for entry in LOCAL_INSTALL_CATALOG
-            if provider is None or entry["provider"] == provider
-        ]
+        entries = list(LOCAL_INSTALL_CATALOG)
     return [
         PaletteEntry(
             value=f"{entry['provider']}/{entry['model']}",
@@ -4625,14 +4680,14 @@ def _provider_argument_command(prompt: str, parts: list[str]) -> str | None:
 
 def _is_model_palette_prompt(prompt: str, parts: list[str]) -> bool:
     return (
-        len(parts) <= 3
+        len(parts) <= 2
         and (prompt.startswith("/model ") or (len(parts) >= 1 and parts[0].casefold() == "/model" and prompt.endswith(" ")))
     )
 
 
 def _is_install_palette_prompt(prompt: str, parts: list[str]) -> bool:
     return (
-        len(parts) <= 3
+        len(parts) <= 2
         and (
             prompt.startswith("/install ")
             or (
