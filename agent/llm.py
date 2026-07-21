@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -45,7 +46,7 @@ class LLMClient:
     turn_usage: dict[str, int] = field(default_factory=lambda: empty_usage(), init=False)
 
     def __post_init__(self) -> None:
-        self.provider = _normalize_provider(self.provider or os.environ.get("NYM_LLM_PROVIDER") or "openai")
+        self.provider = _normalize_provider(self.provider or os.environ.get("AGENT_LLM_PROVIDER") or "openai")
         self.model = self.model or _default_model_for_provider(self.provider)
         self.reasoning_effort = _default_reasoning_effort(self.provider, self.model)
         self.reasoning_summary = _default_reasoning_summary(self.provider, self.model)
@@ -58,18 +59,18 @@ class LLMClient:
             else:
                 self.configuration_error = _provider_configuration_error("OpenAI", "OPENAI_API_KEY")
         elif self.provider == "openai-compatible":
-            base_url = os.environ.get("NYM_OPENAI_COMPAT_BASE_URL") or ""
+            base_url = os.environ.get("AGENT_OPENAI_COMPAT_BASE_URL") or ""
             self.endpoint = base_url
             self.mode = "compatible"
             if base_url:
                 self.client = OpenAI(
-                    api_key=os.environ.get("NYM_OPENAI_COMPAT_API_KEY") or "local",
+                    api_key=os.environ.get("AGENT_OPENAI_COMPAT_API_KEY") or "local",
                     base_url=base_url,
                 )
             else:
                 self.configuration_error = _provider_configuration_error(
                     "OpenAI-compatible provider",
-                    "NYM_OPENAI_COMPAT_BASE_URL",
+                    "AGENT_OPENAI_COMPAT_BASE_URL",
                 )
         elif self.provider == "ollama":
             base_url = _ollama_base_url()
@@ -80,7 +81,7 @@ class LLMClient:
             self.endpoint = base_url
             self.mode = "local"
         elif self.provider == "lmstudio":
-            base_url = os.environ.get("NYM_LMSTUDIO_BASE_URL") or os.environ.get("LMSTUDIO_BASE_URL") or "http://localhost:1234/v1"
+            base_url = os.environ.get("AGENT_LMSTUDIO_BASE_URL") or os.environ.get("LMSTUDIO_BASE_URL") or "http://localhost:1234/v1"
             self.client = OpenAI(
                 api_key=os.environ.get("LMSTUDIO_API_KEY") or "lmstudio",
                 base_url=base_url,
@@ -88,7 +89,7 @@ class LLMClient:
             self.endpoint = base_url
             self.mode = "local"
         elif self.provider == "llamacpp":
-            base_url = os.environ.get("NYM_LLAMACPP_BASE_URL") or os.environ.get("LLAMACPP_BASE_URL") or "http://localhost:8080/v1"
+            base_url = os.environ.get("AGENT_LLAMACPP_BASE_URL") or os.environ.get("LLAMACPP_BASE_URL") or "http://localhost:8080/v1"
             self.client = OpenAI(
                 api_key=os.environ.get("LLAMACPP_API_KEY") or "local",
                 base_url=base_url,
@@ -96,7 +97,7 @@ class LLMClient:
             self.endpoint = base_url
             self.mode = "local"
         elif self.provider == "vllm":
-            base_url = os.environ.get("NYM_VLLM_BASE_URL") or os.environ.get("VLLM_BASE_URL") or "http://localhost:8000/v1"
+            base_url = os.environ.get("AGENT_VLLM_BASE_URL") or os.environ.get("VLLM_BASE_URL") or "http://localhost:8000/v1"
             self.client = OpenAI(
                 api_key=os.environ.get("VLLM_API_KEY") or "local",
                 base_url=base_url,
@@ -104,7 +105,7 @@ class LLMClient:
             self.endpoint = base_url
             self.mode = "local"
         elif self.provider == "localai":
-            base_url = os.environ.get("NYM_LOCALAI_BASE_URL") or os.environ.get("LOCALAI_BASE_URL") or "http://localhost:8080/v1"
+            base_url = os.environ.get("AGENT_LOCALAI_BASE_URL") or os.environ.get("LOCALAI_BASE_URL") or "http://localhost:8080/v1"
             self.client = OpenAI(
                 api_key=os.environ.get("LOCALAI_API_KEY") or "local",
                 base_url=base_url,
@@ -296,6 +297,11 @@ class LLMClient:
             "messages": _responses_messages_to_chat(messages, instructions),
         }
         chat_tools = _responses_tools_to_chat(tools)
+        allowed_text_tool_names = {
+            str(item.get("function", {}).get("name"))
+            for item in chat_tools
+            if item.get("function", {}).get("name")
+        }
         if chat_tools:
             request_args["tools"] = chat_tools
         chat_tool_choice = _chat_tool_choice(tool_choice)
@@ -310,10 +316,18 @@ class LLMClient:
                 response = self._stream_openai_chat(
                     request_args,
                     event_handler=event_handler,
+                    text_tool_names=(
+                        allowed_text_tool_names if self.mode == "local" else set()
+                    ),
                 )
             else:
                 completion = self.client.chat.completions.create(**request_args)
-                response = _chat_completion_to_response(completion)
+                response = _chat_completion_to_response(
+                    completion,
+                    text_tool_names=(
+                        allowed_text_tool_names if self.mode == "local" else set()
+                    ),
+                )
         except Exception as exc:
             raise RuntimeError(_friendly_llm_error(exc, self.provider, self.model, self.endpoint, self.mode)) from exc
         self._record_usage(response)
@@ -324,12 +338,15 @@ class LLMClient:
         request_args: dict[str, Any],
         *,
         event_handler: Callable[[Any], None] | None,
+        text_tool_names: set[str],
     ) -> Any:
         chunks = self.client.chat.completions.create(**request_args, stream=True)
         text_parts: list[str] = []
         calls: dict[int, dict[str, Any]] = {}
         usage: Any = None
         sequence = 0
+        streamed_local_text = False
+        suppress_local_text_stream = False
 
         def emit(event: dict[str, Any]) -> None:
             nonlocal sequence
@@ -348,12 +365,24 @@ class LLMClient:
                 continue
             delta = _get(choices[0], "delta") or {}
             reasoning = _get(delta, "reasoning_content") or _get(delta, "reasoning")
-            if isinstance(reasoning, str) and reasoning:
+            if self.mode != "local" and isinstance(reasoning, str) and reasoning:
                 emit({"type": "response.reasoning_text.delta", "delta": reasoning})
             content = _get(delta, "content")
             if isinstance(content, str) and content:
                 text_parts.append(content)
-                emit({"type": "response.output_text.delta", "delta": content})
+                output_text = "".join(text_parts)
+                if self.mode != "local" and not text_tool_names:
+                    emit({"type": "response.output_text.delta", "delta": content})
+                elif (
+                    self.mode == "local"
+                    and not text_tool_names
+                    and not suppress_local_text_stream
+                ):
+                    if _safe_local_chat_stream_prefix(output_text):
+                        emit({"type": "response.output_text.delta", "delta": content})
+                        streamed_local_text = True
+                    else:
+                        suppress_local_text_stream = True
 
             for call_delta in _get(delta, "tool_calls", []) or []:
                 index = _get(call_delta, "index", 0)
@@ -392,6 +421,45 @@ class LLMClient:
                     })
 
         output: list[dict[str, Any]] = []
+        output_text = "".join(text_parts)
+        if text_tool_names:
+            fallback_calls, visible_text = _text_content_tool_calls(
+                output_text,
+                allowed_names=text_tool_names,
+            )
+            if fallback_calls and not calls:
+                for index, fallback in enumerate(fallback_calls):
+                    call_id = f"call_text_{index}"
+                    calls[index] = {
+                        "id": call_id,
+                        "name": fallback["name"],
+                        "arguments": fallback["arguments"],
+                        "emitted": True,
+                    }
+                    emit({
+                        "type": "response.output_item.added",
+                        "item": {
+                            "type": "function_call",
+                            "id": call_id,
+                            "call_id": call_id,
+                            "name": fallback["name"],
+                        },
+                    })
+                    emit({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": call_id,
+                        "delta": fallback["arguments"],
+                    })
+                output_text = visible_text
+            if output_text and not _looks_like_command_envelope(output_text):
+                emit({"type": "response.output_text.delta", "delta": output_text})
+        elif (
+            self.mode == "local"
+            and output_text
+            and not streamed_local_text
+            and not _looks_like_command_envelope(output_text)
+        ):
+            emit({"type": "response.output_text.delta", "delta": output_text})
         for index in sorted(calls):
             call = calls[index]
             emit({
@@ -408,7 +476,7 @@ class LLMClient:
         emit({"type": "response.completed"})
         return SimpleNamespace(
             output=output,
-            output_text="".join(text_parts),
+            output_text=output_text,
             usage=usage,
         )
 
@@ -445,7 +513,7 @@ class LLMClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=_float_env("NYM_LLM_TIMEOUT_SECONDS") or 120) as response:
+            with urllib.request.urlopen(request, timeout=_float_env("AGENT_LLM_TIMEOUT_SECONDS") or 120) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -466,8 +534,8 @@ class LLMClient:
         return usage
 
     def estimate_cost_usd(self, usage: dict[str, int]) -> float:
-        input_price = _float_env("NYM_INPUT_COST_USD_PER_MILLION_TOKENS")
-        output_price = _float_env("NYM_OUTPUT_COST_USD_PER_MILLION_TOKENS")
+        input_price = _float_env("AGENT_INPUT_COST_USD_PER_MILLION_TOKENS")
+        output_price = _float_env("AGENT_OUTPUT_COST_USD_PER_MILLION_TOKENS")
         if input_price is None and output_price is None:
             return 0.0
 
@@ -558,7 +626,7 @@ def _normalize_provider(value: str) -> str:
 def _default_model_for_provider(provider: str) -> str:
     defaults = {
         "openai": os.environ.get("OPENAI_MODEL") or "gpt-5.4-mini",
-        "openai-compatible": os.environ.get("NYM_OPENAI_COMPAT_MODEL") or "local-model",
+        "openai-compatible": os.environ.get("AGENT_OPENAI_COMPAT_MODEL") or "local-model",
         "ollama": os.environ.get("OLLAMA_MODEL") or "llama3.1",
         "lmstudio": os.environ.get("LMSTUDIO_MODEL") or "local-model",
         "llamacpp": os.environ.get("LLAMACPP_MODEL") or "local-model",
@@ -584,7 +652,7 @@ def _default_model_for_provider(provider: str) -> str:
 def _default_reasoning_effort(provider: str, model: str | None) -> str | None:
     if not _model_supports_reasoning(provider, model):
         return None
-    raw = (os.environ.get("NYM_REASONING_EFFORT") or "medium").strip().casefold()
+    raw = (os.environ.get("AGENT_REASONING_EFFORT") or "medium").strip().casefold()
     if raw in {"minimal", "low", "medium", "high"}:
         return raw
     return "medium"
@@ -593,7 +661,7 @@ def _default_reasoning_effort(provider: str, model: str | None) -> str | None:
 def _default_reasoning_summary(provider: str, model: str | None) -> str | None:
     if provider != "openai" or not _model_supports_reasoning(provider, model):
         return None
-    raw = (os.environ.get("NYM_REASONING_SUMMARY") or "").strip().casefold()
+    raw = (os.environ.get("AGENT_REASONING_SUMMARY") or "").strip().casefold()
     if raw in {"auto", "concise", "detailed"}:
         return raw
     return None
@@ -674,7 +742,7 @@ def _has_bedrock_credentials() -> bool:
 def _provider_configuration_error(provider_name: str, env_name: str) -> str:
     return (
         f"{provider_name} is not configured. Set {env_name}, or switch to a local model with "
-        "`/model ollama <installed-model>` or `nym --provider ollama --model <installed-model>`."
+        "`/model ollama <installed-model>` or `agent --provider ollama --model <installed-model>`."
     )
 
 
@@ -720,7 +788,7 @@ def _friendly_llm_error(
 
 def _ollama_base_url() -> str:
     raw = (
-        os.environ.get("NYM_OLLAMA_BASE_URL")
+        os.environ.get("AGENT_OLLAMA_BASE_URL")
         or os.environ.get("OLLAMA_BASE_URL")
         or os.environ.get("OLLAMA_HOST")
         or "http://localhost:11434"
@@ -849,7 +917,11 @@ def _anthropic_tool_choice(tool_choice: str | dict[str, Any] | None) -> dict[str
     return None
 
 
-def _chat_completion_to_response(response: Any) -> Any:
+def _chat_completion_to_response(
+    response: Any,
+    *,
+    text_tool_names: set[str] | None = None,
+) -> Any:
     choice = (_get(response, "choices") or [None])[0]
     message = _get(choice, "message") if choice is not None else None
     output: list[dict[str, Any]] = []
@@ -862,10 +934,138 @@ def _chat_completion_to_response(response: Any) -> Any:
             "arguments": _get(function, "arguments", "{}"),
         })
     content = _get(message, "content", "") if message is not None else ""
+    if not output and isinstance(content, str) and text_tool_names:
+        fallback_calls, content = _text_content_tool_calls(
+            content,
+            allowed_names=text_tool_names,
+        )
+        for index, call in enumerate(fallback_calls):
+            output.append({
+                "type": "function_call",
+                "call_id": f"call_text_{index}",
+                "name": call["name"],
+                "arguments": call["arguments"],
+            })
     return SimpleNamespace(
         output=output,
         output_text=content or "",
         usage=_get(response, "usage"),
+    )
+
+
+def _text_content_tool_calls(
+    content: str,
+    *,
+    allowed_names: set[str],
+) -> tuple[list[dict[str, str]], str]:
+    if not content.strip() or not allowed_names:
+        return [], content
+
+    tagged = list(re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", content, re.DOTALL))
+    calls: list[dict[str, str]] = []
+    if tagged:
+        for match in tagged:
+            parsed = _text_tool_call_object(match.group(1), allowed_names=allowed_names)
+            if parsed is None:
+                return [], content
+            calls.append(parsed)
+        visible = re.sub(
+            r"<tool_call>\s*\{.*?\}\s*</tool_call>",
+            "",
+            content,
+            flags=re.DOTALL,
+        ).strip()
+        return calls, visible
+
+    fenced = list(re.finditer(
+        r"```(?:json)?\s*(\{.*?\})\s*```",
+        content,
+        flags=re.DOTALL | re.IGNORECASE,
+    ))
+    if fenced:
+        for match in fenced:
+            parsed = _text_tool_call_object(match.group(1), allowed_names=allowed_names)
+            if parsed is None:
+                return [], content
+            calls.append(parsed)
+        return calls, ""
+
+    parsed = _text_tool_call_object(content.strip(), allowed_names=allowed_names)
+    if parsed is None:
+        return [], content
+    return [parsed], ""
+
+
+def _text_tool_call_object(
+    payload: str,
+    *,
+    allowed_names: set[str],
+) -> dict[str, str] | None:
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    arguments = value.get("arguments")
+    if not isinstance(name, str) or name not in allowed_names:
+        return None
+    if isinstance(arguments, dict):
+        serialized_arguments = json.dumps(arguments, ensure_ascii=False)
+    elif isinstance(arguments, str):
+        try:
+            decoded_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(decoded_arguments, dict):
+            return None
+        serialized_arguments = json.dumps(decoded_arguments, ensure_ascii=False)
+    else:
+        return None
+    return {"name": name, "arguments": serialized_arguments}
+
+
+def _looks_like_command_envelope(content: str) -> bool:
+    candidates = [content.strip()]
+    candidates.extend(
+        match.group(1)
+        for match in re.finditer(
+            r"```(?:json)?\s*(\{.*?\})\s*```",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+    )
+    return any(_is_command_envelope_object(candidate) for candidate in candidates)
+
+
+def _safe_local_chat_stream_prefix(content: str) -> bool:
+    text = content.strip()
+    if not text:
+        return True
+    lowered = text.casefold()
+    if "<tool_call" in lowered or "```" in lowered:
+        return False
+    if text.startswith("{") or text.startswith("["):
+        return False
+    return not _looks_like_command_envelope(text)
+
+
+def _is_command_envelope_object(payload: str) -> bool:
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(value, dict):
+        return False
+    command = value.get("command") or value.get("tool")
+    if isinstance(command, str) and command.strip():
+        return True
+    name = value.get("name")
+    return (
+        isinstance(name, str)
+        and bool(name.strip())
+        and "arguments" in value
     )
 
 

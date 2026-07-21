@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from nym_agent.llm import (
+from agent.llm import (
     LLMClient,
     _anthropic_message_to_response,
     _chat_reasoning_effort,
@@ -90,7 +90,238 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(response.output_text, "Checking files")
         self.assertEqual(events[0]["type"], "response.in_progress")
         self.assertTrue(any(event["type"] == "response.output_text.delta" for event in events))
+        self.assertFalse(any(event["type"] == "response.reasoning_text.delta" for event in events))
         self.assertEqual(events[-1]["type"], "response.completed")
+
+    def test_local_provider_converts_bare_json_content_into_tool_call(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:7b")
+        chunks = iter([
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content=(
+                        '{"name":"desktop_action","arguments":'
+                        '{"action":"set_volume","value":"0"}}'
+                    ),
+                    reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+        ])
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=Mock(return_value=chunks)),
+            ),
+        )
+        events = []
+
+        response = client.respond(
+            instructions="Use tools",
+            messages=[{"role": "user", "content": "Mute audio"}],
+            tools=[{
+                "type": "function",
+                "name": "desktop_action",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            stream=True,
+            event_handler=events.append,
+        )
+
+        self.assertEqual(response.output_text, "")
+        self.assertEqual(response.output[0]["name"], "desktop_action")
+        self.assertEqual(
+            response.output[0]["arguments"],
+            '{"action": "set_volume", "value": "0"}',
+        )
+        self.assertTrue(any(event["type"] == "response.output_item.added" for event in events))
+        self.assertFalse(any(
+            event["type"] == "response.output_text.delta"
+            and "desktop_action" in event.get("delta", "")
+            for event in events
+        ))
+
+    def test_local_provider_converts_fenced_json_into_tool_call(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:7b")
+        chunks = iter([
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content=(
+                        "```json\n"
+                        '{"name":"desktop_action","arguments":'
+                        '{"action":"set_volume","value":"0"}}\n'
+                        "```\nThis command will mute audio."
+                    ),
+                    reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+        ])
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=Mock(return_value=chunks)),
+            ),
+        )
+        events = []
+
+        response = client.respond(
+            instructions="Use tools",
+            messages=[{"role": "user", "content": "Mute audio"}],
+            tools=[{
+                "type": "function",
+                "name": "desktop_action",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            stream=True,
+            event_handler=events.append,
+        )
+
+        self.assertEqual(response.output_text, "")
+        self.assertEqual(response.output[0]["name"], "desktop_action")
+        self.assertFalse(any(
+            event["type"] == "response.output_text.delta"
+            for event in events
+        ))
+
+    def test_local_chat_does_not_stream_unexecuted_fenced_tool_json(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:7b")
+        leaked = (
+            "Try this:\n```json\n"
+            '{"name":"secret_scan","arguments":{"path":"/workspace"}}\n'
+            "```"
+        )
+        chunks = iter([
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content=leaked,
+                    reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+        ])
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=Mock(return_value=chunks)),
+            ),
+        )
+        events = []
+
+        response = client.respond(
+            instructions="Answer normally",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[],
+            stream=True,
+            event_handler=events.append,
+        )
+
+        self.assertEqual(response.output_text, leaked)
+        self.assertFalse(any(
+            event["type"] == "response.output_text.delta"
+            for event in events
+        ))
+
+    def test_local_no_tool_chat_streams_safe_text_immediately(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:7b")
+        chunks = iter([
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content="Hi",
+                    reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content=" there.",
+                    reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+        ])
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=Mock(return_value=chunks)),
+            ),
+        )
+        events = []
+
+        response = client.respond(
+            instructions="Answer normally",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            stream=True,
+            event_handler=events.append,
+        )
+
+        self.assertEqual(response.output_text, "Hi there.")
+        self.assertEqual(
+            [
+                event["delta"]
+                for event in events
+                if event["type"] == "response.output_text.delta"
+            ],
+            ["Hi", " there."],
+        )
+
+    def test_local_provider_does_not_execute_unknown_json_tool_name(self) -> None:
+        completion = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"name":"not_registered","arguments":{}}',
+                tool_calls=[],
+            ))],
+            usage=None,
+        )
+
+        response = _chat_completion_to_response(
+            completion,
+            text_tool_names={"desktop_action"},
+        )
+
+        self.assertEqual(response.output, [])
+        self.assertIn("not_registered", response.output_text)
+
+    def test_local_provider_hides_unexecuted_command_envelope_from_stream(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:7b")
+        chunks = iter([
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content=(
+                        '{"command":"read_directory",'
+                        '"directory_path":"/workspace"}'
+                    ),
+                    reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+        ])
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=Mock(return_value=chunks)),
+            ),
+        )
+        events = []
+
+        response = client.respond(
+            instructions="Use native tools",
+            messages=[{"role": "user", "content": "Read the directory"}],
+            tools=[{
+                "type": "function",
+                "name": "inspect_tree",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            stream=True,
+            event_handler=events.append,
+        )
+
+        self.assertIn("read_directory", response.output_text)
+        self.assertFalse(any(
+            event["type"] == "response.output_text.delta"
+            for event in events
+        ))
 
     def test_reasoning_capability_detection_is_provider_specific(self) -> None:
         self.assertTrue(_model_supports_reasoning("openai", "gpt-5.4-mini"))

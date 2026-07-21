@@ -30,6 +30,13 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return [tool.schema for tool in self._tools.values()]
 
+    def restricted(self, allowed_names: set[str]) -> "ToolRegistry":
+        restricted = ToolRegistry()
+        for name, tool in self._tools.items():
+            if name in allowed_names:
+                restricted.register(tool)
+        return restricted
+
     def execute(self, name: str, args: dict[str, Any], ctx: ToolContext) -> Any:
         tool = self._tools.get(name)
         if tool is None:

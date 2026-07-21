@@ -1,27 +1,36 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import curses
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
 import uuid
 import textwrap
 import threading
+import tempfile
 import time
 import webbrowser
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from enum import Enum
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from .context_builder import build_stored_context
+from .bundle import bundled_rust_binary
+from .config import AgentConfig, load_agent_config
+from .gateway import create_inbound_address, start_gateway
 from .language_servers import LanguageServerManager
 from .llm import LLMClient, SUPPORTED_PROVIDERS, _normalize_provider
 from .planner import (
@@ -32,9 +41,20 @@ from .planner import (
 )
 from .rust_tools import RustTools
 from .session_store import SessionInfo, SessionStore, TokenUsage
+from .skills import SkillCatalog, discover_skill_catalog
+from .system_events import drain_system_events, resolve_main_system_event_session_key
+
+if TYPE_CHECKING:
+    from .gateway_impl import AgentGateway
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Unix/WSL is the primary TUI runtime.
+    fcntl = None  # type: ignore[assignment]
 
 
 SESSION_LIST_LIMIT = 10
+TUI_TRANSCRIPT_LIMIT = 200
 USAGE_PANEL_WIDTH = 30
 USAGE_PANEL_MIN_TERMINAL_WIDTH = 105
 DEFAULT_CONTEXT_WINDOWS = {
@@ -56,6 +76,7 @@ DEFAULT_CONTEXT_WINDOWS = {
     "llama3.1": 128_000,
     "llama3.3": 128_000,
     "qwen2.5-coder": 128_000,
+    "qwen2.5-coder-7b-instruct": 128_000,
     "qwen3": 128_000,
     "qwen3.5": 128_000,
     "qwen3.6": 256_000,
@@ -85,11 +106,16 @@ DEFAULT_CONTEXT_WINDOWS = {
 
 LOCAL_COMMANDS = (
     ("/model", "Choose a model or local runtime"),
-    ("/install", "Install an Ollama model"),
+    ("/install", "Install an open-source/open-weight model locally"),
+    ("/reasoning", "Set reasoning effort for supported models"),
+    ("/devices", "Show devices visible to this runtime"),
+    ("/capabilities", "Show agent tools, safety, and current model features"),
+    ("/skills", "Show layered workspace and personal skills"),
+    ("/gateway", "Show control-plane routing and session status"),
     ("/status", "Show model, context, and session usage"),
     ("/setup", "Set up local runtimes or hosted providers"),
     ("/help", "Show commands and keyboard shortcuts"),
-    ("/exit", "Close Nym"),
+    ("/exit", "Close Agent"),
 )
 
 PROVIDER_API_KEY_ENVS = {
@@ -101,7 +127,7 @@ PROVIDER_API_KEY_ENVS = {
     "azure": "AZURE_OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "glm": "GLM_API_KEY",
-    "openai-compatible": "NYM_OPENAI_COMPAT_API_KEY",
+    "openai-compatible": "AGENT_OPENAI_COMPAT_API_KEY",
 }
 
 PROVIDER_LOGIN_URLS = {
@@ -139,6 +165,7 @@ PROVIDER_DISPLAY_NAMES = {
 }
 PROVIDER_ARGUMENT_COMMANDS = {"/provider", "/login", "/auth", "/apikey", "/key"}
 LOCAL_PROVIDERS = {"ollama", "lmstudio", "llamacpp", "vllm", "localai"}
+UNIMPLEMENTED_PROVIDER_TRANSPORTS = {"copilot", "gemini", "bedrock", "azure", "vertexai"}
 PROVIDER_SORT_ORDER = {
     "copilot": 0,
     "anthropic": 1,
@@ -241,57 +268,33 @@ PROVIDER_MODEL_HINTS = {
         "claude-opus-4.1",
     ),
     "ollama": (
-        "qwen3.6",
-        "qwen3-coder",
-        "qwen3-coder-next",
-        "qwen3.5",
-        "qwen3",
         "qwen2.5-coder",
-        "qwen2.5",
+        "qwen3-coder",
+        "qwen3",
         "deepseek-r1",
-        "deepseek-v3.2",
-        "deepseek-v3",
-        "deepseek-coder-v2",
-        "deepseek-coder",
         "llama3.3",
         "llama3.1",
-        "llama3.2",
-        "llama4",
-        "gemma4",
         "gemma3",
-        "gemma3n",
-        "mistral-small3.2",
-        "mistral-small",
-        "mistral-nemo",
-        "mistral",
-        "mixtral",
-        "codestral",
-        "codegemma",
-        "codellama",
-        "gpt-oss",
-        "phi4",
-        "phi4-reasoning",
-        "phi4-mini",
-        "granite-code",
-        "starcoder2",
-        "glm-5.1",
-        "glm-4.7-flash",
+        "stable-code",
     ),
-    "lmstudio": ("local-model",),
+    "lmstudio": ("gpt-oss-20b", "llama-3.1-8b", "local-model"),
     "llamacpp": (
+        "gemma-3-1b-it",
         "local-model",
         "qwen2.5-coder-7b-instruct",
         "deepseek-coder-v2-lite-instruct",
         "codellama-13b-instruct",
     ),
     "vllm": (
+        "qwen2.5-1.5b-instruct",
         "Qwen/Qwen2.5-Coder-32B-Instruct",
         "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
         "meta-llama/Llama-3.3-70B-Instruct",
         "mistralai/Codestral-22B-v0.1",
     ),
     "localai": (
-        "qwen2.5-coder",
+        "llama-3.2-1b-instruct",
+        "hermes-2-theta-llama-3-8b",
         "deepseek-coder",
         "llama-3.1-instruct",
         "codestral",
@@ -305,6 +308,24 @@ PROVIDER_MODEL_HINTS = {
     ),
     "glm": ("glm-5.1", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4", "glm-4.5"),
 }
+LOCAL_INSTALL_CATALOG = (
+    {"provider": "ollama", "model": "qwen3", "install_id": "qwen3:8b", "parameters": "8B", "size": "~5.2 GB", "memory": "8 GB+ RAM", "context": "40K", "quantization": "Ollama default"},
+    {"provider": "lmstudio", "model": "gpt-oss-20b", "install_id": "openai/gpt-oss-20b", "parameters": "20B (3.6B active)", "size": "varies by quantization", "memory": "16 GB+ RAM", "context": "128K", "quantization": "choose in LM Studio"},
+    {"provider": "llamacpp", "model": "gemma-3-1b-it", "install_id": "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M", "parameters": "1B", "size": "~1 GB", "memory": "4 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
+    {"provider": "vllm", "model": "qwen2.5-1.5b-instruct", "install_id": "Qwen/Qwen2.5-1.5B-Instruct", "parameters": "1.5B", "size": "~3 GB", "memory": "6 GB+ VRAM", "context": "32K", "quantization": "full precision weights"},
+    {"provider": "localai", "model": "llama-3.2-1b-instruct", "install_id": "llama-3.2-1b-instruct:q4_k_m", "parameters": "1B", "size": "~1 GB", "memory": "4 GB+ RAM", "context": "128K", "quantization": "Q4_K_M"},
+    {"provider": "ollama", "model": "qwen2.5-coder", "install_id": "qwen2.5-coder:7b", "parameters": "7B", "size": "~4.7 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
+    {"provider": "ollama", "model": "qwen3-coder", "install_id": "qwen3-coder:30b", "parameters": "30B (3.3B active)", "size": "~19 GB", "memory": "24 GB+ RAM", "context": "256K", "quantization": "Ollama default"},
+    {"provider": "lmstudio", "model": "llama-3.1-8b", "install_id": "llama-3.1-8b@q4_k_m", "parameters": "8B", "size": "~5 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Q4_K_M"},
+    {"provider": "llamacpp", "model": "qwen2.5-coder-7b-instruct", "install_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M", "parameters": "7B", "size": "~4.7 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Q4_K_M"},
+    {"provider": "vllm", "model": "Qwen/Qwen2.5-Coder-32B-Instruct", "install_id": "Qwen/Qwen2.5-Coder-32B-Instruct", "parameters": "32.5B", "size": "~65 GB", "memory": "70 GB+ VRAM", "context": "128K", "quantization": "full precision weights"},
+    {"provider": "vllm", "model": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", "install_id": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", "parameters": "16B (2.4B active)", "size": "~32 GB", "memory": "36 GB+ VRAM", "context": "128K", "quantization": "full precision weights"},
+    {"provider": "ollama", "model": "deepseek-r1", "install_id": "deepseek-r1:8b", "parameters": "8B", "size": "~5.2 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
+    {"provider": "ollama", "model": "llama3.3", "install_id": "llama3.3:70b", "parameters": "70B", "size": "~43 GB", "memory": "48 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
+    {"provider": "ollama", "model": "llama3.1", "install_id": "llama3.1:8b", "parameters": "8B", "size": "~4.9 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
+    {"provider": "ollama", "model": "gemma3", "install_id": "gemma3:4b", "parameters": "4B", "size": "~3.3 GB", "memory": "6 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
+    {"provider": "ollama", "model": "stable-code", "install_id": "stable-code:3b", "parameters": "3B", "size": "~1.6 GB", "memory": "4 GB+ RAM", "context": "16K", "quantization": "Ollama default"},
+)
 COLOR_HEADER = 1
 COLOR_USER = 2
 COLOR_ASSISTANT = 3
@@ -326,6 +347,13 @@ class AppContext:
     store: SessionStore
     stored_context: str | None = None
     debug: bool = False
+    config: AgentConfig = field(default_factory=AgentConfig)
+    skills: SkillCatalog = field(default_factory=SkillCatalog)
+    gateway: AgentGateway | None = None
+    agent_id: str = "main"
+    tool_allowlist: tuple[str, ...] | None = None
+    route_key: str | None = None
+    config_path: Path | None = None
 
     pending_provider: str | None = None
     pending_model: str | None = None
@@ -572,7 +600,12 @@ class LiveTurnState:
         with self.lock:
             self._flush_reasoning()
             self._flush_text()
-            self._drop_reasoning()
+            # Tool activity is a live progress surface, not durable conversation
+            # content. The persisted user/assistant messages replace it when the
+            # turn ends; errors remain visible through the dedicated error field.
+            self.feed = []
+            self.prompt = ""
+            self._current_tool = None
             self.active = False
             self.phase = "error" if error else "completed"
             self.error = error
@@ -600,6 +633,7 @@ def _tool_activity_label(name: str | None) -> str:
     labels = {
         "read_path": "Reading files",
         "list_path": "Listing files",
+        "path_status": "Checking path status",
         "inspect_tree": "Exploring the workspace",
         "inspect_target": "Inspecting a target",
         "glob": "Finding files",
@@ -609,6 +643,14 @@ def _tool_activity_label(name: str | None) -> str:
         "edit_file": "Editing a file",
         "delete_path": "Deleting a path",
         "run_system_command": "Running a command",
+        "system_info": "Inspecting the system",
+        "connected_devices": "Checking connected devices",
+        "desktop_capabilities": "Checking desktop capabilities",
+        "desktop_observe": "Observing the desktop",
+        "desktop_resolve": "Resolving desktop target",
+        "process_list": "Checking running processes",
+        "desktop_action": "Performing a desktop action",
+        "load_skill": "Loading a skill",
         "finish_task": "Preparing the response",
     }
     return labels.get(tool, f"Running {tool}")
@@ -637,8 +679,8 @@ def _live_tool_result_feed_item(event: dict[str, Any]) -> tuple[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="nym",
-        description="Nym CLI coding agent",
+        prog="agent",
+        description="Agent CLI coding agent",
     )
 
     parser.add_argument(
@@ -648,9 +690,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--config",
+        default=None,
+        help="Agent JSON config path. Defaults to user and workspace .agent/config.json files.",
+    )
+
+    parser.add_argument(
+        "--channel",
+        default=None,
+        help="Route this invocation through a durable named channel session.",
+    )
+
+    parser.add_argument(
+        "--account-id",
+        default="default",
+        help="Channel account identity used for deterministic session routing.",
+    )
+
+    parser.add_argument(
+        "--sender-id",
+        default=None,
+        help="Sender identity for per-sender channel session scope.",
+    )
+
+    parser.add_argument(
+        "--peer-kind",
+        choices=("direct", "group", "channel"),
+        default=None,
+        help="Optional channel peer kind used by routing bindings.",
+    )
+
+    parser.add_argument(
+        "--peer-id",
+        default=None,
+        help="Optional channel peer id used by routing bindings.",
+    )
+
+    parser.add_argument("--guild-id", default=None, help="Optional guild id used by routing bindings.")
+    parser.add_argument("--team-id", default=None, help="Optional team id used by routing bindings.")
+
+    parser.add_argument(
         "--rust-bin",
         default=None,
-        help="Path to nym-rust binary. Defaults to the built binary in the repository.",
+        help="Path to agent-rust binary. Defaults to the built binary in the repository.",
     )
 
     parser.add_argument(
@@ -664,7 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=sorted(SUPPORTED_PROVIDERS),
         help=(
-            "LLM provider. Defaults to NYM_LLM_PROVIDER or openai. "
+            "LLM provider. Defaults to AGENT_LLM_PROVIDER or openai. "
             "Use ollama, lmstudio, llamacpp, vllm, or localai for no-login local models."
         ),
     )
@@ -683,7 +765,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--tui-bridge",
-        choices=("snapshot", "submit", "stream-submit", "complete", "approve", "deny"),
+        choices=(
+            "snapshot", "submit", "stream-submit", "complete", "gateway",
+            "approve", "deny",
+        ),
         help=argparse.SUPPRESS,
     )
 
@@ -732,6 +817,10 @@ def resolve_rust_bin(
             rust_bin = workspace_root / rust_bin
         return rust_bin.resolve()
 
+    bundled = bundled_rust_binary()
+    if bundled is not None:
+        return bundled.resolve()
+
     repo_root = (repo_root or Path(__file__).resolve().parents[1]).resolve()
     candidate_roots = [
         repo_root,
@@ -741,15 +830,15 @@ def resolve_rust_bin(
 
     for candidate_root in candidate_roots:
         for candidate in (
-            candidate_root / "nym-rust" / "target" / "debug" / "nym-rust",
-            candidate_root / "nym-rust" / "target" / "release" / "nym-rust",
-            candidate_root / "target" / "debug" / "nym-rust",
-            candidate_root / "target" / "release" / "nym-rust",
+            candidate_root / "agent-rust" / "target" / "debug" / "agent-rust",
+            candidate_root / "agent-rust" / "target" / "release" / "agent-rust",
+            candidate_root / "target" / "debug" / "agent-rust",
+            candidate_root / "target" / "release" / "agent-rust",
         ):
             if candidate.exists():
                 return candidate.resolve()
 
-    return (repo_root / "nym-rust" / "target" / "debug" / "nym-rust").resolve()
+    return (repo_root / "agent-rust" / "target" / "debug" / "agent-rust").resolve()
 
 
 def build_context(
@@ -759,6 +848,22 @@ def build_context(
     session_info: SessionInfo,
 ) -> AppContext:
     workspace_root = Path(session_info.workspace_root).expanduser().resolve()
+    explicit_config = getattr(args, "config", None)
+    config_path = (
+        Path(explicit_config).expanduser().resolve()
+        if explicit_config
+        else None
+    )
+    config = load_agent_config(workspace_root, explicit_path=config_path)
+    stored_agent_id = session_info.agent if session_info.agent in config.agents else None
+    agent_id = stored_agent_id or config.default_agent_id
+    tool_allowlist = config.tool_allowlist(agent_id)
+    skills = discover_skill_catalog(
+        workspace_root,
+        config,
+        agent_id=agent_id,
+        tool_allowlist=tool_allowlist,
+    )
     rust_bin = resolve_rust_bin(
         args,
         workspace_root,
@@ -772,6 +877,8 @@ def build_context(
     provider = getattr(args, "provider", None) or session_info.provider
     model = _selected_model(args, session_info)
     llm = LLMClient(model=model, provider=provider)
+    if session.reasoning_effort and llm.reasoning_effort is not None:
+        llm.reasoning_effort = session.reasoning_effort
     if session_info.provider != llm.provider or session_info.model != llm.model:
         store.update_llm_config(session_info.id, provider=llm.provider, model=llm.model)
 
@@ -786,7 +893,22 @@ def build_context(
         store=store,
         stored_context=stored_context,
         debug=args.debug,
+        config=config,
+        skills=skills,
+        gateway=start_gateway(config=config, store=store),
+        agent_id=agent_id,
+        tool_allowlist=tool_allowlist,
+        route_key=_session_route_key(store, session_info.id),
+        config_path=config_path,
     )
+
+
+def _session_route_key(store: SessionStore, session_id: str) -> str | None:
+    try:
+        routes = store.list_routes_for_session(session_id)
+    except (AttributeError, OSError):
+        return None
+    return routes[0].route_key if routes else None
 
 
 def _selected_model(args: argparse.Namespace, session_info: SessionInfo) -> str | None:
@@ -804,18 +926,18 @@ def default_workspace_root(args: argparse.Namespace) -> Path:
 
     cwd = Path.cwd().resolve()
     repo_root = Path(__file__).resolve().parents[1]
-    if cwd == Path("/") and (repo_root / "nym-rust").exists() and (repo_root / "README.md").exists():
+    if cwd == Path("/") and (repo_root / "agent-rust").exists() and (repo_root / "README.md").exists():
         return repo_root.resolve()
 
-    if cwd.name == "nym":
+    if cwd.name == "agent":
         repo_candidates = [cwd.parent, cwd]
-    elif cwd.name == "nym_agent":
+    elif cwd.name == "agent":
         repo_candidates = [cwd.parent.parent, cwd.parent, cwd]
     else:
         repo_candidates = [cwd]
 
     for candidate in repo_candidates:
-        if (candidate / "nym-rust").exists() and (candidate / "README.md").exists():
+        if (candidate / "agent-rust").exists() and (candidate / "README.md").exists():
             return candidate.resolve()
 
     return cwd
@@ -841,9 +963,38 @@ def handle_prompt(
     stream_event: Callable[[dict[str, Any]], None] | None = None,
     approval_requester: Callable[[dict[str, Any]], str] | None = None,
 ) -> str:
+    gateway = getattr(ctx, "gateway", None)
+    lease = (
+        gateway.session_lease(ctx.session_id)
+        if gateway is not None
+        else nullcontext()
+    )
+    with lease:
+        return _run_prompt_turn(
+            ctx,
+            prompt,
+            stream_event=stream_event,
+            approval_requester=approval_requester,
+        )
+
+
+def _run_prompt_turn(
+    ctx: AppContext,
+    prompt: str,
+    *,
+    stream_event: Callable[[dict[str, Any]], None] | None = None,
+    approval_requester: Callable[[dict[str, Any]], str] | None = None,
+) -> str:
     conversation_history = load_session_messages(ctx.store, ctx.session_id)
-    ctx.store.update_last_prompt(ctx.session_id, prompt)
-    ctx.store.add_message(ctx.session_id, "user", prompt)
+    route_key = getattr(ctx, "route_key", None)
+    write_guard = {"expected_route_key": route_key} if route_key else {}
+    user_messages = ctx.store.add_messages(
+        ctx.session_id,
+        [("user", prompt)],
+        last_prompt=prompt,
+        **write_guard,
+    )
+    _emit_transcript_update(ctx, user_messages)
     ctx.store.add_event(
         ctx.session_id,
         event_type="turn_started",
@@ -856,24 +1007,39 @@ def handle_prompt(
         summary="Assistant stream started",
         data={"prompt": prompt},
     )
-
+    _emit_gateway_hook(ctx, "turn_started", {
+        "session_id": ctx.session_id,
+        "route_key": getattr(ctx, "route_key", None),
+        "agent_id": getattr(ctx, "agent_id", "main"),
+    })
     ctx.llm.reset_turn_usage()
+    agent_prompt = _prompt_with_system_events(ctx, prompt)
     try:
-        answer = run_agent(
-            llm=ctx.llm,
-            rust=ctx.rust,
-            workspace_root=str(ctx.workspace_root),
-            search_roots=[str(root) for root in ctx.search_roots],
-            user_prompt=prompt,
-            session=ctx.session,
-            stored_context=ctx.stored_context,
-            conversation_history=conversation_history,
-            record_event=lambda **kwargs: ctx.store.add_event(ctx.session_id, **kwargs),
-            stream_event=stream_event,
-            approval_requester=approval_requester,
-            language_servers=ctx.language_servers,
-            debug=ctx.debug,
-        )
+        try:
+            answer = run_agent(
+                llm=ctx.llm,
+                rust=ctx.rust,
+                workspace_root=str(ctx.workspace_root),
+                search_roots=[str(root) for root in ctx.search_roots],
+                user_prompt=agent_prompt,
+                session=ctx.session,
+                stored_context=ctx.stored_context,
+                conversation_history=conversation_history,
+                record_event=lambda **kwargs: ctx.store.add_event(ctx.session_id, **kwargs),
+                stream_event=stream_event,
+                approval_requester=approval_requester,
+                language_servers=ctx.language_servers,
+                skill_catalog=getattr(ctx, "skills", None),
+                tool_allowlist=getattr(ctx, "tool_allowlist", None),
+                debug=ctx.debug,
+            )
+        except Exception as exc:
+            _emit_gateway_hook(ctx, "turn_failed", {
+                "session_id": ctx.session_id,
+                "route_key": getattr(ctx, "route_key", None),
+                "error": str(exc),
+            })
+            raise
     finally:
         usage = ctx.llm.consume_turn_usage()
         ctx.store.add_usage(
@@ -900,14 +1066,89 @@ def handle_prompt(
         summary="Assistant stream completed",
         data={"answer": answer},
     )
-    ctx.store.add_message(ctx.session_id, "assistant", answer)
+    assistant_message = ctx.store.add_message(ctx.session_id, "assistant", answer, **write_guard)
+    _emit_transcript_update(ctx, [assistant_message])
     persist_agent_state(ctx)
     ctx.stored_context = None
+    _emit_gateway_hook(ctx, "turn_completed", {
+        "session_id": ctx.session_id,
+        "route_key": getattr(ctx, "route_key", None),
+    })
     return answer
 
 
+def _prompt_with_system_events(ctx: AppContext, prompt: str) -> str:
+    events: list[str] = []
+    seen_keys: set[str] = set()
+    for key in (
+        getattr(ctx, "route_key", None),
+        resolve_main_system_event_session_key(getattr(ctx, "config", None)),
+        "global",
+    ):
+        if not isinstance(key, str) or not key.strip() or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        events.extend(drain_system_events(key))
+    if not events:
+        return prompt
+    event_text = "\n".join(f"- {event}" for event in events)
+    return f"System events since the last prompt:\n{event_text}\n\nUser request: {prompt}"
+
+
+def _emit_gateway_hook(ctx: AppContext, event: str, payload: dict[str, Any]) -> None:
+    gateway = getattr(ctx, "gateway", None)
+    hooks = getattr(gateway, "hooks", None)
+    emit = getattr(hooks, "emit", None)
+    if callable(emit):
+        emit(event, payload)
+
+
+def _emit_transcript_update(ctx: AppContext, messages: list[Any]) -> None:
+    """Publish a post-commit transcript update for hook subscribers."""
+    if not messages:
+        return
+    message = messages[-1]
+    route_key = getattr(ctx, "route_key", None)
+    agent_id = getattr(ctx, "agent_id", "main")
+    payload = {
+        "session_id": ctx.session_id,
+        "route_key": route_key,
+        "agent_id": agent_id,
+        "message": {
+            "role": message.role,
+            "content": message.content,
+        },
+        "message_id": str(message.id),
+        "message_seq": message.seq,
+    }
+    if route_key:
+        payload["target"] = {
+            "agent_id": agent_id,
+            "session_id": ctx.session_id,
+            "session_key": route_key,
+        }
+    _emit_gateway_hook(ctx, "session_transcript_updated", payload)
+
+
+def _record_local_command_exchange(ctx: AppContext, prompt: str, answer: str) -> None:
+    """Persist slash-command output so every UI sees the same transcript."""
+    logged_prompt = _redact_local_command(prompt)
+    route_key = getattr(ctx, "route_key", None)
+    write_guard = {"expected_route_key": route_key} if route_key else {}
+    messages = ctx.store.add_messages(
+        ctx.session_id,
+        [
+            ("user", logged_prompt),
+            ("assistant", answer),
+        ],
+        last_prompt=logged_prompt,
+        **write_guard,
+    )
+    _emit_transcript_update(ctx, messages)
+
+
 def repl(ctx: AppContext) -> int:
-    print("Nym agent started.")
+    print("Agent started.")
     print(f"Session: {ctx.session_id}")
     print("Type 'exit' to quit.")
     print()
@@ -915,7 +1156,7 @@ def repl(ctx: AppContext) -> int:
     try:
         while True:
             try:
-                user_input = input("nym> ").strip()
+                user_input = input("agent> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0
@@ -930,6 +1171,8 @@ def repl(ctx: AppContext) -> int:
                 answer = _handle_local_command(ctx, user_input)
                 if answer is None:
                     answer = handle_prompt(ctx, user_input)
+                else:
+                    _record_local_command_exchange(ctx, user_input, answer)
                 print(answer)
             except Exception as exc:
                 if ctx.debug:
@@ -943,6 +1186,30 @@ def repl(ctx: AppContext) -> int:
 
 def create_new_session(args: argparse.Namespace, store: SessionStore) -> SessionInfo:
     workspace_root = default_workspace_root(args)
+    channel = getattr(args, "channel", None)
+    if channel:
+        explicit_config = getattr(args, "config", None)
+        config_path = (
+            Path(explicit_config).expanduser().resolve()
+            if explicit_config
+            else None
+        )
+        config = load_agent_config(workspace_root, explicit_path=config_path)
+        routed = start_gateway(config=config, store=store).open_session(
+            create_inbound_address(
+                channel=channel,
+                account_id=getattr(args, "account_id", None) or "default",
+                sender_id=getattr(args, "sender_id", None),
+                peer_kind=getattr(args, "peer_kind", None),
+                peer_id=getattr(args, "peer_id", None),
+                guild_id=getattr(args, "guild_id", None),
+                team_id=getattr(args, "team_id", None),
+            ),
+            workspace_root=workspace_root,
+            provider=args.provider,
+            model=args.model,
+        )
+        return routed.session
     return store.create_session(
         workspace_root=workspace_root,
         provider=args.provider,
@@ -994,7 +1261,12 @@ def persist_agent_state(ctx: AppContext) -> None:
     )
 
 
-def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
+def _handle_local_command(
+    ctx: AppContext,
+    user_input: str,
+    *,
+    install_progress: Callable[[str], None] | None = None,
+) -> str | None:
     text = _normalized_command_prompt(user_input.strip())
     if not text.startswith("/"):
         return None
@@ -1045,12 +1317,56 @@ def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
         return _switch_model(ctx, model=model, provider=provider)
 
     if command == "/install":
-        if len(parts) != 3:
-            return "Usage: /install ollama <model>"
-        return _install_local_model(ctx, provider=parts[1], model=parts[2])
+        if len(parts) not in {3, 4} or (len(parts) == 4 and parts[3].casefold() not in {"--yes", "--confirm"}):
+            return "Usage: /install <provider> <model> [--yes]"
+        return _install_local_model(
+            ctx,
+            provider=parts[1],
+            model=parts[2],
+            progress=install_progress,
+            confirmed=len(parts) == 4,
+        )
+
+    if command == "/reasoning":
+        if len(parts) == 1:
+            effort = getattr(getattr(ctx, "llm", None), "reasoning_effort", None)
+            if effort is None:
+                return f"Reasoning effort is provider-controlled for `{ctx.llm.model}`."
+            return f"Reasoning effort: {effort}\nChange with: /reasoning minimal|low|medium|high"
+        if len(parts) != 2:
+            return "Usage: /reasoning minimal|low|medium|high"
+        effort = parts[1].casefold()
+        if effort not in {"minimal", "low", "medium", "high"}:
+            return "Reasoning effort must be one of: minimal, low, medium, high."
+        if getattr(getattr(ctx, "llm", None), "reasoning_effort", None) is None:
+            return f"`{ctx.llm.model}` does not expose configurable reasoning effort through this provider."
+        ctx.llm.reasoning_effort = effort
+        ctx.session.reasoning_effort = effort
+        persist_agent_state(ctx)
+        return f"Reasoning effort set to {effort} for {_model_source_label(_active_provider(ctx))} · {ctx.llm.model}."
 
     if command == "/status":
         return _status_text(ctx)
+
+    if command == "/devices":
+        if len(parts) > 2:
+            return "Usage: /devices [category]"
+        scope = parts[1].casefold() if len(parts) == 2 else "all"
+        if len(scope) > 64 or not re.fullmatch(r"[a-z0-9_-]+", scope):
+            return "Device category may contain only letters, numbers, hyphens, and underscores."
+        try:
+            return _devices_text(ctx.rust.connected_devices(scope=scope))
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            return f"Could not inspect connected devices: {exc}"
+
+    if command == "/capabilities":
+        return _capabilities_text(ctx)
+
+    if command == "/skills":
+        return ctx.skills.status_text()
+
+    if command == "/gateway":
+        return _gateway_text(ctx)
 
     if command in {"/setup", "/connect"}:
         return _connect_text()
@@ -1059,7 +1375,7 @@ def _handle_local_command(ctx: AppContext, user_input: str) -> str | None:
         return _slash_help_text()
 
     if command in {"/exit", "/quit", "/q"}:
-        return "Exiting Nym."
+        return "Exiting Agent."
 
     return f"Unknown local command: {parts[0]}"
 
@@ -1087,7 +1403,7 @@ def _provider_switch_text(ctx: AppContext) -> str:
         lines.extend([
             "",
             "OpenAI-compatible models need an endpoint before requests can run.",
-            "Set environment variable: NYM_OPENAI_COMPAT_BASE_URL",
+            "Set environment variable: AGENT_OPENAI_COMPAT_BASE_URL",
             "Optional API key: /apikey openai-compatible",
         ])
         return "\n".join(lines)
@@ -1102,7 +1418,7 @@ def _provider_switch_text(ctx: AppContext) -> str:
             lines.append(f"Open account/API keys: /login {provider}")
         lines.extend([
             f"Environment variable: {env_name}",
-            "Keys loaded with /apikey are used for this Nym process and are not written to session history.",
+            "Keys loaded with /apikey are used for this Agent process and are not written to session history.",
         ])
         return "\n".join(lines)
 
@@ -1135,6 +1451,8 @@ def _models_text(ctx: AppContext) -> str:
         f"Model source: {_model_source_label(active_provider)}",
         "",
         "Models:",
+        "Hosted models use their named provider and may require provider credentials.",
+        "Open-source models use a local runtime and are installed on this computer; they never require login.",
     ]
 
     for provider in sorted(
@@ -1156,7 +1474,7 @@ def _models_text(ctx: AppContext) -> str:
             )
             lines.append(
                 f"{marker} {option['model']}  "
-                f"{_model_state_label(option)}"
+                f"{_model_state_label(option)}{_model_metadata_suffix(option['provider'], option['model'])}"
             )
 
     lines.extend([
@@ -1164,9 +1482,8 @@ def _models_text(ctx: AppContext) -> str:
         "Switch model: /model <model>",
         "Choose exact source/model: /model <source> <model>",
         "Hosted providers ask for a key only when one is required.",
-        "Open-source models run through local runtimes and never require Nym login.",
-        "Local models are not installed in this workspace.",
-        "Start Ollama, LM Studio, llama.cpp, vLLM, or LocalAI first, then select its loaded model.",
+        "Install locally: /install <provider> <model>.",
+        "Supported installers: Ollama, LM Studio, llama.cpp, vLLM, and LocalAI.",
     ])
 
     return "\n".join(lines)
@@ -1218,17 +1535,30 @@ def _resolve_local_model_name(
         "Status: model not installed\n"
         f"Installed models: {installed}."
     )
-    if provider == "ollama":
+    install_entry = _local_install_entry(provider, requested_model)
+    if install_entry is not None:
         message = (
             f"{message}\n"
-            f"Install now: /install ollama {requested_model}\n"
-            f"Terminal alternative: ollama pull {requested_model}"
+            f"Install locally now: /install {provider} {requested_model}"
         )
+        if provider == "ollama":
+            message = f"{message}\nTerminal alternative: ollama pull {requested_model}"
     elif provider == "lmstudio":
         message = f"{message}\nDownload or load it in LM Studio first; no login is required."
     else:
         message = f"{message}\n{_manual_local_install_text(provider, requested_model)}"
     return None, message
+
+
+def _local_install_entry(provider: str, model: str) -> dict[str, str] | None:
+    return next(
+        (
+            entry
+            for entry in LOCAL_INSTALL_CATALOG
+            if entry["provider"] == provider and entry["model"].casefold() == model.casefold()
+        ),
+        None,
+    )
 
 
 def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
@@ -1251,11 +1581,17 @@ def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
             f"Details: {detail}"
         )
     if provider in {"llamacpp", "vllm", "localai"}:
+        install_entry = _local_install_entry(provider, model)
+        setup_hint = (
+            f"Preview/install locally: /install {provider} {model}"
+            if install_entry is not None
+            else _manual_local_install_text(provider, model)
+        )
         return (
             f"{source} · {model}\n"
             "Status: runtime unavailable\n"
             f"Start the {source} OpenAI-compatible server with that model loaded.\n"
-            f"{_manual_local_install_text(provider, model)}\n"
+            f"{setup_hint}\n"
             f"Details: {detail}"
         )
     return detail
@@ -1271,6 +1607,15 @@ def _switch_model(
         model,
         _active_provider(ctx),
     )
+
+    if resolved_provider in UNIMPLEMENTED_PROVIDER_TRANSPORTS:
+        source = _model_source_label(resolved_provider)
+        return "\n".join([
+            f"{source} · {model}",
+            "Status: unavailable",
+            f"{source} transport is not implemented in this Agent build.",
+            "No credentials were requested or changed.",
+        ])
 
     if resolved_provider in LOCAL_PROVIDERS:
         resolved_model, setup_error = _resolve_local_model_name(
@@ -1288,6 +1633,7 @@ def _switch_model(
             model=model,
             provider=resolved_provider,
         )
+        _apply_saved_reasoning_effort(ctx, candidate)
     except Exception as exc:
         return f"Could not use model `{model}`: {exc}"
 
@@ -1375,7 +1721,14 @@ def _switch_model(
     return _model_switch_text(ctx)
 
 
-def _install_local_model(ctx: Any, *, provider: str, model: str) -> str:
+def _install_local_model(
+    ctx: Any,
+    *,
+    provider: str,
+    model: str,
+    progress: Callable[[str], None] | None = None,
+    confirmed: bool = False,
+) -> str:
     try:
         normalized = _normalize_provider(provider)
     except ValueError as exc:
@@ -1387,8 +1740,38 @@ def _install_local_model(ctx: Any, *, provider: str, model: str) -> str:
             f"Choose it with: /model {normalized} {model}"
         )
 
+    install_entry = _local_install_entry(normalized, model)
+    if install_entry is None and normalized in {"llamacpp", "localai", "vllm"} and "/" not in model:
+        source = _model_source_label(normalized)
+        available = ", ".join(
+            entry["model"]
+            for entry in LOCAL_INSTALL_CATALOG
+            if entry["provider"] == normalized
+        )
+        identifier_kind = {
+            "llamacpp": "Hugging Face GGUF repository",
+            "localai": "LocalAI gallery entry with known size metadata",
+            "vllm": "Hugging Face model repository",
+        }[normalized]
+        return (
+            "Status: model is not in the install catalog\n"
+            f"Choose a listed {source} model: {available or 'none'}\n"
+            f"Or provide a full {identifier_kind} identifier after `/install {normalized}`.\n"
+            "Agent will not preview or start an unknown-size local download."
+        )
+    install_id = str(install_entry["install_id"] if install_entry else model)
+
+    if not confirmed:
+        return _local_install_preview(normalized, model, install_entry)
+
     if normalized != "ollama":
-        return _manual_local_install_text(normalized, model)
+        return _install_non_ollama_model(
+            ctx,
+            provider=normalized,
+            model=model,
+            install_id=install_id,
+            progress=progress,
+        )
 
     if shutil.which("ollama") is None:
         return (
@@ -1399,25 +1782,42 @@ def _install_local_model(ctx: Any, *, provider: str, model: str) -> str:
             f"/install ollama {model}"
         )
 
+    if progress is not None:
+        progress("Ollama · checking local runtime")
+
+    runtime_error = _ensure_ollama_running(ctx, progress=progress)
+    if runtime_error:
+        return runtime_error
+
+    if progress is not None:
+        progress(f"Ollama · downloading {model} locally")
+
     try:
-        completed = subprocess.run(
-            ["ollama", "pull", model],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-        )
-    except subprocess.TimeoutExpired:
-        return (
-            "Status: install incomplete\n"
-            f"Installing `{model}` is still taking too long. "
-            f"Continue in another terminal with: ollama pull {model}"
+        process = subprocess.Popen(
+            ["ollama", "pull", install_id],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
         )
     except OSError as exc:
         return f"Status: install failed\nCould not start Ollama: {exc}"
 
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "Ollama pull failed.").strip()
+    output_tail = ""
+    stdout = process.stdout
+    if stdout is not None:
+        while True:
+            chunk = stdout.read(256)
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            output_tail = (output_tail + text)[-8000:]
+            summary = _clean_install_progress(text)
+            if summary and progress is not None:
+                progress(summary)
+
+    returncode = process.wait()
+    if returncode != 0:
+        detail = _clean_install_progress(output_tail) or "Ollama pull failed."
         return (
             "Status: install failed\n"
             f"Could not install `{model}` with Ollama.\n"
@@ -1425,8 +1825,359 @@ def _install_local_model(ctx: Any, *, provider: str, model: str) -> str:
             f"Retry: /install ollama {model}"
         )
 
+    verification_error = _verify_local_model_ready(ctx, "ollama", model)
+    if verification_error:
+        return (
+            "Status: install could not be verified\n"
+            f"Ollama reported a successful pull for `{model}`, but Agent could not verify it locally.\n"
+            f"{verification_error}\n"
+            f"Retry: /install ollama {model}"
+        )
+
+    if progress is not None:
+        progress(f"Ollama · installed {model}; selecting model")
     switch_result = _switch_model(ctx, model=model, provider="ollama")
     return f"Installed `{model}` with Ollama.\n{switch_result}"
+
+
+def _local_install_preview(
+    provider: str,
+    model: str,
+    entry: dict[str, str] | None,
+) -> str:
+    source = _model_source_label(provider)
+    metadata = entry or {
+        "install_id": model,
+        "parameters": "unknown",
+        "size": "unknown",
+        "memory": "unknown",
+        "context": "unknown",
+        "quantization": "provider default",
+    }
+    return "\n".join([
+        "Local model install preview",
+        f"Model: {model}",
+        f"Provider: {source}",
+        f"Exact artifact: {metadata['install_id']}",
+        f"Parameters: {metadata['parameters']}",
+        f"Download: {metadata['size']}",
+        f"Recommended memory: {metadata['memory']}",
+        f"Context: {metadata['context']}",
+        f"Quantization: {metadata['quantization']}",
+        "Location: local runtime storage on this computer",
+        "Authentication: none",
+        "",
+        f"Confirm download: /install {provider} {model} --yes",
+        "Nothing has been downloaded yet.",
+        "During installation, press Esc or Ctrl+C to stop without closing Agent.",
+    ])
+
+
+def _install_non_ollama_model(
+    ctx: Any,
+    *,
+    provider: str,
+    model: str,
+    install_id: str,
+    progress: Callable[[str], None] | None,
+) -> str:
+    source = _model_source_label(provider)
+    command: list[str]
+    runtime_url: str
+
+    if provider == "lmstudio":
+        if shutil.which("lms") is None:
+            return _runtime_not_installed_text(
+                source,
+                "https://lmstudio.ai/download",
+                provider,
+                model,
+            )
+        command = ["lms", "get", install_id]
+        runtime_url = "https://lmstudio.ai/docs/cli/local-models/get"
+    elif provider == "localai":
+        if shutil.which("local-ai") is None:
+            return _runtime_not_installed_text(
+                source,
+                "https://localai.io/installation/",
+                provider,
+                model,
+            )
+        command = ["local-ai", "models", "install", install_id]
+        runtime_url = "https://localai.io/models/"
+    elif provider == "llamacpp":
+        llama_cli = shutil.which("llama-cli")
+        if llama_cli is None:
+            return _runtime_not_installed_text(
+                source,
+                "https://github.com/ggml-org/llama.cpp/releases",
+                provider,
+                model,
+            )
+        command = [llama_cli, "-hf", install_id, "-p", "", "-n", "1"]
+        runtime_url = "https://github.com/ggml-org/llama.cpp"
+    elif provider == "vllm":
+        if shutil.which("vllm") is None:
+            return _runtime_not_installed_text(
+                source,
+                "https://docs.vllm.ai/en/latest/getting_started/installation/",
+                provider,
+                model,
+            )
+        hf_cli = shutil.which("hf")
+        if hf_cli is None:
+            return (
+                "Status: runtime helper unavailable\n"
+                "vLLM is installed, but the Hugging Face `hf` download command is unavailable.\n"
+                f"Install huggingface_hub, then retry: /install {provider} {model}"
+            )
+        command = [hf_cli, "download", install_id]
+        runtime_url = "https://docs.vllm.ai/en/latest/models/supported_models/"
+    else:
+        return _manual_local_install_text(provider, model)
+
+    ok, detail = _run_local_install_command(
+        command,
+        label=f"{source} · downloading {model} locally",
+        progress=progress,
+    )
+    if not ok:
+        return (
+            "Status: install failed\n"
+            f"Could not install `{model}` with {source}.\n"
+            f"{detail}\n"
+            f"Provider instructions: {runtime_url}"
+        )
+
+    activation_error = _activate_local_runtime(
+        ctx,
+        provider=provider,
+        model=model,
+        install_id=install_id,
+        progress=progress,
+    )
+    if activation_error:
+        return (
+            f"Download command completed for `{model}` with {source}.\n"
+            "Status: install not ready\n"
+            f"{activation_error}\n"
+            f"Then select it with: /model {provider} {model}"
+        )
+
+    verification_error = _verify_local_model_ready(ctx, provider, model)
+    if verification_error:
+        return (
+            "Status: install could not be verified\n"
+            f"{source} completed its download command, but `{model}` is not exposed by its local API.\n"
+            f"{verification_error}\n"
+            f"Retry: /install {provider} {model}"
+        )
+
+    if progress is not None:
+        progress(f"{source} · installed locally; selecting {model}")
+    switch_result = _switch_model(ctx, model=model, provider=provider)
+    return f"Installed `{model}` locally with {source}.\n{switch_result}"
+
+
+def _verify_local_model_ready(ctx: Any, provider: str, model: str) -> str | None:
+    discovered, discovery_error = _discover_provider_models(ctx, provider)
+    if discovery_error:
+        return f"Could not query {_model_source_label(provider)}: {discovery_error}"
+    if not _local_model_is_available(model, discovered):
+        available = ", ".join(discovered) or "none"
+        return f"Local API models: {available}."
+    return None
+
+
+def _run_local_install_command(
+    command: list[str],
+    *,
+    label: str,
+    progress: Callable[[str], None] | None,
+) -> tuple[bool, str]:
+    if progress is not None:
+        progress(label)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+    except OSError as exc:
+        return False, str(exc)
+
+    output_tail = ""
+    if process.stdout is not None:
+        while True:
+            chunk = process.stdout.read(256)
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            output_tail = (output_tail + text)[-8000:]
+            summary = _clean_install_progress(text)
+            if summary and progress is not None:
+                progress(summary)
+    returncode = process.wait()
+    detail = _clean_install_progress(output_tail)
+    return returncode == 0, detail or ("Installation completed." if returncode == 0 else "Installation failed.")
+
+
+def _runtime_not_installed_text(
+    source: str,
+    download_url: str,
+    provider: str,
+    model: str,
+) -> str:
+    return (
+        "Status: runtime not installed\n"
+        f"{source} is not installed on this computer.\n"
+        f"Install the local runtime: {download_url}\n"
+        f"Then retry: /install {provider} {model}"
+    )
+
+
+def _clean_install_progress(value: str) -> str:
+    without_ansi = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    segments = [
+        segment.strip()
+        for segment in re.split(r"[\r\n]+", without_ansi)
+        if segment.strip()
+    ]
+    if not segments:
+        return ""
+    return truncate(" ".join(segments[-2:]), 160)
+
+
+def _ensure_ollama_running(
+    ctx: Any,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> str | None:
+    _models, discovery_error = _discover_provider_models(ctx, "ollama")
+    if not discovery_error:
+        return None
+
+    base_url = _provider_base_url(ctx, "ollama")
+    hostname = (urllib.parse.urlparse(_normalize_base_url(base_url)).hostname or "").casefold()
+    if hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return (
+            "Status: runtime unavailable\n"
+            f"Could not reach the configured Ollama server at {base_url}.\n"
+            f"Details: {discovery_error}"
+        )
+
+    if progress is not None:
+        progress("Ollama · starting local runtime")
+    try:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return f"Status: runtime unavailable\nCould not start Ollama locally: {exc}"
+
+    last_error = discovery_error
+    for _attempt in range(40):
+        time.sleep(0.25)
+        _models, last_error = _discover_provider_models(ctx, "ollama")
+        if not last_error:
+            if progress is not None:
+                progress("Ollama · local runtime started")
+            return None
+
+    return (
+        "Status: runtime unavailable\n"
+        "Ollama is installed but its local server did not start.\n"
+        "Run `ollama serve` in another terminal, then retry the install.\n"
+        f"Details: {last_error}"
+    )
+
+
+def _activate_local_runtime(
+    ctx: Any,
+    *,
+    provider: str,
+    model: str,
+    install_id: str,
+    progress: Callable[[str], None] | None,
+) -> str | None:
+    source = _model_source_label(provider)
+    if progress is not None:
+        progress(f"{source} · starting local model server")
+
+    if provider == "lmstudio":
+        load_ok, load_detail = _run_local_install_command(
+            ["lms", "load", install_id, "--identifier", model],
+            label=f"{source} · loading {model}",
+            progress=progress,
+        )
+        if not load_ok:
+            return f"LM Studio downloaded the model but could not load it: {load_detail}"
+        server_ok, server_detail = _run_local_install_command(
+            ["lms", "server", "start"],
+            label=f"{source} · starting local API server",
+            progress=progress,
+        )
+        if not server_ok:
+            return f"LM Studio could not start its local server: {server_detail}"
+    else:
+        base_url = _provider_base_url(ctx, provider)
+        parsed = urllib.parse.urlparse(_normalize_base_url(base_url))
+        hostname = (parsed.hostname or "").casefold()
+        if hostname not in {"localhost", "127.0.0.1", "::1"}:
+            return f"The configured {source} endpoint is remote ({base_url}); start that runtime on its host."
+        port = parsed.port or {
+            "llamacpp": 8080,
+            "vllm": 8000,
+            "localai": 8080,
+        }[provider]
+        if provider == "llamacpp":
+            server = shutil.which("llama-server")
+            if server is None:
+                return "`llama-server` is not installed or not on PATH."
+            command = [server, "-hf", install_id, "--alias", model, "--port", str(port)]
+        elif provider == "vllm":
+            command = [
+                "vllm",
+                "serve",
+                install_id,
+                "--served-model-name",
+                model,
+                "--port",
+                str(port),
+            ]
+        elif provider == "localai":
+            command = ["local-ai", "run", install_id, "--address", f":{port}"]
+        else:
+            return f"No automatic local server activation is configured for {source}."
+
+        try:
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return f"Could not start {source}: {exc}"
+
+    last_error: str | None = None
+    for _attempt in range(120):
+        models, discovery_error = _discover_provider_models(ctx, provider)
+        if not discovery_error and _local_model_is_available(model, models):
+            if progress is not None:
+                progress(f"{source} · local server ready")
+            return None
+        if discovery_error:
+            last_error = discovery_error
+        else:
+            available = ", ".join(models) or "none"
+            last_error = f"server is online, but `{model}` is not ready (API models: {available})"
+        time.sleep(0.5)
+    return f"{source} did not become ready: {last_error or 'unknown startup error'}"
 
 
 def _manual_local_install_text(provider: str, model: str) -> str:
@@ -1510,6 +2261,15 @@ def _ollama_tags_url(base_url: str) -> str:
     return f"{root}/api/tags"
 
 
+def _ollama_ps_url(base_url: str) -> str:
+    root = _strip_api_suffix(base_url)
+
+    if not root:
+        return ""
+
+    return f"{root}/api/ps"
+
+
 def _get_json(
     url: str,
     *,
@@ -1521,7 +2281,7 @@ def _get_json(
 
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Nym/1.0",
+        "User-Agent": "Agent/1.0",
     }
 
     if api_key:
@@ -1611,6 +2371,42 @@ def _discover_ollama_models(
     return sorted(set(models))
 
 
+def _discover_ollama_loaded_models(
+    base_url: str,
+) -> list[dict[str, Any]]:
+    payload = _get_json(
+        _ollama_ps_url(base_url),
+    )
+
+    items = payload.get("models", [])
+
+    if not isinstance(items, list):
+        return []
+
+    models: list[dict[str, Any]] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        name = item.get("model") or item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        detail = item.get("details")
+        details = detail if isinstance(detail, dict) else {}
+        models.append({
+            "model": name,
+            "size": item.get("size"),
+            "size_vram": item.get("size_vram"),
+            "expires_at": item.get("expires_at"),
+            "parameters": details.get("parameter_size"),
+            "quantization": details.get("quantization_level"),
+        })
+
+    return sorted(models, key=lambda item: str(item["model"]).casefold())
+
+
 def _discover_openai_compatible_models(
     base_url: str,
     *,
@@ -1659,7 +2455,7 @@ def _provider_base_url(
     # Then use provider-specific environment configuration.
     if provider == "ollama":
         return os.environ.get(
-            "NYM_OLLAMA_BASE_URL",
+            "AGENT_OLLAMA_BASE_URL",
             os.environ.get(
                 "OLLAMA_HOST",
                 "http://localhost:11434",
@@ -1668,31 +2464,31 @@ def _provider_base_url(
 
     if provider == "lmstudio":
         return os.environ.get(
-            "NYM_LMSTUDIO_BASE_URL",
+            "AGENT_LMSTUDIO_BASE_URL",
             os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
         )
 
     if provider == "llamacpp":
         return os.environ.get(
-            "NYM_LLAMACPP_BASE_URL",
+            "AGENT_LLAMACPP_BASE_URL",
             os.environ.get("LLAMACPP_BASE_URL", "http://localhost:8080/v1"),
         )
 
     if provider == "vllm":
         return os.environ.get(
-            "NYM_VLLM_BASE_URL",
+            "AGENT_VLLM_BASE_URL",
             os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1"),
         )
 
     if provider == "localai":
         return os.environ.get(
-            "NYM_LOCALAI_BASE_URL",
+            "AGENT_LOCALAI_BASE_URL",
             os.environ.get("LOCALAI_BASE_URL", "http://localhost:8080/v1"),
         )
 
     if provider == "openai-compatible":
         return os.environ.get(
-            "NYM_OPENAI_COMPAT_BASE_URL",
+            "AGENT_OPENAI_COMPAT_BASE_URL",
             "",
         )
 
@@ -1736,7 +2532,7 @@ def _discover_provider_models(
                 return [], "Endpoint is not configured."
 
             api_key = os.environ.get(
-                "NYM_OPENAI_COMPAT_API_KEY",
+                "AGENT_OPENAI_COMPAT_API_KEY",
             )
 
             return (
@@ -1841,6 +2637,12 @@ def _model_switch_text(ctx: Any) -> str:
     if configuration == "ready":
         return f"{_model_source_label(provider)} · {model}"
     return _provider_switch_text(ctx)
+
+
+def _apply_saved_reasoning_effort(ctx: Any, llm: Any) -> None:
+    effort = getattr(getattr(ctx, "session", None), "reasoning_effort", None)
+    if effort in {"minimal", "low", "medium", "high"} and getattr(llm, "reasoning_effort", None) is not None:
+        llm.reasoning_effort = effort
 
 
 def _open_provider_setup_url(provider: str) -> tuple[bool, str] | None:
@@ -1964,15 +2766,99 @@ def _model_options_for_display(ctx: Any) -> list[dict[str, Any]]:
     active_provider = _active_provider(ctx)
     active_model = str(getattr(getattr(ctx, "llm", None), "model", "") or "")
     options = _model_options()
+    local_availability = _discover_local_provider_availability(ctx)
+    known_options = {
+        (option["provider"], option["model"])
+        for option in options
+    }
+    for provider, (discovered, _error) in local_availability.items():
+        for installed_model in discovered:
+            if (provider, installed_model) in known_options:
+                continue
+            options.append({
+                "provider": provider,
+                "model": installed_model,
+                "state": ModelState.READY,
+                "selectable": True,
+                "error": None,
+            })
+            known_options.add((provider, installed_model))
 
     for option in options:
         provider = option["provider"]
         model = option["model"]
-        option["state"] = _hinted_model_state(ctx, provider, model, active_provider, active_model)
+        if provider in LOCAL_PROVIDERS:
+            discovered, discovery_error = local_availability.get(provider, ([], "Runtime unavailable."))
+            if discovery_error:
+                option["state"] = ModelState.SERVER_OFFLINE
+            elif _local_model_is_available(model, discovered):
+                option["state"] = ModelState.READY
+            else:
+                option["state"] = ModelState.MODEL_NOT_INSTALLED
+        else:
+            option["state"] = _hinted_model_state(
+                ctx,
+                provider,
+                model,
+                active_provider,
+                active_model,
+            )
         option["selectable"] = True
         option["error"] = None
 
-    return options
+    return sorted(options, key=_model_display_sort_key)
+
+
+def _model_display_sort_key(option: dict[str, Any]) -> tuple[int, int, int, str]:
+    provider = str(option.get("provider") or "")
+    model = str(option.get("model") or "")
+    state = option.get("state")
+    state_order = {
+        ModelState.READY: 0,
+        ModelState.AUTH_REQUIRED: 1,
+        ModelState.LOGIN_REQUIRED: 1,
+        ModelState.UNKNOWN: 2,
+        ModelState.MODEL_NOT_INSTALLED: 3,
+        ModelState.SERVER_OFFLINE: 4,
+        ModelState.DOWNLOADING: 4,
+        ModelState.LOADING: 4,
+        ModelState.UNAVAILABLE: 5,
+        ModelState.INCOMPATIBLE: 5,
+    }
+    local_order = 0 if provider in LOCAL_PROVIDERS else 1
+    return (
+        state_order.get(state, 6),
+        local_order,
+        MODEL_PICKER_SORT_ORDER.get(provider, 99),
+        model.casefold(),
+    )
+
+
+def _discover_local_provider_availability(
+    ctx: Any,
+) -> dict[str, tuple[list[str], str | None]]:
+    results: dict[str, tuple[list[str], str | None]] = {}
+    with ThreadPoolExecutor(max_workers=len(LOCAL_PROVIDERS)) as executor:
+        pending = {
+            executor.submit(_discover_provider_models, ctx, provider): provider
+            for provider in LOCAL_PROVIDERS
+        }
+        for future in as_completed(pending):
+            provider = pending[future]
+            try:
+                results[provider] = future.result()
+            except Exception as exc:
+                results[provider] = ([], str(exc))
+    return results
+
+
+def _local_model_is_available(model: str, discovered: list[str]) -> bool:
+    normalized = model.casefold()
+    return any(
+        installed.casefold() == normalized
+        or installed.casefold().startswith(f"{normalized}:")
+        for installed in discovered
+    )
 
 
 def _hinted_model_state(
@@ -1988,6 +2874,9 @@ def _hinted_model_state(
     if provider in LOCAL_PROVIDERS:
         return ModelState.UNKNOWN
 
+    if provider in UNIMPLEMENTED_PROVIDER_TRANSPORTS:
+        return ModelState.UNAVAILABLE
+
     if provider == "openai-compatible":
         return ModelState.UNKNOWN
 
@@ -2000,7 +2889,7 @@ def _hinted_model_state(
 
 def _provider_access_label(provider: str) -> str:
     if provider in LOCAL_PROVIDERS:
-        return "local app, install outside workspace · no login"
+        return "open source · local runtime/install · no login"
     if provider == "openai-compatible":
         return "endpoint required"
     if provider == "copilot":
@@ -2025,14 +2914,310 @@ def _status_text(ctx: AppContext) -> str:
     lines = [
         f"Session: {ctx.session_id}",
         f"Root: {ctx.workspace_root}",
+        f"Agent profile: {getattr(ctx, 'agent_id', 'main')}",
         f"Model: {ctx.llm.model}",
         f"Model source: {_model_source_label(_active_provider(ctx))}",
         f"Mode: {_llm_mode(ctx)}",
         f"Configuration: {_llm_configuration(ctx)}",
+        f"Reasoning effort: {getattr(ctx.llm, 'reasoning_effort', None) or 'provider controlled'}",
+        f"Skills: {len(getattr(getattr(ctx, 'skills', None), 'skills', {}))}",
     ]
     lines.extend(_status_context_lines(ctx))
+    lines.extend(_local_runtime_status_lines(ctx))
     lines.append(f"Pending approvals: {len(pending_approvals)}")
     return "\n".join(lines)
+
+
+def _local_runtime_status_lines(ctx: Any) -> list[str]:
+    provider = _active_provider(ctx)
+    if provider not in LOCAL_PROVIDERS:
+        return []
+
+    source = _model_source_label(provider)
+    model = str(getattr(getattr(ctx, "llm", None), "model", "") or "")
+    base_url = _provider_base_url(ctx, provider)
+    lines = [
+        "Local runtime:",
+        f"- Source: {source}",
+        f"- Endpoint: {base_url}",
+    ]
+
+    discovered, discovery_error = _discover_provider_models(ctx, provider)
+    if discovery_error:
+        lines.extend([
+            "- Server: unreachable",
+            f"- Details: {discovery_error}",
+            "- Latency: server is offline; the next usable turn must wait for the runtime/model to start.",
+        ])
+        return lines
+
+    installed = ", ".join(discovered[:8]) if discovered else "none"
+    if len(discovered) > 8:
+        installed = f"{installed}, +{len(discovered) - 8} more"
+    active_installed = _local_model_is_available(model, discovered)
+    lines.extend([
+        "- Server: reachable",
+        f"- Installed/API models: {installed}",
+        f"- Active model installed: {'yes' if active_installed else 'no'}",
+    ])
+
+    if provider != "ollama":
+        lines.append("- Loaded/warm models: not exposed by this provider's OpenAI-compatible API")
+        return lines
+
+    try:
+        loaded = _discover_ollama_loaded_models(base_url)
+    except RuntimeError as exc:
+        lines.append(f"- Loaded/warm models: unavailable ({exc})")
+        return lines
+
+    loaded_names = [str(item["model"]) for item in loaded]
+    active_loaded = _local_model_is_available(model, loaded_names)
+    if not loaded:
+        lines.extend([
+            "- Loaded/warm models: none",
+            "- Latency: first prompt may be slow because Ollama must load the model into memory.",
+        ])
+        return lines
+
+    loaded_text = ", ".join(_format_loaded_local_model(item) for item in loaded[:5])
+    if len(loaded) > 5:
+        loaded_text = f"{loaded_text}, +{len(loaded) - 5} more"
+    lines.extend([
+        f"- Loaded/warm models: {loaded_text}",
+        f"- Active model loaded: {'yes' if active_loaded else 'no'}",
+    ])
+    if not active_loaded:
+        lines.append("- Latency: active model is installed but not warm; the next prompt may include load time.")
+    return lines
+
+
+def _format_loaded_local_model(item: dict[str, Any]) -> str:
+    model = str(item.get("model") or "unknown")
+    metadata = [
+        str(value)
+        for value in (item.get("parameters"), item.get("quantization"))
+        if isinstance(value, str) and value
+    ]
+    suffix = f" ({', '.join(metadata)})" if metadata else ""
+    return f"{model}{suffix}"
+
+
+def _capabilities_text(ctx: AppContext) -> str:
+    effort = getattr(ctx.llm, "reasoning_effort", None)
+    desktop_line = "Desktop: runtime capability discovery unavailable"
+    try:
+        desktop = ctx.rust.desktop_capabilities()
+        actions = desktop.get("actions", []) if isinstance(desktop, dict) else []
+        backends = desktop.get("backends", {}) if isinstance(desktop, dict) else {}
+        observation = backends.get("desktop_observation", {}) if isinstance(backends, dict) else {}
+        if isinstance(actions, list):
+            available = [
+                action.get("action")
+                for action in actions
+                if isinstance(action, dict) and action.get("available") is True
+            ]
+            observe_text = (
+                "desktop observation available"
+                if isinstance(observation, dict) and observation.get("available") is True
+                else "desktop observation unavailable"
+            )
+            desktop_line = (
+                "Desktop: "
+                + (
+                    f"{len(available)} runtime-supported approved actions; {observe_text}"
+                    if available
+                    else f"no approved actions currently supported by this runtime; {observe_text}"
+                )
+            )
+    except Exception:
+        pass
+    return "\n".join([
+        "Agent capabilities",
+        f"Current model: {_model_source_label(_active_provider(ctx))} · {ctx.llm.model}",
+        f"Reasoning effort: {effort or 'provider controlled'}",
+        "",
+        "Workspace: discover, search, read, create, edit, delete, and verify files",
+        "Code intelligence: symbols, definitions, and references through configured language servers",
+        "Host visibility: system, devices, processes, ports, and allowlisted service controls",
+        desktop_line,
+        "Safety: external-path approvals, explicit deletion authorization, workspace-root protection",
+        "Verification: write/edit hashes and delete postconditions are checked on disk",
+        "Interaction: queued follow-ups, cancellable turns/downloads, model and reasoning selectors",
+        "Control plane: deterministic channel routing, durable scoped sessions, lifecycle hooks",
+        "Skills: layered SKILL.md discovery with profile allowlists and runtime requirement checks",
+        "Extensions: registered channel adapters and observer hooks cannot bypass tool policy",
+        "Subagents: one isolated, sequential, discovery-only child; the parent owns all mutations",
+        "",
+        "Raw private chain-of-thought is not shown. The activity panel exposes tool calls, results, and guardrails.",
+    ])
+
+
+def _gateway_text(ctx: AppContext) -> str:
+    gateway = getattr(ctx, "gateway", None)
+    if gateway is None:
+        return "Agent control plane is not available in this session."
+    status = gateway.status()
+    sources = status.get("config_sources") or []
+    tool_allowlist = getattr(ctx, "tool_allowlist", None)
+    tools_text = (
+        "all parent tools"
+        if tool_allowlist is None
+        else ", ".join(tool_allowlist) or "none"
+    )
+    return "\n".join([
+        "Agent control plane",
+        f"Runtime: {status['control_plane']}",
+        f"Session store: {status['session_store']}",
+        f"Agent profile: {getattr(ctx, 'agent_id', status['default_agent'])}",
+        f"Profile tools: {tools_text}",
+        f"Session scope: {status['default_scope']}",
+        f"Route: {getattr(ctx, 'route_key', None) or 'direct CLI session'}",
+        f"Bindings: {status['bindings']}",
+        f"Registered channels: {', '.join(status['channels']) or 'none'}",
+        f"Config: {', '.join(sources) or 'built-in defaults'}",
+        f"Execution: {status['execution_model']}",
+    ])
+
+
+def _gateway_control_snapshot(ctx: AppContext) -> dict[str, Any]:
+    gateway = getattr(ctx, "gateway", None)
+    if gateway is None:
+        raise RuntimeError("Agent control plane is not available in this session.")
+    snapshot = gateway.control_snapshot()
+    overview = snapshot.get("overview")
+    if isinstance(overview, dict):
+        overview.update({
+            "active_session": ctx.session_id,
+            "active_agent": getattr(ctx, "agent_id", "main"),
+            "active_route": getattr(ctx, "route_key", None),
+            "workspace_root": str(ctx.workspace_root),
+            "tool_policy": (
+                "all parent tools"
+                if getattr(ctx, "tool_allowlist", None) is None
+                else ", ".join(ctx.tool_allowlist) or "none"
+            ),
+        })
+    return snapshot
+
+
+def _devices_text(payload: Any) -> str:
+    if not isinstance(payload, dict) or payload.get("ok") is False:
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        return f"Could not inspect connected devices{f': {detail}' if detail else '.'}"
+
+    runtime = str(payload.get("runtime") or "unknown")
+    visibility = str(payload.get("visibility") or "runtime visible")
+    lines = ["Connected devices", f"Runtime: {runtime} · Visibility: {visibility}"]
+    limitations = payload.get("limitations")
+    availability = payload.get("availability")
+    availability = availability if isinstance(availability, dict) else {}
+    category_payload = payload.get("categories")
+    if isinstance(category_payload, dict):
+        discovered = {
+            str(category): section
+            for category, section in category_payload.items()
+            if isinstance(category, str) and isinstance(section, dict)
+        }
+        preferred = [
+            "usb", "bluetooth", "storage", "network", "audio",
+            "display", "camera", "printer", "input", "power",
+        ]
+        category_names = [name for name in preferred if name in discovered]
+        category_names.extend(sorted(name for name in discovered if name not in preferred))
+    else:
+        discovered = {}
+        category_names = [
+            category for category in (
+                "usb", "bluetooth", "storage", "network", "audio",
+                "display", "camera", "printer", "input", "power", "other",
+            )
+            if category in payload
+        ]
+
+    for category in category_names:
+        section = discovered.get(category)
+        records = section.get("records") if isinstance(section, dict) else payload.get(category)
+        records = records if isinstance(records, list) else []
+        state = section.get("state") if isinstance(section, dict) else availability.get(category)
+        available = state.get("available") if isinstance(state, dict) else True
+        lines.extend(["", f"{category.replace('_', ' ').title()} ({len(records)})"])
+        if not records:
+            lines.append("- No visible devices" if available else "- Unavailable from this runtime")
+            continue
+        visible_records = records[:50]
+        for record in visible_records:
+            if not isinstance(record, dict):
+                continue
+            name = _device_record_name(record)
+            status = str(record.get("status") or "unknown")
+            details = _device_record_details(category, record)
+            suffix = f" · {' · '.join(details)}" if details else ""
+            lines.append(f"- {name} — {status}{suffix}")
+        if len(records) > len(visible_records):
+            lines.append(f"- … {len(records) - len(visible_records)} more; use /devices {category} to focus")
+    if isinstance(limitations, list) and limitations:
+        lines.extend(["", "Limitations"])
+        lines.extend(f"- {item}" for item in limitations if isinstance(item, str))
+    return "\n".join(lines)
+
+
+def _device_record_name(record: dict[str, Any]) -> str:
+    for key in ("product", "device_name", "model", "name", "id"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "Unnamed device"
+
+
+def _device_record_details(category: str, record: dict[str, Any]) -> list[str]:
+    details: list[str] = []
+    if category == "network":
+        interface_type = record.get("interface_type")
+        ssid = record.get("ssid")
+        addresses = record.get("addresses")
+        if interface_type:
+            details.append(str(interface_type))
+        if ssid:
+            details.append(f"SSID {ssid}")
+        if isinstance(addresses, list) and addresses:
+            details.append(", ".join(str(value) for value in addresses[:3]))
+    elif category == "storage":
+        size = record.get("size_bytes")
+        mounts = record.get("mount_points")
+        if isinstance(size, int) and size > 0:
+            details.append(_format_device_bytes(size))
+        if isinstance(mounts, list) and mounts:
+            details.append("mounted at " + ", ".join(str(value) for value in mounts[:3]))
+        if record.get("removable") is True:
+            details.append("removable")
+    elif category == "bluetooth":
+        battery = record.get("battery_percent")
+        if isinstance(battery, (int, float)):
+            details.append(f"battery {battery:g}%")
+    elif category == "display":
+        mode = record.get("active_mode")
+        if mode:
+            details.append(str(mode))
+    elif category == "power":
+        capacity = record.get("capacity_percent")
+        if isinstance(capacity, (int, float)):
+            details.append(f"{capacity:g}%")
+    if record.get("source_runtime") == "windows_host":
+        details.append("Windows host")
+    native_class = record.get("native_class")
+    if category == "other" and isinstance(native_class, str) and native_class:
+        details.append(f"class {native_class}")
+    return details
+
+
+def _format_device_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if amount < 1000 or unit == "TB":
+            return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} {unit}"
+        amount /= 1000
+    return f"{value} B"
 
 
 def _status_context_lines(ctx: Any) -> list[str]:
@@ -2072,13 +3257,13 @@ def _connect_text() -> str:
     return "\n".join([
         "Model setup",
         "",
-        "Open-source · local · no Nym login",
+        "Open-source · local · no Agent login",
         "Ollama local: `ollama pull <model>`, then /model ollama <model>",
         "LM Studio local: load a model and start Local Server, then /model lmstudio <model>",
         "llama.cpp: start llama-server (port 8080), then /model llamacpp <model>",
         "vLLM: start its OpenAI API server (port 8000), then /model vllm <model>",
         "LocalAI: start its API server (port 8080), then /model localai <model>",
-        "Set NYM_LLAMACPP_BASE_URL, NYM_VLLM_BASE_URL, or NYM_LOCALAI_BASE_URL to override endpoints.",
+        "Set AGENT_LLAMACPP_BASE_URL, AGENT_VLLM_BASE_URL, or AGENT_LOCALAI_BASE_URL to override endpoints.",
         "",
         "Hosted · API key or cloud credentials",
         "GitHub Copilot: /login copilot, then /model copilot <model>",
@@ -2093,8 +3278,8 @@ def _connect_text() -> str:
         "DeepSeek hosted: /login deepseek, then /apikey deepseek (DEEPSEEK_API_KEY)",
         "GLM hosted: /login glm, then /apikey glm (GLM_API_KEY)",
         "",
-        "Local models live in their runtime, not in this workspace; Nym never asks them to log in.",
-        "Persistent keys: export the model source environment variable before starting nym.",
+        "Local models live in their runtime, not in this workspace; Agent never asks them to log in.",
+        "Persistent keys: export the model source environment variable before starting agent.",
     ])
 
 
@@ -2146,6 +3331,7 @@ def _set_provider_api_key(ctx: Any, provider: str, api_key: str) -> str:
         reload_model = pending_model if pending_provider == normalized else current_model
         try:
             ctx.llm = LLMClient(model=reload_model, provider=reload_provider)
+            _apply_saved_reasoning_effort(ctx, ctx.llm)
             ctx.pending_provider = None
             ctx.pending_model = None
             _persist_llm_config(ctx)
@@ -2319,7 +3505,18 @@ def truncate(value: str | None, limit: int) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    store = SessionStore.default()
+    try:
+        store = SessionStore.default()
+    except Exception as exc:
+        if args.tui_bridge:
+            payload = {"ok": False, "error": str(exc)}
+            if args.tui_bridge == "stream-submit":
+                payload["kind"] = "final"
+                _bridge_emit(payload)
+                return 0
+            print(json.dumps(payload, ensure_ascii=False))
+            return 1
+        raise
 
     if args.tui_bridge:
         return _run_tui_bridge(args, store)
@@ -2386,7 +3583,10 @@ def run_tui(ctx: AppContext) -> int:
     env = os.environ.copy()
     store_db_path = getattr(getattr(ctx, "store", None), "db_path", None)
     if store_db_path is not None:
-        env["NYM_SESSION_DB"] = str(store_db_path)
+        env["AGENT_SESSION_DB"] = str(store_db_path)
+    config_path = getattr(ctx, "config_path", None)
+    if config_path is not None:
+        env["AGENT_CONFIG"] = str(config_path)
 
     try:
         completed = subprocess.run(command, check=False, env=env)
@@ -2399,23 +3599,145 @@ def run_tui(ctx: AppContext) -> int:
     return int(completed.returncode)
 
 
+@contextmanager
+def _exclusive_bridge_turn(session_id: str):
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:24]
+    lock_dir = Path(tempfile.gettempdir()) / "agent-bridge-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{digest}.lock"
+    handle = lock_path.open("a+")
+    if fcntl is None:
+        handle.close()
+        raise RuntimeError(
+            "This runtime cannot enforce the single active bridge safety lock."
+        )
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "A turn is already active for this session. Wait for it to finish before submitting another."
+            ) from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _run_tui_stream_submit(ctx: AppContext, prompt: str) -> int:
+    if not prompt:
+        _bridge_emit({
+            "kind": "final",
+            "ok": False,
+            "error": "Prompt cannot be empty.",
+            "snapshot": _tui_bridge_snapshot(ctx),
+        })
+        return 0
+
+    try:
+        with _exclusive_bridge_turn(ctx.session_id):
+            _bridge_emit({
+                "kind": "submitted",
+                "prompt": prompt,
+                "snapshot": _tui_bridge_snapshot(ctx),
+            })
+            answer = _handle_local_command(
+                ctx,
+                prompt,
+                install_progress=lambda summary: _tui_bridge_local_progress(
+                    ctx,
+                    "install_progress",
+                    summary,
+                ),
+            )
+            if answer is None:
+                answer = handle_prompt(
+                    ctx,
+                    prompt,
+                    stream_event=lambda event: _tui_bridge_stream_event(ctx, event),
+                    approval_requester=lambda request: _tui_bridge_wait_for_approval(ctx, request),
+                )
+            else:
+                _record_local_command_exchange(ctx, prompt, answer)
+            _bridge_emit({
+                "kind": "final",
+                "ok": True,
+                "answer": answer,
+                "snapshot": _tui_bridge_snapshot(ctx),
+            })
+            return 0
+    except Exception as exc:
+        _bridge_emit({
+            "kind": "final",
+            "ok": False,
+            "error": str(exc),
+            "snapshot": _tui_bridge_snapshot(ctx),
+        })
+        return 0
+
+
+def _expire_orphaned_approvals(ctx: AppContext) -> int:
+    try:
+        with _exclusive_bridge_turn(ctx.session_id):
+            return _expire_orphaned_approvals_unlocked(ctx)
+    except RuntimeError as exc:
+        if "A turn is already active for this session" in str(exc):
+            return 0
+        raise
+
+
+def _expire_orphaned_approvals_unlocked(ctx: AppContext) -> int:
+    expired_count = 0
+    expired_ids: list[str] = []
+    expired_at = datetime.now(timezone.utc).isoformat()
+    for item in ctx.session.pending_approvals:
+        if not isinstance(item, dict) or item.get("status") != "pending":
+            continue
+        item["status"] = "expired"
+        item["decision"] = "denied"
+        item["decision_at"] = expired_at
+        item["expired_reason"] = "no_active_turn"
+        expired_count += 1
+        request_id = item.get("id")
+        if isinstance(request_id, str) and request_id:
+            expired_ids.append(request_id)
+    if expired_count == 0:
+        return 0
+    persist_agent_state(ctx)
+    ctx.store.add_event(
+        ctx.session_id,
+        event_type="approval_expired",
+        summary=f"Expired {expired_count} orphaned approval request(s)",
+        data={"request_ids": expired_ids, "reason": "no_active_turn"},
+    )
+    return expired_count
+
+
 def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
     session_id = (args.bridge_session_id or "").strip()
     if not session_id:
         print(json.dumps({"ok": False, "error": "Missing bridge session id."}))
         return 1
 
+    if args.tui_bridge == "complete":
+        payload = {
+            "ok": True,
+            "completions": _tui_bridge_completions(args.bridge_prompt or ""),
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
     ctx: AppContext | None = None
     try:
         session_info = store.get_session(session_id)
         ctx = build_context(args, store=store, session_info=session_info)
         if args.tui_bridge == "snapshot":
+            _expire_orphaned_approvals(ctx)
             payload = {"ok": True, "snapshot": _tui_bridge_snapshot(ctx)}
-        elif args.tui_bridge == "complete":
-            payload = {
-                "ok": True,
-                "completions": _tui_bridge_completions(args.bridge_prompt or ""),
-            }
+        elif args.tui_bridge == "gateway":
+            payload = {"ok": True, "gateway": _gateway_control_snapshot(ctx)}
         elif args.tui_bridge in {"approve", "deny"}:
             request_id = (args.bridge_request_id or "").strip()
             if not request_id:
@@ -2425,34 +3747,7 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
                 payload = _tui_bridge_apply_approval_decision(ctx, request_id, decision)
         elif args.tui_bridge == "stream-submit":
             prompt = (args.bridge_prompt or "").strip()
-            if not prompt:
-                _bridge_emit({"kind": "final", "ok": False, "error": "Prompt cannot be empty.", "snapshot": _tui_bridge_snapshot(ctx)})
-                return 0
-            _bridge_emit({"kind": "submitted", "prompt": prompt, "snapshot": _tui_bridge_snapshot(ctx)})
-            try:
-                answer = _handle_local_command(ctx, prompt)
-                if answer is None:
-                    answer = handle_prompt(
-                        ctx,
-                        prompt,
-                        stream_event=lambda event: _tui_bridge_stream_event(ctx, event),
-                        approval_requester=lambda request: _tui_bridge_wait_for_approval(ctx, request),
-                    )
-                _bridge_emit({
-                    "kind": "final",
-                    "ok": True,
-                    "answer": answer,
-                    "snapshot": _tui_bridge_snapshot(ctx),
-                })
-                return 0
-            except Exception as exc:
-                _bridge_emit({
-                    "kind": "final",
-                    "ok": False,
-                    "error": str(exc),
-                    "snapshot": _tui_bridge_snapshot(ctx),
-                })
-                return 0
+            return _run_tui_stream_submit(ctx, prompt)
         else:
             prompt = (args.bridge_prompt or "").strip()
             if not prompt:
@@ -2462,6 +3757,8 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
                     answer = _handle_local_command(ctx, prompt)
                     if answer is None:
                         answer = handle_prompt(ctx, prompt)
+                    else:
+                        _record_local_command_exchange(ctx, prompt, answer)
                     payload = {
                         "ok": True,
                         "answer": answer,
@@ -2484,7 +3781,7 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
 
 def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
     session = ctx.store.get_session(ctx.session_id)
-    messages = ctx.store.list_messages(ctx.session_id, limit=None)
+    messages = ctx.store.list_messages(ctx.session_id, limit=TUI_TRANSCRIPT_LIMIT)
     return {
         "session": {
             "id": session.id,
@@ -2494,6 +3791,7 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             "provider": _active_provider(ctx),
             "model": ctx.llm.model,
             "mode": _llm_mode(ctx),
+            "reasoning_effort": getattr(ctx.llm, "reasoning_effort", None) or "provider controlled",
             "configuration": _llm_configuration(ctx),
             "cost_usd": session.cost_usd,
             "tokens": {
@@ -2520,8 +3818,8 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
     }
 
 
-def _tui_bridge_completions(prompt: str) -> dict[str, Any]:
-    entries = _slash_palette_entries(prompt)
+def _tui_bridge_completions(prompt: str, *, ctx: Any | None = None) -> dict[str, Any]:
+    entries = _slash_palette_entries(prompt, ctx=ctx)
     return {
         "title": _slash_palette_title(prompt) if entries else "",
         "entries": [
@@ -2544,6 +3842,18 @@ def _bridge_emit(payload: dict[str, Any]) -> None:
 def _tui_bridge_stream_event(ctx: AppContext, event: dict[str, Any]) -> None:
     persist_agent_state(ctx)
     _bridge_emit({"kind": "stream_event", "event": event, "snapshot": _tui_bridge_snapshot(ctx)})
+
+
+def _tui_bridge_local_progress(
+    ctx: AppContext,
+    kind: str,
+    summary: str,
+) -> None:
+    _bridge_emit({
+        "kind": "stream_event",
+        "event": {"kind": kind, "summary": summary},
+        "snapshot": _tui_bridge_snapshot(ctx),
+    })
 
 
 def _tui_bridge_wait_for_approval(ctx: AppContext, request: dict[str, Any], *, poll_interval: float = 0.1, timeout: float = 1800.0) -> str:
@@ -2669,7 +3979,7 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
 
     while True:
         height, width = stdscr.getmaxyx()
-        messages = ctx.store.list_messages(ctx.session_id, limit=None)
+        messages = ctx.store.list_messages(ctx.session_id, limit=TUI_TRANSCRIPT_LIMIT)
         session_info = ctx.store.get_session(ctx.session_id)
         show_usage_panel = width >= USAGE_PANEL_MIN_TERMINAL_WIDTH
         panel_width = USAGE_PANEL_WIDTH if show_usage_panel else 0
@@ -2745,13 +4055,14 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             error=worker_error,
             usage_summary=None if show_usage_panel else _compact_usage_text(session_info, ctx.llm.model, _active_provider(ctx)),
             auth_active=secret_provider is not None,
+            approval_active=bool(approval_snapshot.get("pending")),
         )
         _draw_input_line(
             stdscr,
             input_y,
             width,
             "*" * len(secret_value) if secret_provider else prompt,
-            label=f" {secret_provider} key> " if secret_provider else " nym> ",
+            label=f" {secret_provider} key> " if secret_provider else " agent> ",
         )
         stdscr.refresh()
 
@@ -2771,6 +4082,16 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
                 status = "Cancelling..." if canceled else "Cancellation requested"
                 continue
             break
+
+        if key == 27:  # Esc
+            if secret_provider:
+                secret_provider = None
+                secret_value = ""
+                status = "API key entry cancelled"
+            elif approval_snapshot.get("pending"):
+                if approval_queue.deny_selected():
+                    status = "Approval denied"
+            continue
 
         if key == 17:  # Ctrl+Q
             break
@@ -2818,10 +4139,13 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
                 history_index = None
                 transcript_at_bottom = True
                 transcript_scroll = 0
-                ctx.store.update_last_prompt(ctx.session_id, logged_candidate)
-                ctx.store.add_message(ctx.session_id, "user", logged_candidate)
-                ctx.store.add_message(ctx.session_id, "assistant", local_answer)
+                _record_local_command_exchange(ctx, logged_candidate, local_answer)
                 status = truncate(local_answer, 80)
+                continue
+
+            if approval_snapshot.get("pending"):
+                if approval_queue.approve_selected():
+                    status = "Approval granted"
                 continue
 
             candidate = prompt.strip()
@@ -2852,9 +4176,7 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
                     logged_candidate = _redact_local_command(candidate)
                     prompt_history.append(logged_candidate)
                     history_index = None
-                    ctx.store.update_last_prompt(ctx.session_id, logged_candidate)
-                    ctx.store.add_message(ctx.session_id, "user", logged_candidate)
-                    ctx.store.add_message(ctx.session_id, "assistant", local_answer)
+                    _record_local_command_exchange(ctx, logged_candidate, local_answer)
                     auth_provider = _provider_api_key_needed(ctx)
                     if auth_provider and _starts_auth_candidate(candidate):
                         secret_provider = auth_provider
@@ -2945,6 +4267,15 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
         if 32 <= key <= 126:
             if secret_provider:
                 secret_value += chr(key)
+            elif approval_snapshot.get("pending") and chr(key).casefold() in {"y", "n"}:
+                approved = chr(key).casefold() == "y"
+                decided = (
+                    approval_queue.approve_selected()
+                    if approved
+                    else approval_queue.deny_selected()
+                )
+                if decided:
+                    status = "Approval granted" if approved else "Approval denied"
             else:
                 char = chr(key)
                 prompt += "/" if char == "\\" and not prompt else char
@@ -2960,7 +4291,7 @@ def _setup_tui_colors(stdscr: Any | None = None) -> None:
     if not _has_tui_colors():
         return
     curses.start_color()
-    theme = os.environ.get("NYM_TUI_THEME", "").strip().casefold()
+    theme = os.environ.get("AGENT_TUI_THEME", "").strip().casefold()
     light_theme = theme == "light"
     background = curses.COLOR_WHITE if light_theme else -1
     text = curses.COLOR_BLACK if light_theme else curses.COLOR_WHITE
@@ -2997,7 +4328,7 @@ def _has_tui_colors() -> bool:
 
 def _draw_header(stdscr: Any, ctx: AppContext, width: int) -> None:
     root_budget = max(12, width - 58)
-    title = " nym "
+    title = " agent "
     detail = (
         f"session {ctx.session_id}  source {_model_source_label(_active_provider(ctx))}  model {ctx.llm.model}  "
         f"root {truncate(str(ctx.workspace_root), root_budget)}"
@@ -3061,7 +4392,7 @@ def _slash_command_lines(prompt: str, width: int, *, selected_index: int = 0) ->
     return lines
 
 
-def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
+def _slash_palette_entries(prompt: str, *, ctx: Any | None = None) -> list[PaletteEntry]:
     prompt = _normalized_command_prompt(prompt)
     if not prompt.startswith("/"):
         return []
@@ -3074,7 +4405,9 @@ def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
     if _is_install_palette_prompt(prompt, parts):
         return _install_palette_entries(parts[1] if len(parts) >= 2 else "")
     if _is_model_palette_prompt(prompt, parts):
-        return _model_palette_entries(parts[1] if len(parts) >= 2 else "")
+        return _model_palette_entries(parts[1] if len(parts) >= 2 else "", ctx=ctx)
+    if _is_reasoning_palette_prompt(prompt, parts):
+        return _reasoning_palette_entries(parts[1] if len(parts) >= 2 else "")
 
     query = parts[0].casefold() if parts else "/"
     matches = [
@@ -3104,13 +4437,13 @@ def _slash_palette_entries(prompt: str) -> list[PaletteEntry]:
 
 
 def _slash_command_complete_to(name: str) -> str:
-    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install"}:
+    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install", "/reasoning"}:
         return f"{name} "
     return name
 
 
 def _slash_command_executes(name: str) -> bool:
-    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install"}
+    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install", "/reasoning"}
 
 
 def _provider_palette_entries(command: str, query: str) -> list[PaletteEntry]:
@@ -3143,9 +4476,9 @@ def _provider_palette_description(command: str, provider: str) -> str:
     return f"default model: {PROVIDER_MODEL_HINTS.get(provider, ('custom-model',))[0]}"
 
 
-def _model_palette_entries(query: str) -> list[PaletteEntry]:
+def _model_palette_entries(query: str, *, ctx: Any | None = None) -> list[PaletteEntry]:
     normalized = query.casefold()
-    options = _model_options()
+    options = _model_options_for_display(ctx) if ctx is not None else _model_options()
     matches = [
         option for option in options
         if option["model"].casefold().startswith(normalized)
@@ -3157,7 +4490,15 @@ def _model_palette_entries(query: str) -> list[PaletteEntry]:
         PaletteEntry(
             value=f"{option['provider']}/{option['model']}",
             label=option["model"],
-            description=f"{_model_source_label(option['provider'])}: {_provider_access_label(option['provider'])}",
+            description=(
+                f"{_model_source_label(option['provider'])} · {_model_state_label(option)}"
+                f"{_model_metadata_suffix(option['provider'], option['model'])}"
+                if ctx is not None
+                else (
+                    f"{_model_source_label(option['provider'])}: {_provider_access_label(option['provider'])}"
+                    f"{_model_metadata_suffix(option['provider'], option['model'])}"
+                )
+            ),
             complete_to=f"/model {option['provider']} {option['model']}",
             execute=True,
         )
@@ -3167,23 +4508,57 @@ def _model_palette_entries(query: str) -> list[PaletteEntry]:
 
 def _install_palette_entries(query: str) -> list[PaletteEntry]:
     normalized = query.casefold()
-    models = [
-        model
-        for model in PROVIDER_MODEL_HINTS.get("ollama", ())
-        if model.casefold().startswith(normalized)
+    entries = [
+        entry
+        for entry in LOCAL_INSTALL_CATALOG
+        if entry["model"].casefold().startswith(normalized)
+        or entry["provider"].casefold().startswith(normalized)
     ]
-    if not models:
-        models = list(PROVIDER_MODEL_HINTS.get("ollama", ()))
+    if not entries:
+        entries = list(LOCAL_INSTALL_CATALOG)
     return [
         PaletteEntry(
-            value=f"ollama/{model}",
-            label=model,
-            description="Ollama: download and select locally · no login",
-            complete_to=f"/install ollama {model}",
+            value=f"{entry['provider']}/{entry['model']}",
+            label=entry["model"],
+            description=(
+                "Open-source/open-weight · "
+                f"Provider: {_model_source_label(entry['provider'])} · "
+                f"{entry['parameters']} params · {entry['size']} · {entry['memory']} · "
+                "preview first · installs locally · no login"
+            ),
+            complete_to=f"/install {entry['provider']} {entry['model']}",
             execute=True,
         )
-        for model in models
+        for entry in entries
     ]
+
+
+def _reasoning_palette_entries(query: str) -> list[PaletteEntry]:
+    descriptions = {
+        "minimal": "fastest · smallest reasoning budget",
+        "low": "quick tasks and small edits",
+        "medium": "balanced default",
+        "high": "complex debugging and architecture",
+    }
+    normalized = query.casefold()
+    efforts = [effort for effort in descriptions if effort.startswith(normalized)] or list(descriptions)
+    return [
+        PaletteEntry(
+            value=effort,
+            label=effort,
+            description=descriptions[effort],
+            complete_to=f"/reasoning {effort}",
+            execute=True,
+        )
+        for effort in efforts
+    ]
+
+
+def _model_metadata_suffix(provider: str, model: str) -> str:
+    entry = _local_install_entry(provider, model)
+    if entry is None:
+        return ""
+    return f" · {entry['parameters']} params · {entry['size']} · {entry['context']} ctx"
 
 
 def _slash_palette_title(prompt: str) -> str:
@@ -3193,9 +4568,11 @@ def _slash_palette_title(prompt: str) -> str:
     if _provider_argument_command(prompt, parts) is not None:
         return "Model sources"
     if _is_install_palette_prompt(prompt, parts):
-        return "Install with Ollama"
+        return "Open-source/open-weight models · choose local provider"
     if _is_model_palette_prompt(prompt, parts):
         return "Models"
+    if _is_reasoning_palette_prompt(prompt, parts):
+        return "Reasoning effort · raw chain-of-thought stays private"
     return "Commands"
 
 
@@ -3231,6 +4608,16 @@ def _is_install_palette_prompt(prompt: str, parts: list[str]) -> bool:
     )
 
 
+def _is_reasoning_palette_prompt(prompt: str, parts: list[str]) -> bool:
+    return (
+        len(parts) <= 2
+        and (
+            prompt.startswith("/reasoning ")
+            or (parts and parts[0].casefold() == "/reasoning" and prompt.endswith(" "))
+        )
+    )
+
+
 def _selected_palette_entry(prompt: str, selected_index: int) -> PaletteEntry | None:
     entries = _slash_palette_entries(prompt)
     if not entries:
@@ -3246,6 +4633,7 @@ def _complete_slash_command(prompt: str) -> str | None:
         _provider_argument_command(prompt, parts) is not None
         or prompt.startswith("/model ")
         or prompt.startswith("/install ")
+        or prompt.startswith("/reasoning ")
     ):
         return selected.complete_to
     if not prompt.startswith("/") or " " in prompt:
@@ -3273,7 +4661,7 @@ def _line_attr(line: str) -> int:
     stripped = line.strip()
     if stripped.startswith("You"):
         return _tui_attr(COLOR_USER, curses.A_BOLD)
-    if stripped.startswith("Nym"):
+    if stripped.startswith("Agent"):
         return _tui_attr(COLOR_ASSISTANT, curses.A_BOLD)
     if stripped.startswith("Thinking") or stripped.startswith("Tool") or stripped.startswith("Result"):
         return _tui_attr(COLOR_THINKING)
@@ -3380,6 +4768,11 @@ def _approval_panel_lines(approvals: dict[str, Any], width: int) -> list[str]:
             lines.append(_clip_line(f"   {path}", width))
         if reason:
             lines.append(_clip_line(f"   {reason}", width))
+    lines.extend([
+        "",
+        _clip_line("Enter/Y approve", width),
+        _clip_line("N/Esc deny", width),
+    ])
     return lines
 
 
@@ -3405,7 +4798,7 @@ def _billable_token_total(usage: TokenUsage) -> int:
 
 
 def _context_window_for_model(model: str) -> int | None:
-    env_value = os.environ.get("NYM_CONTEXT_WINDOW_TOKENS", "").strip()
+    env_value = os.environ.get("AGENT_CONTEXT_WINDOW_TOKENS", "").strip()
     if env_value:
         try:
             parsed = int(env_value.replace("_", ""))
@@ -3478,6 +4871,7 @@ def _draw_status_line(
     error: str | None,
     usage_summary: str | None = None,
     auth_active: bool = False,
+    approval_active: bool = False,
 ) -> None:
     footer = f" {status}"
     if worker_alive:
@@ -3492,7 +4886,9 @@ def _draw_status_line(
     help_text = (
         "Enter save key  Ctrl+O open account  Ctrl+C cancel"
         if auth_active
-        else "Ctrl+C cancel/exit  PgUp/PgDn scroll  Ctrl+A approve  Ctrl+D deny"
+        else "Enter/Y approve  N/Esc deny"
+        if approval_active
+        else "Ctrl+C cancel/exit  PgUp/PgDn scroll"
     )
     gap = max(1, width - len(footer) - len(help_text) - 1)
     line = f"{footer}{' ' * gap}{help_text}"
@@ -3506,7 +4902,7 @@ def _draw_input_line(
     width: int,
     prompt: str,
     *,
-    label: str = " nym> ",
+    label: str = " agent> ",
 ) -> None:
     body_width = max(0, width - len(label))
     visible_prompt = prompt[-body_width:]
@@ -3545,7 +4941,7 @@ def _render_tui_transcript(messages: list[Any], live_turn: dict[str, Any], width
 def _render_messages(messages: list[Any], width: int) -> list[str]:
     lines: list[str] = []
     for message in messages:
-        speaker = "You" if message.role == "user" else "Nym" if message.role == "assistant" else message.role.title()
+        speaker = "You" if message.role == "user" else "Agent" if message.role == "assistant" else message.role.title()
         lines.append(f"{speaker}  {message.created_at}")
         body = message.content.strip() or "<empty>"
         for paragraph in body.splitlines() or [""]:
@@ -3577,7 +4973,7 @@ def _render_live_turn(live_turn: dict[str, Any], width: int) -> list[str]:
         lines.append(f"You")
         lines.extend(_wrap_lines(prompt, width, indent="  "))
         lines.append("")
-        lines.append("Nym")
+        lines.append("Agent")
 
     prev_kind: str | None = None
     for kind, content in feed:

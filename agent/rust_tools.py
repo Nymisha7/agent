@@ -255,6 +255,48 @@ class RustTools:
             timeout=20,
         )
 
+    def desktop_capabilities(self) -> Any:
+        return self.run_json(["desktop-capabilities"], timeout=15)
+
+    def desktop_observe(self, *, scope: str = "all", limit: int = 50) -> Any:
+        return self.run_json(
+            [
+                "desktop-observe",
+                "--scope",
+                scope,
+                "--limit",
+                str(limit),
+            ],
+            timeout=20,
+        )
+
+    def desktop_resolve(self, *, query: str, kind: str = "any", limit: int = 10) -> Any:
+        return self.run_json(
+            [
+                "desktop-resolve",
+                query,
+                "--kind",
+                kind,
+                "--limit",
+                str(limit),
+            ],
+            timeout=20,
+        )
+
+    def desktop_action(
+        self,
+        *,
+        action: str,
+        target: str | None = None,
+        value: str | None = None,
+    ) -> Any:
+        args = ["desktop-action", action]
+        if target is not None:
+            args.extend(["--target", target])
+        if value is not None:
+            args.extend(["--value", value])
+        return self.run_json(args, timeout=30)
+
     def process_list(self, *, limit: int = 20, sort_by: str = "cpu") -> Any:
         return self.run_json(
             [

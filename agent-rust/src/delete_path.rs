@@ -26,6 +26,12 @@ pub fn delete_path(options: DeletePathOptions) -> Result<DeletePathResult> {
         )
     })?;
     let target = resolve_target_path(&options.path, &workspace_root)?;
+    if target == workspace_root {
+        bail!(
+            "Refusing to delete the workspace root itself: {}",
+            workspace_root.display()
+        );
+    }
     let resource = relative_display(&target, &workspace_root);
 
     let metadata = fs::symlink_metadata(&target).with_context(|| {
@@ -141,4 +147,32 @@ fn relative_display(path: &Path, workspace_root: &Path) -> String {
     path.strip_prefix(workspace_root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn refuses_to_delete_workspace_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("agent-delete-root-{unique}"));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::write(workspace.join("keep.txt"), "keep").expect("write fixture");
+
+        let error = delete_path(DeletePathOptions {
+            path: workspace.clone(),
+            workspace_root: workspace.clone(),
+            recursive: true,
+        })
+        .expect_err("workspace root deletion must be rejected");
+
+        assert!(error.to_string().contains("workspace root"));
+        assert!(workspace.join("keep.txt").exists());
+        fs::remove_dir_all(workspace).expect("clean fixture");
+    }
 }

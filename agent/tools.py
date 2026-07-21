@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any
 
 from .language_servers import LanguageServerManager
 from .policy import PolicyEngine
 from .project_identity import resolve_workspace_alias
 from .rust_tools import RustTools
 from .tool_registry import ToolRegistry, ToolSpec
+
+if TYPE_CHECKING:
+    from .skills import SkillCatalog
 
 
 @dataclass
@@ -26,6 +30,8 @@ class ToolContext:
     approved_external_delete_roots: list[Path] = field(default_factory=list)
     approved_system_commands: list[str] = field(default_factory=list)
     language_servers: LanguageServerManager | None = None
+    discovery_runner: Callable[..., Any] | None = None
+    skill_catalog: SkillCatalog | None = None
 
 
 @dataclass(frozen=True)
@@ -114,7 +120,88 @@ DEFAULT_CONTEXT_FILE_NAMES = {
 def build_tool_registry(ctx: ToolContext) -> ToolRegistry:
     registry = ToolRegistry()
     register_rust_file_tools(registry, ctx)
+    if ctx.skill_catalog is not None and ctx.skill_catalog.skills:
+        registry.register(
+            ToolSpec(
+                name="load_skill",
+                handler=_load_skill,
+                schema=_function_schema(
+                    name="load_skill",
+                    description=(
+                        "Load the full instructions for one available Agent skill when its "
+                        "catalog description matches the current task. Skills cannot grant "
+                        "tools, bypass approvals, or override core safety policy."
+                    ),
+                    properties={
+                        "name": {
+                            "type": "string",
+                            "enum": list(ctx.skill_catalog.names()),
+                            "description": "Exact skill name from the available-skills catalog.",
+                        },
+                    },
+                    required=["name"],
+                ),
+            )
+        )
+    if ctx.discovery_runner is not None:
+        registry.register(
+            ToolSpec(
+                name="discovery_subagent",
+                handler=_discovery_subagent,
+                schema=_function_schema(
+                    name="discovery_subagent",
+                    description=(
+                        "Run one isolated, sequential, read-only subagent to search or inspect "
+                        "the workspace. It cannot edit files, run commands, control the desktop, "
+                        "use secret-scanning tools, spawn another subagent, or continue in the background. "
+                        "Use it only for a bounded discovery task; it returns before you continue."
+                    ),
+                    properties={
+                        "task": {
+                            "type": "string",
+                            "description": "Specific search, inspection, or evidence-gathering task.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional workspace-relative path that scopes discovery.",
+                        },
+                    },
+                    required=["task"],
+                ),
+            )
+        )
     return registry
+
+
+def _load_skill(args: dict[str, Any], ctx: ToolContext) -> Any:
+    if ctx.skill_catalog is None:
+        return {
+            "ok": False,
+            "tool": "load_skill",
+            "blocked": True,
+            "reason": "skill_catalog_unavailable",
+        }
+    name = args.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("load_skill requires non-empty string arg 'name'.")
+    return ctx.skill_catalog.load(name)
+
+
+def _discovery_subagent(args: dict[str, Any], ctx: ToolContext) -> Any:
+    if ctx.discovery_runner is None:
+        return {
+            "ok": False,
+            "tool": "discovery_subagent",
+            "blocked": True,
+            "reason": "discovery_subagent_unavailable",
+        }
+    task = args.get("task")
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError("discovery_subagent requires non-empty string arg 'task'.")
+    path = args.get("path")
+    if path is not None and (not isinstance(path, str) or not path.strip()):
+        raise ValueError("discovery_subagent arg 'path' must be a non-empty string when provided.")
+    return ctx.discovery_runner(task=task.strip(), path=path.strip() if isinstance(path, str) else None)
 
 
 def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
@@ -315,6 +402,29 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
 
     registry.register(
         ToolSpec(
+            name="path_status",
+            handler=_path_status,
+            schema=_function_schema(
+                name="path_status",
+                description=(
+                    "Verify whether a file or directory exists without changing it. For a "
+                    "directory, report whether it is empty. When the target is inside a Git "
+                    "working tree, also report tracked files Git sees as deleted. Use this for "
+                    "questions such as 'has this project been deleted?' or 'does this still exist?'."
+                ),
+                properties={
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path whose current state should be verified.",
+                    },
+                },
+                required=["path"],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
             name="inspect_target",
             handler=_inspect_target,
             schema=_function_schema(
@@ -362,7 +472,9 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 description=(
                     "Recursively inventory a directory or project and read bounded text "
                     "files that actually exist. Use this for requests to understand, "
-                    "summarize, explain, or inspect all files in a directory/project."
+                    "summarize, explain, or inspect all files in a directory/project. "
+                    "Resolve a named target with inspect_target first; do not scan a "
+                    "workspace-container root unless the user explicitly requested it."
                 ),
                 properties={
                     "path": {
@@ -374,6 +486,11 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                         "description": "Maximum number of readable text files to include.",
                         "default": 25,
                     },
+                    "max_entries": {
+                        "type": "integer",
+                        "description": "Maximum number of file/directory metadata entries to inventory.",
+                        "default": 1000,
+                    },
                     "max_bytes_per_file": {
                         "type": "integer",
                         "description": "Maximum bytes to read from each text file.",
@@ -383,6 +500,14 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                         "type": "integer",
                         "description": "Maximum combined bytes of file content to include.",
                         "default": 80000,
+                    },
+                    "allow_broad_workspace": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true only when the user explicitly asked to recursively inspect "
+                            "the entire workspace-container root."
+                        ),
+                        "default": False,
                     },
                 },
                 required=["path"],
@@ -484,18 +609,102 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
             schema=_function_schema(
                 name="connected_devices",
                 description=(
-                    "Count and list devices visible to the current runtime. Returns category "
-                    "counts for USB, storage, network, input, and Bluetooth devices."
+                    "Inspect live devices visible to the current runtime. Returns status-rich "
+                    "records and per-category availability for USB, storage, network, input, "
+                    "Bluetooth, audio, displays, cameras, printers, and power devices. Use this "
+                    "for natural questions about what is connected to this computer."
                 ),
                 properties={
                     "scope": {
                         "type": "string",
-                        "enum": ["all", "usb", "storage", "network", "input", "bluetooth"],
-                        "description": "Optional device category to focus on.",
+                        "description": (
+                            "Optional discovered category to focus on, such as usb, bluetooth, "
+                            "network, or other. Omit it to return every runtime category."
+                        ),
                         "default": "all",
                     },
                 },
                 required=[],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="desktop_capabilities",
+            handler=_desktop_capabilities,
+            schema=_function_schema(
+                name="desktop_capabilities",
+                description=(
+                    "Report which desktop actions are supported by the current runtime and "
+                    "which local backends are available. Use this before attempting an "
+                    "uncertain desktop action, or when the user asks what desktop operations "
+                    "Agent can perform on this machine."
+                ),
+                properties={},
+                required=[],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="desktop_observe",
+            handler=_desktop_observe,
+            schema=_function_schema(
+                name="desktop_observe",
+                description=(
+                    "Read the current desktop state visible to this runtime: installed "
+                    "applications, visible windows, active window, connected displays, and audio state when supported. "
+                    "This is read-only and reports backend limitations instead of changing state."
+                ),
+                properties={
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "applications", "windows", "active_window", "clipboard", "ui_tree", "displays", "audio"],
+                        "description": "Desktop observation scope to return.",
+                        "default": "all",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of applications or windows to return.",
+                        "default": 50,
+                    },
+                },
+                required=[],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="desktop_resolve",
+            handler=_desktop_resolve,
+            schema=_function_schema(
+                name="desktop_resolve",
+                description=(
+                    "Resolve a natural desktop target name to concrete observed applications "
+                    "or windows. Use this before launching, focusing, closing, or otherwise "
+                    "acting on a desktop target when the user gave a name instead of an id."
+                ),
+                properties={
+                    "query": {
+                        "type": "string",
+                        "description": "User-provided app/window name or title fragment to resolve.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["any", "application", "window"],
+                        "description": "Target kind to search.",
+                        "default": "any",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of candidates to return.",
+                        "default": 10,
+                    },
+                },
+                required=["query"],
             ),
         )
     )
@@ -564,6 +773,48 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                     },
                 },
                 required=["command"],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="desktop_action",
+            handler=_desktop_action,
+            schema=_function_schema(
+                name="desktop_action",
+                description=(
+                    "Perform one narrow desktop or device action after explicit user approval. "
+                    "Never use this for read-only questions; use connected_devices, system_info, "
+                    "or process_list instead. Results include before/after state and verification."
+                ),
+                properties={
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "set_volume", "set_mute", "set_brightness",
+                            "bluetooth_connect", "bluetooth_disconnect",
+                            "network_connect", "network_disconnect", "eject_storage",
+                            "terminate_process", "launch_application", "open_path", "open_url",
+                            "focus_window", "minimize_window", "maximize_window",
+                            "restore_window", "close_window", "clipboard_write",
+                            "send_key", "type_text", "mouse_click", "scroll",
+                        ],
+                        "description": "Typed desktop operation to perform.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Concrete target when required: device address, interface, /dev path, "
+                            "PID, application ID, local path, HTTP(S) URL, window id from desktop_observe, or x,y screen coordinates for mouse_click."
+                        ),
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Action value, such as volume/brightness percent, true/false/toggle, clipboard text, key spec, or text to type.",
+                    },
+                },
+                required=["action"],
             ),
         )
     )
@@ -885,9 +1136,9 @@ def _resolve_windows_tool_path(
             reason="windows_path_unavailable_from_current_runtime",
             requested_path=raw_path,
             guidance=(
-                "This looks like a Windows path, but Nym is running in a Linux/Ubuntu "
+                "This looks like a Windows path, but Agent is running in a Linux/Ubuntu "
                 "runtime that cannot currently access it. Provide a Linux-accessible "
-                "mount path, or run Nym from WSL with the Windows drive mounted."
+                "mount path, or run Agent from WSL with the Windows drive mounted."
             ),
         )
 
@@ -1291,6 +1542,110 @@ def _list_path(args: dict[str, Any], ctx: ToolContext) -> Any:
     return ctx.rust.read_path(path=path, offset=offset, limit=limit)
 
 
+def _path_status(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    raw_path = args.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("path_status requires non-empty string arg 'path'.")
+
+    path_or_observation = _resolve_tool_path(
+        raw_path,
+        ctx,
+        tool="path_status",
+        operation="read",
+    )
+    if isinstance(path_or_observation, dict):
+        return path_or_observation
+    path = path_or_observation
+
+    exists = path.exists()
+    is_symlink = path.is_symlink()
+    kind = "missing"
+    empty: bool | None = None
+    entry_count: int | None = None
+    if exists and path.is_dir():
+        kind = "directory"
+        try:
+            entry_count = sum(1 for _ in path.iterdir())
+            empty = entry_count == 0
+        except OSError:
+            entry_count = None
+            empty = None
+    elif exists and path.is_file():
+        kind = "file"
+    elif is_symlink:
+        kind = "broken_symlink"
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "tool": "path_status",
+        "path": str(path),
+        "exists": exists,
+        "kind": kind,
+        "is_symlink": is_symlink,
+    }
+    if empty is not None:
+        result["empty"] = empty
+    if entry_count is not None:
+        result["entry_count"] = entry_count
+
+    git_root = _git_root_for(path if exists and path.is_dir() else path.parent)
+    git_changes: list[dict[str, str]] = []
+    if git_root is not None:
+        result["git_root"] = str(git_root)
+        try:
+            relative = path.relative_to(git_root)
+        except ValueError:
+            relative = Path(".")
+        pathspec = str(relative) if str(relative) else "."
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(git_root),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                pathspec,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode == 0:
+            for line in completed.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                status = line[:2]
+                changed_path = line[3:]
+                if " -> " in changed_path:
+                    changed_path = changed_path.split(" -> ", 1)[1]
+                git_changes.append({"status": status, "path": changed_path})
+        else:
+            result["git_error"] = (completed.stderr or "git status failed").strip()
+
+    tracked_deletions = [item for item in git_changes if "D" in item["status"]]
+    result["git_change_count"] = len(git_changes)
+    result["git_changes"] = git_changes[:25]
+    result["git_changes_truncated"] = len(git_changes) > 25
+    result["tracked_deleted_count"] = len(tracked_deletions)
+    result["tracked_deleted_paths"] = [item["path"] for item in tracked_deletions[:25]]
+
+    if not exists:
+        state = "missing"
+    elif tracked_deletions and kind == "directory" and empty:
+        state = "tracked_content_deleted"
+    elif kind == "directory" and empty:
+        state = "empty_directory"
+    elif tracked_deletions:
+        state = "partially_deleted"
+    else:
+        state = "present"
+    result["state"] = state
+    return result
+
+
 def _inspect_target(args: dict[str, Any], ctx: ToolContext) -> Any:
     raw_path = args.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
@@ -1317,13 +1672,35 @@ def _inspect_target(args: dict[str, Any], ctx: ToolContext) -> Any:
     else:
         path_arg = _inspect_target_arg(raw_path, ctx.workspace_root)
 
-    return ctx.rust.inspect_target(
+    result = ctx.rust.inspect_target(
         path=path_arg,
         workspace_root=ctx.workspace_root,
         kind=kind,
         offset=offset,
         limit=limit,
     )
+    if (
+        isinstance(result, dict)
+        and result.get("status") == "not_found"
+        and isinstance(path_arg, str)
+        and not _looks_like_explicit_path(path_arg)
+    ):
+        recovered_query = _strip_generic_target_suffix(path_arg)
+        if recovered_query and recovered_query != path_arg:
+            recovered = ctx.rust.inspect_target(
+                path=recovered_query,
+                workspace_root=ctx.workspace_root,
+                kind=kind,
+                offset=offset,
+                limit=min(limit, 100),
+            )
+            if isinstance(recovered, dict) and recovered.get("status") in {"resolved", "candidates"}:
+                recovered = dict(recovered)
+                recovered["original_query"] = path_arg
+                recovered["recovered_query"] = recovered_query
+                recovered["recovery"] = "removed_generic_target_suffix"
+                return _bound_target_candidates(recovered, recovered_query)
+    return _bound_target_candidates(result, path_arg if isinstance(path_arg, str) else raw_path)
 
 
 def _inspect_tree(args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -1340,7 +1717,8 @@ def _inspect_tree(args: dict[str, Any], ctx: ToolContext) -> Any:
     if isinstance(root_or_observation, dict):
         return root_or_observation
     root = root_or_observation
-    max_files = _int_arg(args.get("max_files"), default=80, minimum=1, maximum=300)
+    max_files = _int_arg(args.get("max_files"), default=25, minimum=1, maximum=300)
+    max_entries = _int_arg(args.get("max_entries"), default=1_000, minimum=10, maximum=5_000)
     max_bytes_per_file = _int_arg(
         args.get("max_bytes_per_file"),
         default=12_000,
@@ -1368,13 +1746,37 @@ def _inspect_tree(args: dict[str, Any], ctx: ToolContext) -> Any:
         raise ValueError(f"Path is not a regular file or directory: {root}")
 
     direct_children = _directory_children(root, ctx.workspace_root)
+    if (
+        _same_path(root, ctx.workspace_root)
+        and not _looks_like_project_root(root)
+        and not _bool_arg(args.get("allow_broad_workspace"), default=False)
+    ):
+        return {
+            "ok": False,
+            "tool": "inspect_tree",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "workspace_container_requires_target",
+            "path": str(root),
+            "direct_children": direct_children[:100],
+            "direct_children_truncated": len(direct_children) > 100,
+            "guidance": (
+                "This workspace is a container for multiple projects. Resolve the user's "
+                "named project with inspect_target, then inspect only the selected project. "
+                "Use allow_broad_workspace=true only for an explicit whole-workspace request."
+            ),
+        }
     tree: list[dict[str, Any]] = []
     files: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     total_bytes = 0
     truncated = False
 
-    for path in _walk_project(root):
+    project_paths, tree_truncated = _walk_project(root, max_entries=max_entries)
+    if tree_truncated:
+        truncated = True
+
+    for path in project_paths:
         rel = _relative_display(path, ctx.workspace_root)
 
         if path.is_dir():
@@ -1427,6 +1829,8 @@ def _inspect_tree(args: dict[str, Any], ctx: ToolContext) -> Any:
         "read_file_count": len(files),
         "bytes_read": total_bytes,
         "truncated": truncated,
+        "tree_truncated": tree_truncated,
+        "tree_entry_limit": max_entries,
     }
 
 
@@ -1474,7 +1878,8 @@ def _secret_scan(args: dict[str, Any], ctx: ToolContext) -> Any:
     findings: list[dict[str, Any]] = []
     scanned_files = 0
 
-    for path in _walk_project(root):
+    project_paths, _tree_truncated = _walk_project(root, max_entries=max(limit * 20, 1_000))
+    for path in project_paths:
         if scanned_files >= limit:
             break
         if not path.is_file():
@@ -1510,12 +1915,133 @@ def _system_info(_args: dict[str, Any], ctx: ToolContext) -> Any:
 
 
 def _connected_devices(args: dict[str, Any], ctx: ToolContext) -> Any:
+    raw_scope = args.get("scope", "all")
+    if not isinstance(raw_scope, str) or not raw_scope.strip():
+        raise ValueError("connected_devices scope must be a non-empty category string.")
+    scope = raw_scope.strip().casefold()
+    if len(scope) > 64 or not re.fullmatch(r"[a-z0-9_-]+", scope):
+        raise ValueError("connected_devices scope may contain only letters, numbers, hyphens, and underscores.")
+    return ctx.rust.connected_devices(scope=scope)
+
+
+def _desktop_capabilities(_args: dict[str, Any], ctx: ToolContext) -> Any:
+    return ctx.rust.desktop_capabilities()
+
+
+def _desktop_observe(args: dict[str, Any], ctx: ToolContext) -> Any:
     scope = _enum_arg(
         args.get("scope"),
         default="all",
-        allowed={"all", "usb", "storage", "network", "input", "bluetooth"},
+        allowed={"all", "applications", "windows", "active_window", "clipboard", "ui_tree", "displays", "audio"},
     )
-    return ctx.rust.connected_devices(scope=scope)
+    limit = _int_arg(args.get("limit"), default=50, minimum=1, maximum=200)
+    return ctx.rust.desktop_observe(scope=scope, limit=limit)
+
+
+def _desktop_resolve(args: dict[str, Any], ctx: ToolContext) -> Any:
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("desktop_resolve requires a non-empty query.")
+    if len(query) > 200:
+        raise ValueError("desktop_resolve query must be 200 characters or fewer.")
+    kind = _enum_arg(
+        args.get("kind"),
+        default="any",
+        allowed={"any", "application", "window"},
+    )
+    limit = _int_arg(args.get("limit"), default=10, minimum=1, maximum=50)
+    return ctx.rust.desktop_resolve(query=query.strip(), kind=kind, limit=limit)
+
+
+def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
+    action = _enum_arg(
+        args.get("action"),
+        default="",
+        allowed={
+            "set_volume", "set_mute", "set_brightness",
+            "bluetooth_connect", "bluetooth_disconnect",
+            "network_connect", "network_disconnect", "eject_storage",
+            "terminate_process", "launch_application", "open_path", "open_url",
+            "focus_window", "minimize_window", "maximize_window",
+                            "restore_window", "close_window", "clipboard_write",
+            "send_key", "type_text", "mouse_click", "scroll",
+        },
+    )
+    if not action:
+        raise ValueError("desktop_action requires a supported action.")
+    target = _optional_desktop_arg(args.get("target"), "target")
+    value = _optional_desktop_arg(args.get("value"), "value")
+    if action in {
+        "bluetooth_connect", "bluetooth_disconnect", "network_connect",
+        "network_disconnect", "eject_storage", "terminate_process",
+        "launch_application", "open_path", "open_url",
+        "focus_window", "minimize_window", "maximize_window",
+        "restore_window", "close_window", "mouse_click",
+    } and target is None:
+        return {
+            "ok": False,
+            "tool": "desktop_action",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "desktop_action_target_required",
+            "operation": "desktop",
+            "guidance": f"{action} requires a concrete target before approval can be requested.",
+        }
+    if action in {"set_volume", "set_brightness", "clipboard_write", "send_key", "type_text", "scroll"} and value is None:
+        return {
+            "ok": False,
+            "tool": "desktop_action",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "desktop_action_value_required",
+            "operation": "desktop",
+            "guidance": (
+                f"{action} requires clipboard text."
+                if action == "clipboard_write"
+                else f"{action} requires a value."
+                if action in {"send_key", "type_text", "scroll"}
+                else f"{action} requires a value between 0 and 100."
+            ),
+        }
+    if action in {"set_volume", "set_brightness"}:
+        try:
+            numeric_value = int(value or "")
+        except ValueError as exc:
+            raise ValueError(f"{action} value must be an integer between 0 and 100.") from exc
+        if not 0 <= numeric_value <= 100:
+            raise ValueError(f"{action} value must be between 0 and 100.")
+        value = str(numeric_value)
+    if action == "set_mute":
+        value = value or "toggle"
+        if value.casefold() not in {"true", "false", "toggle"}:
+            raise ValueError("set_mute value must be true, false, or toggle.")
+        value = value.casefold()
+
+    approval_key = _desktop_action_approval_key(action, target, value)
+    if approval_key not in ctx.approved_system_commands:
+        return {
+            "ok": False,
+            "tool": "desktop_action",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "desktop_action_requires_approval",
+            "operation": "desktop",
+            "requested_path": approval_key,
+            "guidance": (
+                "This action can change desktop or host state. Ask the user to approve this "
+                "exact action before retrying."
+            ),
+        }
+    return ctx.rust.desktop_action(action=action, target=target, value=value)
+
+
+def _optional_desktop_arg(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"desktop_action {name} must be a string when provided.")
+    normalized = value.strip()
+    return normalized or None
 
 
 def _process_list(args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -1751,12 +2277,18 @@ def _inspect_single_file(
     }
 
 
-def _walk_project(root: Path) -> list[Path]:
+def _walk_project(root: Path, *, max_entries: int) -> tuple[list[Path], bool]:
     policy = _walk_policy(root)
     paths: list[Path] = []
-    _collect_project_paths(root, paths, policy, depth=0)
+    truncated = _collect_project_paths(
+        root,
+        paths,
+        policy,
+        depth=0,
+        max_entries=max_entries,
+    )
 
-    return paths
+    return paths, truncated
 
 
 def _directory_children(root: Path, workspace_root: Path) -> list[dict[str, Any]]:
@@ -1789,19 +2321,22 @@ def _collect_project_paths(
     policy: WalkPolicy,
     *,
     depth: int,
-) -> None:
+    max_entries: int,
+) -> bool:
+    if len(paths) >= max_entries:
+        return True
     try:
         canonical = directory.resolve()
     except OSError:
-        return
+        return False
     if canonical in policy.visited_dirs:
-        return
+        return False
     policy.visited_dirs.add(canonical)
 
     try:
         entries = sorted(directory.iterdir(), key=_entry_sort_key)
     except OSError:
-        return
+        return False
 
     files = [
         entry
@@ -1814,10 +2349,45 @@ def _collect_project_paths(
         if entry.is_dir() and not _should_skip_path(entry, policy=policy, depth=depth)
     ]
 
-    paths.extend(files)
+    remaining = max_entries - len(paths)
+    paths.extend(files[:remaining])
+    if len(files) > remaining:
+        return True
     for entry in dirs:
+        if len(paths) >= max_entries:
+            return True
         paths.append(entry)
-        _collect_project_paths(entry, paths, policy, depth=depth + 1)
+        if _collect_project_paths(
+            entry,
+            paths,
+            policy,
+            depth=depth + 1,
+            max_entries=max_entries,
+        ):
+            return True
+    return False
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left.absolute() == right.absolute()
+
+
+def _looks_like_project_root(path: Path) -> bool:
+    markers = (
+        ".git",
+        "Cargo.toml",
+        "pyproject.toml",
+        "package.json",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "Makefile",
+    )
+    return any((path / marker).exists() for marker in markers)
 
 
 def _entry_sort_key(path: Path) -> tuple[int, str]:
@@ -2071,6 +2641,46 @@ def _inspect_target_arg(value: str, workspace_root: Path) -> str:
     return value
 
 
+def _strip_generic_target_suffix(value: str) -> str:
+    normalized = value.strip()
+    stripped = re.sub(
+        r"(?:[\s_-]+)(?:project|repo|repository|folder|directory)$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip(" _-")
+    return stripped if stripped else normalized
+
+
+def _bound_target_candidates(result: Any, query: str, *, limit: int = 20) -> Any:
+    if not isinstance(result, dict) or result.get("status") != "candidates":
+        return result
+    candidates = result.get("candidates")
+    if not isinstance(candidates, list):
+        return result
+
+    normalized_query = query.strip().casefold().replace(" ", "_").replace("-", "_")
+    top_level_prefixes: list[Any] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        path = candidate.get("path")
+        if not isinstance(path, str) or "/" in path.strip("/") or "\\" in path.strip("\\"):
+            continue
+        normalized_name = path.strip("/\\").casefold().replace("-", "_")
+        if normalized_query and normalized_name.startswith(normalized_query):
+            top_level_prefixes.append(candidate)
+
+    selected = top_level_prefixes if top_level_prefixes else candidates
+    bounded = dict(result)
+    bounded["candidates"] = selected[:limit]
+    bounded["candidate_count"] = len(candidates)
+    bounded["candidates_truncated"] = len(selected) > limit or len(selected) < len(candidates)
+    if top_level_prefixes:
+        bounded["candidate_filter"] = "top_level_prefix"
+    return bounded
+
+
 def _workspace_alias_path(value: str, workspace_root: Path) -> Path | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -2135,6 +2745,24 @@ def _bool_arg(value: Any, *, default: bool) -> bool:
 def _system_command_approval_key(command: str, target: str | None) -> str:
     normalized_target = (target or "").strip()
     return f"{command} {normalized_target}".strip()
+
+
+def _desktop_action_approval_key(
+    action: str,
+    target: str | None,
+    value: str | None,
+) -> str:
+    parts = ["desktop", action]
+    if target:
+        parts.append(target.strip())
+    if value:
+        if action in {"clipboard_write", "type_text"}:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            parts.append(f"sha256:{digest}")
+            parts.append(f"bytes:{len(value.encode('utf-8'))}")
+        else:
+            parts.append(value.strip())
+    return " ".join(parts)
 
 
 def _glob_has_matches(result: Any) -> bool:

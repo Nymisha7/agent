@@ -9,7 +9,7 @@ def default_system_prompt_path() -> Path:
 
 
 def system_prompt_path() -> Path:
-    override = os.environ.get("NYM_SYSTEM_PROMPT_PATH")
+    override = os.environ.get("AGENT_SYSTEM_PROMPT_PATH")
     if override:
         return Path(override).expanduser().resolve()
     return default_system_prompt_path()

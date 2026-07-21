@@ -4,10 +4,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const LOCATOR_ROOTS_ENV: &str = "NYM_LOCATOR_ROOTS";
-const LOCATOR_ROOTS_FILE_ENV: &str = "NYM_LOCATOR_ROOTS_FILE";
-const ROOTS_ENV: &str = "NYM_SEARCH_ROOTS";
-const ROOTS_FILE_ENV: &str = "NYM_ROOTS_FILE";
+const LOCATOR_ROOTS_ENV: &str = "AGENT_LOCATOR_ROOTS";
+const LOCATOR_ROOTS_FILE_ENV: &str = "AGENT_LOCATOR_ROOTS_FILE";
+const ROOTS_ENV: &str = "AGENT_SEARCH_ROOTS";
+const ROOTS_FILE_ENV: &str = "AGENT_ROOTS_FILE";
 
 pub fn resolve_search_roots(cli_roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     if !cli_roots.is_empty() {
@@ -32,7 +32,7 @@ pub fn resolve_locator_roots() -> Result<Vec<PathBuf>> {
 
     if resolved.is_empty() {
         anyhow::bail!(
-            "No locator roots configured. Add roots using NYM_LOCATOR_ROOTS or ~/.config/nym/locator_roots"
+            "No locator roots configured. Add roots using AGENT_LOCATOR_ROOTS or ~/.config/agent/locator_roots"
         );
     }
 
@@ -65,13 +65,13 @@ fn config_path() -> Option<PathBuf> {
     }
 
     if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(config_home).join("nym").join("roots"));
+        return Some(PathBuf::from(config_home).join("agent").join("roots"));
     }
 
     env::var_os("HOME").map(|home| {
         PathBuf::from(home)
             .join(".config")
-            .join("nym")
+            .join("agent")
             .join("roots")
     })
 }
@@ -122,13 +122,13 @@ fn locator_config_path() -> Option<PathBuf> {
     }
 
     if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(config_home).join("nym").join("locator_roots"));
+        return Some(PathBuf::from(config_home).join("agent").join("locator_roots"));
     }
 
     env::var_os("HOME").map(|home| {
         PathBuf::from(home)
             .join(".config")
-            .join("nym")
+            .join("agent")
             .join("locator_roots")
     })
 }

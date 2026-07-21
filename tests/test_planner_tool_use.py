@@ -1,6 +1,8 @@
 import unittest
+import hashlib
 import os
 import json
+import subprocess
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,38 +10,28 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import patch
 
-from nym_agent.main import default_workspace_root, resolve_rust_bin
-from nym_agent.planner import (
+from agent.main import default_workspace_root, resolve_rust_bin
+from agent.planner import (
     AgentSession,
     ModelToolCall,
     _approval_request_from_observation,
-    _annotate_tool_observation,
     _build_initial_messages,
     _prepare_tool_output,
     _preflight_tool_call,
-    _request_frame,
-    _requires_tool_use,
+    _is_explicit_delete_request,
+    _verify_mutation_observation,
     _update_session_from_tool_result,
     agent_session_from_dict,
     agent_session_to_dict,
     run_agent,
 )
-from nym_agent.prompt_loader import load_system_prompt
-from nym_agent.rust_tools import RustTools
-from nym_agent.language_servers import LanguageServerManager, LanguageServerSpec
-from nym_agent.tools import ToolContext, _context_file_paths, build_tool_registry
+from agent.prompt_loader import load_system_prompt
+from agent.rust_tools import RustTools
+from agent.language_servers import LanguageServerManager, LanguageServerSpec
+from agent.tools import ToolContext, _context_file_paths, build_tool_registry
 
 
 class PlannerToolUseTests(unittest.TestCase):
-    def test_requires_tool_use_for_file_creation(self) -> None:
-        self.assertTrue(_requires_tool_use("create a new file named notes.txt"))
-
-    def test_requires_tool_use_for_project_questions(self) -> None:
-        self.assertTrue(_requires_tool_use("tell me about this project"))
-
-    def test_does_not_require_tool_use_for_simple_chat(self) -> None:
-        self.assertFalse(_requires_tool_use("hello there"))
-
     def test_system_prompt_mentions_write_file_tool(self) -> None:
         prompt = load_system_prompt()
         self.assertIn("write_file", prompt)
@@ -50,7 +42,10 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("secret_scan", prompt)
         self.assertIn("system_info", prompt)
         self.assertIn("connected_devices", prompt)
+        self.assertIn("desktop_capabilities", prompt)
+        self.assertIn("desktop_observe", prompt)
         self.assertIn("run_system_command", prompt)
+        self.assertIn("desktop_action", prompt)
         self.assertIn("generated, dependency, cache, and build output", prompt)
         self.assertIn("Failed path operations only prove that the attempted path failed", prompt)
         self.assertIn("recent file operations", prompt)
@@ -73,7 +68,7 @@ class PlannerToolUseTests(unittest.TestCase):
 
     def test_tool_registry_exposes_edit_and_delete_tools(self) -> None:
         ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
+            rust=RustTools(Path("/tmp/agent-rust")),
             workspace_root=Path("/tmp"),
             search_roots=[],
         )
@@ -82,12 +77,596 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("write_file", tool_names)
         self.assertIn("edit_file", tool_names)
         self.assertIn("delete_path", tool_names)
+        self.assertIn("path_status", tool_names)
         self.assertIn("secret_scan", tool_names)
         self.assertIn("language_server", tool_names)
         self.assertIn("system_info", tool_names)
         self.assertIn("connected_devices", tool_names)
+        self.assertIn("desktop_capabilities", tool_names)
+        self.assertIn("desktop_observe", tool_names)
+        self.assertIn("desktop_resolve", tool_names)
         self.assertIn("process_list", tool_names)
         self.assertIn("run_system_command", tool_names)
+        self.assertIn("desktop_action", tool_names)
+        desktop_action = next(schema for schema in registry.schemas() if schema["name"] == "desktop_action")
+        actions = desktop_action["parameters"]["properties"]["action"]["enum"]
+        self.assertIn("focus_window", actions)
+        self.assertIn("close_window", actions)
+        self.assertIn("clipboard_write", actions)
+        self.assertIn("send_key", actions)
+        self.assertIn("type_text", actions)
+        self.assertIn("mouse_click", actions)
+        self.assertIn("scroll", actions)
+
+    def test_device_tool_schema_accepts_runtime_discovered_categories(self) -> None:
+        ctx = ToolContext(
+            rust=RustTools(Path("/tmp/agent-rust")),
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        schemas = {schema["name"]: schema for schema in build_tool_registry(ctx).schemas()}
+        scope = schemas["connected_devices"]["parameters"]["properties"]["scope"]
+
+        self.assertNotIn("enum", scope)
+        self.assertIn("discovered category", scope["description"])
+
+    def test_desktop_capabilities_is_read_only(self) -> None:
+        class FakeRust:
+            def desktop_capabilities(self) -> dict[str, object]:
+                return {
+                    "ok": True,
+                    "tool": "desktop_capabilities",
+                    "actions": [{"action": "set_volume", "available": True}],
+                }
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute("desktop_capabilities", {}, ctx)
+
+        self.assertEqual(result["tool"], "desktop_capabilities")
+        self.assertFalse(result.get("blocked", False))
+
+    def test_desktop_observe_is_read_only_and_bounded(self) -> None:
+        class FakeRust:
+            def desktop_observe(self, *, scope: str, limit: int) -> dict[str, object]:
+                return {
+                    "ok": True,
+                    "tool": "desktop_observe",
+                    "scope": scope,
+                    "limit": limit,
+                }
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_observe",
+            {"scope": "windows", "limit": 500},
+            ctx,
+        )
+
+        self.assertEqual(result["tool"], "desktop_observe")
+        self.assertEqual(result["scope"], "windows")
+        self.assertEqual(result["limit"], 200)
+        self.assertFalse(result.get("blocked", False))
+
+    def test_desktop_observe_accepts_clipboard_scope(self) -> None:
+        class FakeRust:
+            def desktop_observe(self, *, scope: str, limit: int) -> dict[str, object]:
+                return {"ok": True, "tool": "desktop_observe", "scope": scope, "limit": limit}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_observe",
+            {"scope": "clipboard"},
+            ctx,
+        )
+
+        self.assertEqual(result["scope"], "clipboard")
+
+    def test_desktop_observe_accepts_ui_tree_scope(self) -> None:
+        class FakeRust:
+            def desktop_observe(self, *, scope: str, limit: int) -> dict[str, object]:
+                return {"ok": True, "tool": "desktop_observe", "scope": scope, "limit": limit}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_observe",
+            {"scope": "ui_tree", "limit": 500},
+            ctx,
+        )
+
+        self.assertEqual(result["scope"], "ui_tree")
+        self.assertEqual(result["limit"], 200)
+
+    def test_desktop_observe_accepts_displays_scope(self) -> None:
+        class FakeRust:
+            def desktop_observe(self, *, scope: str, limit: int) -> dict[str, object]:
+                return {"ok": True, "tool": "desktop_observe", "scope": scope, "limit": limit}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_observe",
+            {"scope": "displays", "limit": 10},
+            ctx,
+        )
+
+        self.assertEqual(result["scope"], "displays")
+        self.assertEqual(result["limit"], 10)
+
+    def test_desktop_observe_accepts_audio_scope(self) -> None:
+        class FakeRust:
+            def desktop_observe(self, *, scope: str, limit: int) -> dict[str, object]:
+                return {"ok": True, "tool": "desktop_observe", "scope": scope, "limit": limit}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_observe",
+            {"scope": "audio"},
+            ctx,
+        )
+
+        self.assertEqual(result["scope"], "audio")
+
+    def test_desktop_resolve_is_read_only_and_bounded(self) -> None:
+        class FakeRust:
+            def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, object]:
+                return {
+                    "ok": True,
+                    "tool": "desktop_resolve",
+                    "query": query,
+                    "kind": kind,
+                    "limit": limit,
+                    "candidates": [],
+                }
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_resolve",
+            {"query": "vim", "kind": "application", "limit": 500},
+            ctx,
+        )
+
+        self.assertEqual(result["tool"], "desktop_resolve")
+        self.assertEqual(result["query"], "vim")
+        self.assertEqual(result["kind"], "application")
+        self.assertEqual(result["limit"], 50)
+
+    def test_desktop_action_requires_exact_approval(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("desktop action must not run before approval")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "set_volume", "value": "25"},
+            ctx,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["reason"], "desktop_action_requires_approval")
+        self.assertEqual(result["requested_path"], "desktop set_volume 25")
+
+    def test_volume_action_ignores_empty_optional_target_from_local_model(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("desktop action must not run before approval")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "set_volume", "target": "", "value": "0"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_requires_approval")
+        self.assertEqual(result["requested_path"], "desktop set_volume 0")
+
+    def test_window_action_requires_target_before_approval(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("window action must not run without target")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "focus_window"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_target_required")
+
+    def test_clipboard_write_approval_key_redacts_content(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("clipboard write must not run before approval")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "clipboard_write", "value": "secret clipboard text"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_requires_approval")
+        self.assertIn("sha256:", result["requested_path"])
+        self.assertIn("bytes:", result["requested_path"])
+        self.assertNotIn("secret clipboard text", result["requested_path"])
+
+    def test_type_text_approval_key_redacts_content(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("type_text must not run before approval")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "type_text", "value": "private typed text"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_requires_approval")
+        self.assertIn("sha256:", result["requested_path"])
+        self.assertNotIn("private typed text", result["requested_path"])
+
+    def test_send_key_requires_value(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("send_key must not run without value")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "send_key"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_value_required")
+
+    def test_mouse_click_requires_coordinates(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("mouse_click must not run without coordinates")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "mouse_click"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_target_required")
+
+    def test_scroll_requires_value(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("scroll must not run without value")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "scroll"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_value_required")
+
+    def test_desktop_action_runs_after_exact_approval(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **kwargs: Any) -> dict[str, object]:
+                return {"ok": True, "verified": True, **kwargs}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+            approved_system_commands=["desktop set_volume 25"],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "set_volume", "value": "25"},
+            ctx,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["action"], "set_volume")
+
+    def test_desktop_action_observation_creates_approval_request(self) -> None:
+        request = _approval_request_from_observation(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="call-desktop",
+                arguments={"action": "bluetooth_connect", "target": "AA:BB:CC:DD:EE:FF"},
+            ),
+            {
+                "ok": False,
+                "blocked": True,
+                "recoverable": True,
+                "reason": "desktop_action_requires_approval",
+                "operation": "desktop",
+                "requested_path": "desktop bluetooth_connect AA:BB:CC:DD:EE:FF",
+            },
+            user_prompt="connect my headphones",
+            workspace_root=Path("/workspace"),
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request["operation"], "desktop")
+        self.assertEqual(request["tool"], "desktop_action")
+
+    def test_write_mutation_is_verified_against_file_hash(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "created.txt"
+            target.write_text("real content")
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+
+            result = _verify_mutation_observation(
+                "write_file",
+                {"path": "created.txt", "content": "real content"},
+                {"path": str(target), "after_sha256": digest},
+                workspace_root=workspace,
+            )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["verification"]["sha256"], digest)
+
+    def test_write_success_report_is_rejected_when_file_was_not_created(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "missing.txt"
+
+            result = _verify_mutation_observation(
+                "write_file",
+                {"path": "missing.txt", "content": "claimed content"},
+                {"path": str(target), "after_sha256": "0" * 64},
+                workspace_root=workspace,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["reason"], "mutation_verification_failed")
+
+    def test_delete_success_report_is_rejected_when_target_still_exists(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "still-here.txt"
+            target.write_text("keep")
+
+            result = _verify_mutation_observation(
+                "delete_path",
+                {"path": str(target)},
+                {"path": str(target), "deleted": True},
+                workspace_root=workspace,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("still exists", result["error"])
+
+    def test_path_status_detects_empty_project_with_git_tracked_deletions(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            project = workspace / "project"
+            project.mkdir()
+            tracked = project / "app.py"
+            tracked.write_text("print('hello')\n")
+            subprocess_args = {"cwd": workspace, "check": True, "capture_output": True}
+
+            subprocess.run(["git", "init"], **subprocess_args)
+            subprocess.run(["git", "add", "project/app.py"], **subprocess_args)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Agent Tests",
+                    "-c",
+                    "user.email=agent@example.invalid",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                **subprocess_args,
+            )
+            tracked.unlink()
+            ctx = ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=workspace,
+                search_roots=[],
+            )
+
+            result = build_tool_registry(ctx).execute("path_status", {"path": "project"}, ctx)
+
+        self.assertTrue(result["exists"])
+        self.assertTrue(result["empty"])
+        self.assertEqual(result["git_change_count"], 1)
+        self.assertEqual(result["tracked_deleted_count"], 1)
+        self.assertEqual(result["state"], "tracked_content_deleted")
+
+    def test_delete_verification_is_not_explicit_delete_request(self) -> None:
+        self.assertFalse(_is_explicit_delete_request("has my project been deleted?"))
+        self.assertFalse(_is_explicit_delete_request("check whether project/ was removed"))
+        self.assertTrue(_is_explicit_delete_request("delete project/"))
+
+    def test_preflight_blocks_delete_for_read_only_verification(self) -> None:
+        ctx = ToolContext(
+            rust=RustTools(Path("/tmp/agent-rust")),
+            workspace_root=Path("/workspace"),
+            search_roots=[],
+        )
+
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="delete_path",
+                call_id="call-verify",
+                arguments={"path": "project"},
+            ),
+            tool_ctx=ctx,
+            user_prompt="can you tell me if my project has been deleted or not?",
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertTrue(observation["blocked"])
+        self.assertEqual(observation["reason"], "delete_not_explicitly_requested")
+
+    def test_preflight_blocks_active_workspace_root_deletion(self) -> None:
+        ctx = ToolContext(
+            rust=RustTools(Path("/tmp/agent-rust")),
+            workspace_root=Path("/workspace"),
+            search_roots=[],
+        )
+
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="delete_path",
+                call_id="call-delete-root",
+                arguments={"path": "/workspace", "recursive": True},
+            ),
+            tool_ctx=ctx,
+            user_prompt="delete this project",
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertTrue(observation["blocked"])
+        self.assertEqual(observation["reason"], "workspace_root_delete_blocked")
+
+    def test_session_remembers_desktop_observe_targets(self) -> None:
+        session = AgentSession()
+
+        _update_session_from_tool_result(
+            session,
+            tool="desktop_observe",
+            args={"scope": "windows"},
+            observation={
+                "ok": True,
+                "tool": "desktop_observe",
+                "snapshot_id": "desktop-123",
+                "observed_at_unix_ms": 123,
+                "scope": "windows",
+                "windows": {
+                    "items": [
+                        {"id": "0x3a00007", "title": "Editor"},
+                    ],
+                },
+            },
+            workspace_root=Path("/workspace"),
+        )
+
+        self.assertEqual(session.last_desktop_snapshot["snapshot_id"], "desktop-123")
+        self.assertEqual(session.desktop_targets[0]["kind"], "window")
+        self.assertEqual(session.desktop_targets[0]["target"], "0x3a00007")
+
+    def test_preflight_blocks_unobserved_window_action(self) -> None:
+        ctx = ToolContext(
+            rust=RustTools(Path("/tmp/agent-rust")),
+            workspace_root=Path("/workspace"),
+            search_roots=[],
+        )
+
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="focus-1",
+                arguments={"action": "focus_window", "target": "0x3a00007"},
+            ),
+            tool_ctx=ctx,
+            session=AgentSession(),
+            user_prompt="focus that window",
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertTrue(observation["blocked"])
+        self.assertEqual(observation["reason"], "desktop_target_not_observed")
+
+    def test_preflight_allows_observed_window_action(self) -> None:
+        ctx = ToolContext(
+            rust=RustTools(Path("/tmp/agent-rust")),
+            workspace_root=Path("/workspace"),
+            search_roots=[],
+        )
+        session = AgentSession(
+            desktop_targets=[
+                {
+                    "kind": "window",
+                    "id": "0x3a00007",
+                    "target": "0x3a00007",
+                    "action": "focus_window",
+                }
+            ]
+        )
+
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="focus-1",
+                arguments={"action": "focus_window", "target": "60817415"},
+            ),
+            tool_ctx=ctx,
+            session=session,
+            user_prompt="focus that window",
+        )
+
+        self.assertIsNone(observation)
 
     def test_language_server_status_tool_reports_configured_servers(self) -> None:
         manager = LanguageServerManager(
@@ -102,7 +681,7 @@ class PlannerToolUseTests(unittest.TestCase):
             )
         )
         ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
+            rust=RustTools(Path("/tmp/agent-rust")),
             workspace_root=Path("/tmp"),
             search_roots=[],
             language_servers=manager,
@@ -132,7 +711,7 @@ class PlannerToolUseTests(unittest.TestCase):
             )
         )
         ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
+            rust=RustTools(Path("/tmp/agent-rust")),
             workspace_root=Path("/tmp"),
             search_roots=[],
             language_servers=manager,
@@ -165,7 +744,7 @@ class PlannerToolUseTests(unittest.TestCase):
 
         manager = FakeLanguageServers()
         ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
+            rust=RustTools(Path("/tmp/agent-rust")),
             workspace_root=Path("/workspace"),
             search_roots=[],
             language_servers=manager,  # type: ignore[arg-type]
@@ -215,7 +794,7 @@ class PlannerToolUseTests(unittest.TestCase):
             source.write_text("def run():\n    return 1\n")
             manager = FakeLanguageServers()
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
                 language_servers=manager,  # type: ignore[arg-type]
@@ -288,7 +867,7 @@ class PlannerToolUseTests(unittest.TestCase):
                 }
 
         with TemporaryDirectory() as tmp:
-            workspace_root = Path(tmp) / "nym"
+            workspace_root = Path(tmp) / "agent"
             workspace_root.mkdir()
             rust = FakeRust()
             ctx = ToolContext(
@@ -300,7 +879,7 @@ class PlannerToolUseTests(unittest.TestCase):
 
             result = registry.execute(
                 "inspect_target",
-                {"path": "nym", "kind": "directory"},
+                {"path": "agent", "kind": "directory"},
                 ctx,
             )
 
@@ -319,7 +898,7 @@ class PlannerToolUseTests(unittest.TestCase):
             )
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -334,26 +913,15 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertNotIn("sk-test-secret-value", text)
         self.assertNotIn("ghp_123456789012345678901234567890123456", text)
 
-    def test_request_frame_recognizes_workspace_identity_alias(self) -> None:
-        with TemporaryDirectory() as tmp:
-            workspace_root = Path(tmp) / "nym"
-            workspace_root.mkdir()
-
-            frame = _request_frame("tell me about my nym project", workspace_root)
-
-        self.assertEqual(frame.named_scope, "nym")
-        self.assertFalse(frame.requires_target_resolution)
-        self.assertEqual(frame.resolved_scope, workspace_root.resolve())
-
     def test_resolve_rust_bin_prefers_repo_binary_over_workspace_parent(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            repo_root = tmp_path / "nym"
+            repo_root = tmp_path / "agent"
             workspace_root = tmp_path / "app1"
             stale_root = tmp_path
 
-            repo_bin = repo_root / "nym-rust" / "target" / "debug" / "nym-rust"
-            stale_bin = stale_root / "nym-rust" / "target" / "debug" / "nym-rust"
+            repo_bin = repo_root / "agent-rust" / "target" / "debug" / "agent-rust"
+            stale_bin = stale_root / "agent-rust" / "target" / "debug" / "agent-rust"
 
             repo_bin.parent.mkdir(parents=True)
             stale_bin.parent.mkdir(parents=True)
@@ -368,13 +936,13 @@ class PlannerToolUseTests(unittest.TestCase):
 
             self.assertEqual(resolved, repo_bin.resolve())
 
-    def test_default_workspace_root_uses_parent_when_running_from_nym_checkout(self) -> None:
+    def test_default_workspace_root_uses_parent_when_running_from_agent_checkout(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace_root = Path(tmp)
-            repo_root = workspace_root / "nym"
-            (workspace_root / "nym-rust").mkdir()
+            repo_root = workspace_root / "agent"
+            (workspace_root / "agent-rust").mkdir()
             (workspace_root / "README.md").write_text("workspace\n")
-            (repo_root / "nym-rust").mkdir(parents=True)
+            (repo_root / "agent-rust").mkdir(parents=True)
             (repo_root / "README.md").write_text("repo\n")
 
             old_cwd = Path.cwd()
@@ -649,7 +1217,7 @@ class PlannerToolUseTests(unittest.TestCase):
         )
         registry = build_tool_registry(ctx)
 
-        with patch("nym_agent.tools._translate_windows_path", return_value=Path("/mnt/c/Users")):
+        with patch("agent.tools._translate_windows_path", return_value=Path("/mnt/c/Users")):
             result = registry.execute(
                 "glob",
                 {"pattern": "**/calculator*", "path": "C:/Users", "kind": "directory"},
@@ -675,7 +1243,7 @@ class PlannerToolUseTests(unittest.TestCase):
         )
         registry = build_tool_registry(ctx)
 
-        with patch("nym_agent.tools._translate_windows_path", return_value=None):
+        with patch("agent.tools._translate_windows_path", return_value=None):
             result = registry.execute(
                 "glob",
                 {"pattern": "README*", "path": "C:/Users/alice/Desktop", "kind": "file"},
@@ -706,7 +1274,7 @@ class PlannerToolUseTests(unittest.TestCase):
         registry = build_tool_registry(ctx)
 
         with patch(
-            "nym_agent.tools._translate_windows_path",
+            "agent.tools._translate_windows_path",
             return_value=Path("/mnt/c/Users/alice/Desktop"),
         ):
             result = registry.execute(
@@ -896,7 +1464,7 @@ class PlannerToolUseTests(unittest.TestCase):
                 (nested / f"file_{index}.py").write_text(f"value = {index}\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -918,16 +1486,63 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("sample_project/web_ui", payload)
         self.assertIn("sample_project/api_service", payload)
 
+    def test_inspect_tree_blocks_recursive_scan_of_multi_project_workspace_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace_root = Path(tmp)
+            (workspace_root / "RA_publish").mkdir()
+            (workspace_root / "RA_clean").mkdir()
+            (workspace_root / "agent").mkdir()
+            ctx = ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=workspace_root,
+                search_roots=[],
+            )
+
+            observation = build_tool_registry(ctx).execute(
+                "inspect_tree",
+                {"path": str(workspace_root)},
+                ctx,
+            )
+
+        self.assertFalse(observation["ok"])
+        self.assertEqual(observation["reason"], "workspace_container_requires_target")
+        child_paths = {item["path"] for item in observation["direct_children"]}
+        self.assertTrue({"RA_publish", "RA_clean", "agent"} <= child_paths)
+
+    def test_inspect_tree_caps_metadata_entries(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace_root = Path(tmp)
+            project = workspace_root / "repo"
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname='repo'\n")
+            for index in range(50):
+                (project / f"file_{index:02}.txt").write_text("value\n")
+            ctx = ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=workspace_root,
+                search_roots=[],
+            )
+
+            observation = build_tool_registry(ctx).execute(
+                "inspect_tree",
+                {"path": "repo", "max_entries": 10},
+                ctx,
+            )
+
+        self.assertEqual(len(observation["tree"]), 10)
+        self.assertTrue(observation["tree_truncated"])
+        self.assertTrue(observation["truncated"])
+
     def test_inspect_tree_reads_unknown_utf8_file_extensions(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace_root = Path(tmp)
             project = workspace_root / "custom_project"
             project.mkdir()
-            custom_file = project / "workflow.nymdsl"
+            custom_file = project / "workflow.agentdsl"
             custom_file.write_text("step build\nstep verify\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -945,7 +1560,7 @@ class PlannerToolUseTests(unittest.TestCase):
             )
 
         self.assertEqual(observation["read_file_count"], 1)
-        self.assertEqual(observation["files"][0]["path"], "custom_project/workflow.nymdsl")
+        self.assertEqual(observation["files"][0]["path"], "custom_project/workflow.agentdsl")
         self.assertIn("step verify", observation["files"][0]["content"])
 
     def test_inspect_tree_respects_gitignore_without_git_repo(self) -> None:
@@ -958,7 +1573,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (project / "kept.log").write_text("keep\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -984,7 +1599,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (nested / "service.py").write_text("print('ok')\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -1007,7 +1622,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (project / ".secret" / "token.txt").write_text("hidden\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -1031,7 +1646,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (shallow_build / "generated.txt").write_text("generated\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -1056,7 +1671,7 @@ class PlannerToolUseTests(unittest.TestCase):
                 self.skipTest("directory symlinks are not supported on this filesystem")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
+                rust=RustTools(Path("/tmp/agent-rust")),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -1077,7 +1692,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (project / "AGENTS.md").write_text("root hints\n")
             (child / "AGENTS.md").write_text("child hints\n")
 
-            with patch("nym_agent.tools._git_root_for", return_value=None):
+            with patch("agent.tools._git_root_for", return_value=None):
                 paths = _context_file_paths(child)
 
         self.assertEqual(paths, [child / "AGENTS.md"])
@@ -1089,13 +1704,13 @@ class PlannerToolUseTests(unittest.TestCase):
             child = project / "child"
             child.mkdir(parents=True)
             (project / ".git").mkdir()
-            (project / "NYM_HINTS.md").write_text("root hints\n")
-            (child / "NYM_HINTS.md").write_text("child hints\n")
+            (project / "AGENT_HINTS.md").write_text("root hints\n")
+            (child / "AGENT_HINTS.md").write_text("child hints\n")
 
-            with patch.dict(os.environ, {"CONTEXT_FILE_NAMES": "NYM_HINTS.md"}):
+            with patch.dict(os.environ, {"CONTEXT_FILE_NAMES": "AGENT_HINTS.md"}):
                 paths = _context_file_paths(child)
 
-        self.assertEqual(paths, [project / "NYM_HINTS.md", child / "NYM_HINTS.md"])
+        self.assertEqual(paths, [project / "AGENT_HINTS.md", child / "AGENT_HINTS.md"])
 
     def test_inspect_tree_recovers_simple_typo_target_to_single_scope(self) -> None:
         class FakeRust:
@@ -1173,17 +1788,76 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(observation["reason"], "target_ambiguous")
         self.assertEqual(len(observation["candidates"]), 2)
 
+    def test_inspect_target_recovers_model_added_project_suffix(self) -> None:
+        class FakeRust:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+
+            def inspect_target(self, **kwargs: object) -> dict[str, object]:
+                query = str(kwargs["path"])
+                self.queries.append(query)
+                if query == "ra_project":
+                    return {"status": "not_found", "query": query}
+                return {
+                    "status": "candidates",
+                    "query": query,
+                    "candidates": [
+                        {"path": "RA_clean", "kind": "directory"},
+                        {"path": "RA_publish", "kind": "directory"},
+                    ],
+                }
+
+        with TemporaryDirectory() as tmp:
+            rust = FakeRust()
+            ctx = ToolContext(
+                rust=rust,  # type: ignore[arg-type]
+                workspace_root=Path(tmp),
+                search_roots=[],
+            )
+
+            observation = build_tool_registry(ctx).execute(
+                "inspect_target",
+                {"path": "ra_project", "kind": "directory"},
+                ctx,
+            )
+
+        self.assertEqual(rust.queries, ["ra_project", "ra"])
+        self.assertEqual(observation["recovered_query"], "ra")
+        self.assertEqual(
+            [item["path"] for item in observation["candidates"]],
+            ["RA_clean", "RA_publish"],
+        )
+
     def test_agent_session_round_trips_path_context(self) -> None:
         session = AgentSession(
             active_root="/workspace/sample_project",
             focus_paths=["/workspace/sample_project/api_service"],
             last_candidates=[{"path": "/workspace/sample_project/web_ui", "kind": "directory"}],
-            pending_action={
-                "status": "unresolved",
-                "action": "delete",
-                "candidates": [{"path": "/workspace/AlphaSuiteClean", "kind": "directory"}],
-            },
+            reasoning_effort="high",
             approved_system_commands=["restart_service docker"],
+            desktop_targets=[
+                {
+                    "kind": "window",
+                    "id": "0x3a00007",
+                    "target": "0x3a00007",
+                    "title": "Editor",
+                    "action": "focus_window",
+                    "source": "desktop_observe",
+                }
+            ],
+            last_desktop_snapshot={
+                "snapshot_id": "desktop-1",
+                "scope": "windows",
+                "observed_at_unix_ms": "123",
+            },
+            tool_loop_history=[
+                {
+                    "tool": "glob",
+                    "args_hash": "args",
+                    "result_hash": "result",
+                    "run_id": "run-1",
+                }
+            ],
         )
 
         restored = agent_session_from_dict(agent_session_to_dict(session))
@@ -1192,12 +1866,15 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(restored.focus_paths, session.focus_paths)
         self.assertEqual(restored.last_candidates, session.last_candidates)
         self.assertEqual(restored.recent_files, session.recent_files)
-        self.assertEqual(restored.pending_action, session.pending_action)
+        self.assertEqual(restored.reasoning_effort, "high")
         self.assertEqual(restored.approved_system_commands, session.approved_system_commands)
+        self.assertEqual(restored.tool_loop_history, session.tool_loop_history)
+        self.assertEqual(restored.desktop_targets, session.desktop_targets)
+        self.assertEqual(restored.last_desktop_snapshot, session.last_desktop_snapshot)
 
     def test_system_command_mutation_requires_approval(self) -> None:
         ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
+            rust=RustTools(Path("/tmp/agent-rust")),
             workspace_root=Path("/tmp"),
             search_roots=[],
         )
@@ -1318,7 +1995,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("Session path context", content)
         self.assertIn("Active root: /workspace/sample_project", content)
         self.assertIn("/workspace/sample_project/web_ui (directory)", content)
-        self.assertIn("resolve that target directly", content)
+        self.assertIn("choose tools and resolve references", content)
 
     def test_initial_message_includes_recent_file_operations(self) -> None:
         messages = _build_initial_messages(
@@ -1340,693 +2017,7 @@ class PlannerToolUseTests(unittest.TestCase):
         content = messages[0]["content"]
         self.assertIn("Recent file operations", content)
         self.assertIn("/workspace/sample_project/web_ui/new_file.txt (delete, deleted)", content)
-        self.assertIn("recent file operation path", content)
-
-    def test_session_records_pending_action_for_ambiguous_mutation_target(self) -> None:
-        session = AgentSession()
-
-        _update_session_from_tool_result(
-            session,
-            tool="inspect_target",
-            args={"path": "AlphaSuite", "kind": "directory"},
-            observation={
-                "status": "candidates",
-                "query": "AlphaSuite",
-                "candidates": [
-                    {
-                        "path": "browser/env/lib/python3.12/site-packages/django/contrib/gis/gdal/raster",
-                        "kind": "directory",
-                    },
-                    {"path": "AlphaSuiteRelease/env", "kind": "directory"},
-                    {"path": "AlphaSuiteRelease/rag_env", "kind": "directory"},
-                    {"path": "AlphaSuiteClean", "kind": "directory"},
-                    {"path": "AlphaSuiteV2Clean", "kind": "directory"},
-                    {"path": "AlphaSuiteRelease", "kind": "directory"},
-                ],
-            },
-            workspace_root=Path("/workspace"),
-            user_prompt="delete readme from my AlphaSuite project",
-        )
-
-        self.assertIsNotNone(session.pending_action)
-        self.assertEqual(session.pending_action["status"], "unresolved")
-        self.assertEqual(session.pending_action["action"], "delete")
-        self.assertEqual(
-            session.pending_action["candidates"],
-            [
-                {"path": "/workspace/AlphaSuiteClean", "kind": "directory"},
-                {"path": "/workspace/AlphaSuiteV2Clean", "kind": "directory"},
-                {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
-            ],
-        )
-
-    def test_project_candidate_filter_excludes_virtualenv_subdirectories(self) -> None:
-        session = AgentSession()
-
-        _update_session_from_tool_result(
-            session,
-            tool="inspect_target",
-            args={"path": "ra", "kind": "directory"},
-            observation={
-                "status": "candidates",
-                "query": "ra",
-                "candidates": [
-                    {
-                        "path": "browser/env/lib/python3.12/site-packages/django/contrib/gis/gdal/raster",
-                        "kind": "directory",
-                    },
-                    {"path": "RA_publish/rag_env", "kind": "directory"},
-                    {"path": "RA_clean", "kind": "directory"},
-                    {"path": "RA2_clean", "kind": "directory"},
-                    {"path": "RA_publish", "kind": "directory"},
-                ],
-            },
-            workspace_root=Path("/home/pssintern"),
-            user_prompt="can you tell me about ra project",
-        )
-
-        self.assertIsNotNone(session.pending_action)
-        self.assertEqual(
-            session.pending_action["candidates"],
-            [
-                {"path": "/home/pssintern/RA_clean", "kind": "directory"},
-                {"path": "/home/pssintern/RA2_clean", "kind": "directory"},
-                {"path": "/home/pssintern/RA_publish", "kind": "directory"},
-            ],
-        )
-
-    def test_session_records_pending_action_for_ambiguous_non_mutation_target(self) -> None:
-        session = AgentSession()
-
-        _update_session_from_tool_result(
-            session,
-            tool="inspect_target",
-            args={"path": "AlphaSuite", "kind": "directory"},
-            observation={
-                "status": "candidates",
-                "query": "AlphaSuite",
-                "candidates": [
-                    {"path": "AlphaSuiteRelease", "kind": "directory"},
-                    {"path": "AlphaSuiteClean", "kind": "directory"},
-                    {"path": "AlphaSuiteV2Clean", "kind": "directory"},
-                ],
-            },
-            workspace_root=Path("/workspace"),
-            user_prompt="which AlphaSuite project are you referring to",
-        )
-
-        self.assertIsNotNone(session.pending_action)
-        self.assertEqual(session.pending_action["status"], "unresolved")
-        self.assertEqual(session.pending_action["action"], "answer")
-        self.assertEqual(len(session.pending_action["candidates"]), 3)
-
-    def test_initial_message_includes_pending_action(self) -> None:
-        messages = _build_initial_messages(
-            workspace_root="/workspace",
-            context_text="",
-            session=AgentSession(
-                pending_action={
-                    "status": "unresolved",
-                    "action": "delete",
-                    "candidates": [
-                        {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
-                        {"path": "/workspace/AlphaSuiteClean", "kind": "directory"},
-                    ],
-                }
-            ),
-            user_prompt="yup why not?",
-            conversation_history=None,
-        )
-
-        content = messages[0]["content"]
-        self.assertIn("Pending unresolved action: delete", content)
-        self.assertIn("1. /workspace/AlphaSuiteRelease (directory)", content)
-        self.assertIn("do not continue it until the user selects exactly one", content)
-
-    def test_preflight_blocks_tools_when_pending_action_unresolved_by_meta_question(self) -> None:
-        session = AgentSession(
-            pending_action={
-                "status": "unresolved",
-                "action": "delete",
-                "candidates": [
-                    {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
-                    {"path": "/workspace/AlphaSuiteClean", "kind": "directory"},
-                    {"path": "/workspace/AlphaSuiteV2Clean", "kind": "directory"},
-                ],
-            }
-        )
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        observation = _preflight_tool_call(
-            ModelToolCall(
-                name="glob",
-                call_id="call-1",
-                arguments={
-                    "pattern": "README*",
-                    "path": "/workspace/AlphaSuiteRelease",
-                    "kind": "file",
-                },
-            ),
-            tool_ctx=ctx,
-            session=session,
-            user_prompt="yup why weren't you able to get it the first time?",
-        )
-
-        self.assertIsNotNone(observation)
-        self.assertTrue(observation["blocked"])
-        self.assertEqual(observation["reason"], "pending_target_clarification_unresolved")
-
-    def test_preflight_blocks_tools_when_pending_action_unresolved_by_transcript_snippet(self) -> None:
-        session = AgentSession(
-            pending_action={
-                "status": "unresolved",
-                "action": "answer",
-                "query": "AlphaSuite",
-                "candidates": [
-                    {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
-                    {"path": "/workspace/AlphaSuiteClean", "kind": "directory"},
-                ],
-            }
-        )
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        observation = _preflight_tool_call(
-            ModelToolCall(
-                name="glob",
-                call_id="call-1",
-                arguments={"pattern": "*.md", "path": "/workspace/AlphaSuiteRelease", "kind": "file"},
-            ),
-            tool_ctx=ctx,
-            session=session,
-            user_prompt="Assistant  2026-07-02T12:36:15.813394+00:00",
-        )
-
-        self.assertIsNotNone(observation)
-        self.assertTrue(observation["blocked"])
-        self.assertEqual(observation["reason"], "pending_target_clarification_unresolved")
-
-    def test_non_actionable_prompt_does_not_include_pending_action_context(self) -> None:
-        messages = _build_initial_messages(
-            workspace_root="/workspace",
-            context_text="",
-            session=AgentSession(
-                pending_action={
-                    "status": "unresolved",
-                    "action": "delete",
-                    "candidates": [
-                        {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
-                        {"path": "/workspace/AlphaSuiteClean", "kind": "directory"},
-                    ],
-                }
-            ),
-            user_prompt="?",
-            conversation_history=None,
-        )
-
-        content = messages[0]["content"]
-        self.assertNotIn("Pending unresolved action", content)
-        self.assertIn("User request: ?", content)
-
-    def test_preflight_blocks_workspace_file_search_for_named_project_mutation(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        observation = _preflight_tool_call(
-            ModelToolCall(
-                name="glob",
-                call_id="call-1",
-                arguments={
-                    "pattern": "*.txt",
-                    "path": "/workspace",
-                    "kind": "file",
-                },
-            ),
-            tool_ctx=ctx,
-            session=AgentSession(),
-            user_prompt="delete read me from my AlphaSuite project",
-        )
-
-        self.assertIsNotNone(observation)
-        self.assertTrue(observation["blocked"])
-        self.assertEqual(observation["reason"], "named_project_scope_not_resolved")
-        self.assertEqual(observation["named_scope"], "AlphaSuite")
-
-    def test_preflight_blocks_workspace_inspect_for_named_project_answer(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        observation = _preflight_tool_call(
-            ModelToolCall(
-                name="inspect_tree",
-                call_id="call-1",
-                arguments={
-                    "path": "/workspace",
-                    "max_files": 10,
-                    "max_bytes_per_file": 2000,
-                    "max_total_bytes": 8000,
-                },
-            ),
-            tool_ctx=ctx,
-            session=AgentSession(),
-            user_prompt="can you tell me about my alphaSuite PROJECT?",
-        )
-
-        self.assertIsNotNone(observation)
-        self.assertTrue(observation["blocked"])
-        self.assertTrue(observation["recoverable"])
-        self.assertEqual(observation["reason"], "named_project_scope_not_resolved")
-        self.assertEqual(observation["intent"], "inspect")
-        self.assertEqual(observation["named_scope"], "alphaSuite")
-        self.assertIn("inspect_target", observation["guidance"])
-
-    def test_preflight_blocks_default_grep_for_named_project_search(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        observation = _preflight_tool_call(
-            ModelToolCall(
-                name="grep",
-                call_id="call-1",
-                arguments={"pattern": "README"},
-            ),
-            tool_ctx=ctx,
-            session=AgentSession(),
-            user_prompt="search for AlphaSuite project",
-        )
-
-        self.assertIsNotNone(observation)
-        self.assertTrue(observation["blocked"])
-        self.assertEqual(observation["reason"], "named_project_scope_not_resolved")
-        self.assertEqual(observation["intent"], "search")
-        self.assertEqual(observation["named_scope"], "AlphaSuite")
-
-    def test_preflight_named_scope_guard_is_generic_across_intents_and_names(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-        cases = [
-            (
-                "inspect_tree",
-                {"path": "/workspace"},
-                "tell me about ledger-api",
-                "inspect",
-                "ledger-api",
-            ),
-            (
-                "list_path",
-                {"path": "/workspace"},
-                "show files in mobile.repo folder",
-                "inspect",
-                "mobile.repo",
-            ),
-            (
-                "read_path",
-                {"path": "/workspace"},
-                "explain DataLake42 project",
-                "inspect",
-                "DataLake42",
-            ),
-            (
-                "grep",
-                {"pattern": "README"},
-                "search for billing_app project",
-                "search",
-                "billing_app",
-            ),
-            (
-                "glob",
-                {"pattern": "README*", "path": "/workspace", "kind": "file"},
-                "delete readme from my docs-site repo",
-                "delete",
-                "docs-site",
-            ),
-        ]
-
-        for tool_name, arguments, prompt, intent, named_scope in cases:
-            with self.subTest(prompt=prompt, tool=tool_name):
-                observation = _preflight_tool_call(
-                    ModelToolCall(
-                        name=tool_name,
-                        call_id="call-1",
-                        arguments=arguments,
-                    ),
-                    tool_ctx=ctx,
-                    session=AgentSession(),
-                    user_prompt=prompt,
-                )
-
-                self.assertIsNotNone(observation)
-                self.assertTrue(observation["blocked"])
-                self.assertEqual(observation["reason"], "named_project_scope_not_resolved")
-                self.assertEqual(observation["intent"], intent)
-                self.assertEqual(observation["named_scope"], named_scope)
-
-    def test_preflight_handles_additional_prompt_variants_without_special_casing(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-        cases = [
-            (
-                "can you give me the rundown of telemetry-platform",
-                "inspect_tree",
-                "inspect",
-                "telemetry-platform",
-            ),
-            (
-                "locate the readme in commerce_gateway",
-                "glob",
-                "search",
-                "commerce_gateway",
-            ),
-            (
-                "remove the readme from docs-core repo",
-                "glob",
-                "delete",
-                "docs-core",
-            ),
-        ]
-
-        for prompt, tool_name, intent, named_scope in cases:
-            with self.subTest(prompt=prompt):
-                observation = _preflight_tool_call(
-                    ModelToolCall(
-                        name=tool_name,
-                        call_id="call-1",
-                        arguments={
-                            "pattern": "README*",
-                            "path": "/workspace",
-                            "kind": "file",
-                        },
-                    ),
-                    tool_ctx=ctx,
-                    session=AgentSession(),
-                    user_prompt=prompt,
-                )
-
-                self.assertIsNotNone(observation)
-                self.assertTrue(observation["blocked"])
-                self.assertEqual(observation["reason"], "named_project_scope_not_resolved")
-                self.assertEqual(observation["intent"], intent)
-                self.assertEqual(observation["named_scope"], named_scope)
-
-    def test_preflight_uses_container_scope_for_inside_phrase(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        observation = _preflight_tool_call(
-            ModelToolCall(
-                name="glob",
-                call_id="call-1",
-                arguments={"pattern": "README*", "path": "/workspace", "kind": "file"},
-            ),
-            tool_ctx=ctx,
-            session=AgentSession(),
-            user_prompt="check README in frontend inside inventory-service",
-        )
-
-        self.assertIsNotNone(observation)
-        self.assertEqual(observation["reason"], "named_project_scope_not_resolved")
-        self.assertEqual(observation["named_scope"], "inventory-service")
-
-    def test_preflight_allows_workspace_inspect_for_workspace_request(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        observation = _preflight_tool_call(
-            ModelToolCall(
-                name="inspect_tree",
-                call_id="call-1",
-                arguments={"path": "/workspace"},
-            ),
-            tool_ctx=ctx,
-            session=AgentSession(),
-            user_prompt="tell me about my workspace",
-        )
-
-        self.assertIsNone(observation)
-
-    def test_preflight_allows_current_project_inspect_without_named_scope(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        observation = _preflight_tool_call(
-            ModelToolCall(
-                name="inspect_tree",
-                call_id="call-1",
-                arguments={"path": "/workspace"},
-            ),
-            tool_ctx=ctx,
-            session=AgentSession(),
-            user_prompt="tell me about this project",
-        )
-
-        self.assertIsNone(observation)
-
-    def test_preflight_blocks_named_summary_at_workspace_root_but_allows_named_path(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        blocked = _preflight_tool_call(
-            ModelToolCall(
-                name="inspect_tree",
-                call_id="call-1",
-                arguments={"path": "/workspace"},
-            ),
-            tool_ctx=ctx,
-            session=AgentSession(),
-            user_prompt="tell me about inventory-service",
-        )
-        allowed = _preflight_tool_call(
-            ModelToolCall(
-                name="inspect_tree",
-                call_id="call-2",
-                arguments={"path": "/workspace/inventory-service"},
-            ),
-            tool_ctx=ctx,
-            session=AgentSession(),
-            user_prompt="tell me about inventory-service",
-        )
-
-        self.assertIsNotNone(blocked)
-        self.assertEqual(blocked["reason"], "named_project_scope_not_resolved")
-        self.assertEqual(blocked["named_scope"], "inventory-service")
-        self.assertIsNone(allowed)
-
-    def test_preflight_allows_only_selected_pending_candidate(self) -> None:
-        session = AgentSession(
-            pending_action={
-                "status": "unresolved",
-                "action": "delete",
-                "candidates": [
-                    {"path": "/workspace/AlphaSuiteRelease", "kind": "directory"},
-                    {"path": "/workspace/AlphaSuiteClean", "kind": "directory"},
-                    {"path": "/workspace/AlphaSuiteV2Clean", "kind": "directory"},
-                ],
-            }
-        )
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/nym-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
-        blocked = _preflight_tool_call(
-            ModelToolCall(
-                name="delete_path",
-                call_id="call-1",
-                arguments={"path": "/workspace/AlphaSuiteRelease/README.md"},
-            ),
-            tool_ctx=ctx,
-            session=session,
-            user_prompt="3",
-        )
-        allowed = _preflight_tool_call(
-            ModelToolCall(
-                name="glob",
-                call_id="call-2",
-                arguments={"pattern": "README*", "path": "/workspace/AlphaSuiteV2Clean", "kind": "file"},
-            ),
-            tool_ctx=ctx,
-            session=session,
-            user_prompt="3",
-        )
-
-        self.assertIsNotNone(blocked)
-        self.assertEqual(blocked["reason"], "tool_path_outside_selected_candidate")
-        self.assertIsNone(allowed)
-        self.assertEqual(session.pending_action["status"], "resolved")
-        self.assertEqual(session.pending_action["selected"]["path"], "/workspace/AlphaSuiteV2Clean")
-
-    def test_preflight_blocks_write_file_create_for_edit_intent(self) -> None:
-        with TemporaryDirectory() as tmp:
-            workspace_root = Path(tmp)
-            ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
-                workspace_root=workspace_root,
-                search_roots=[],
-            )
-
-            observation = _preflight_tool_call(
-                ModelToolCall(
-                    name="write_file",
-                    call_id="call-1",
-                    arguments={"path": "new_file.txt", "content": "ny test"},
-                ),
-                tool_ctx=ctx,
-                session=AgentSession(),
-                user_prompt="edit new_file.txt and add ny test in it",
-            )
-
-        self.assertIsNotNone(observation)
-        self.assertTrue(observation["blocked"])
-        self.assertEqual(observation["reason"], "edit_intent_would_create_missing_file")
-
-    def test_preflight_redirects_missing_delete_to_recent_file(self) -> None:
-        with TemporaryDirectory() as tmp:
-            workspace_root = Path(tmp)
-            recent_path = workspace_root / "sample_project" / "web_ui" / "new_file.txt"
-            recent_path.parent.mkdir(parents=True)
-            recent_path.write_text("ny test")
-            session = AgentSession(
-                recent_files=[
-                    {
-                        "path": str(recent_path),
-                        "action": "write",
-                        "status": "exists",
-                    }
-                ]
-            )
-            ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
-                workspace_root=workspace_root,
-                search_roots=[],
-            )
-
-            observation = _preflight_tool_call(
-                ModelToolCall(
-                    name="delete_path",
-                    call_id="call-1",
-                    arguments={"path": str(workspace_root / "sample_project" / "new_file.txt")},
-                ),
-                tool_ctx=ctx,
-                session=session,
-                user_prompt="delete from there",
-            )
-
-        self.assertIsNotNone(observation)
-        self.assertTrue(observation["blocked"])
-        self.assertEqual(observation["reason"], "delete_path_missed_recent_file")
-        self.assertEqual(observation["recent_matches"][0]["path"], str(recent_path))
-
-    def test_preflight_short_circuits_already_deleted_recent_file(self) -> None:
-        with TemporaryDirectory() as tmp:
-            workspace_root = Path(tmp)
-            deleted_path = workspace_root / "sample_project" / "web_ui" / "new_file.txt"
-            session = AgentSession(
-                recent_files=[
-                    {
-                        "path": str(deleted_path),
-                        "action": "delete",
-                        "status": "deleted",
-                    }
-                ]
-            )
-            ctx = ToolContext(
-                rust=RustTools(Path("/tmp/nym-rust")),
-                workspace_root=workspace_root,
-                search_roots=[],
-            )
-
-            observation = _preflight_tool_call(
-                ModelToolCall(
-                    name="delete_path",
-                    call_id="call-1",
-                    arguments={"path": str(deleted_path)},
-                ),
-                tool_ctx=ctx,
-                session=session,
-                user_prompt="delete it from sample_project",
-            )
-
-        self.assertIsNotNone(observation)
-        self.assertTrue(observation["already_absent"])
-        self.assertEqual(observation["path"], str(deleted_path))
-
-    def test_missing_delete_path_error_is_marked_recoverable(self) -> None:
-        observation = _annotate_tool_observation(
-            "delete_path",
-            {"path": "/workspace/sample_project/web_ui/README.md"},
-            {
-                "ok": False,
-                "tool": "delete_path",
-                "error": "Path does not exist or cannot be inspected: /workspace/sample_project/web_ui/README.md",
-            },
-        )
-
-        self.assertTrue(observation["recoverable"])
-        self.assertEqual(observation["failed_path"], "/workspace/sample_project/web_ui/README.md")
-        self.assertIn("incorrect guess", observation["guidance"])
-
-    def test_missing_inspect_tree_error_is_marked_recoverable(self) -> None:
-        observation = _annotate_tool_observation(
-            "inspect_tree",
-            {"path": "sample_projet"},
-            {
-                "ok": False,
-                "tool": "inspect_tree",
-                "error": "Path does not exist: /workspace/sample_projet",
-            },
-        )
-
-        self.assertTrue(observation["recoverable"])
-        self.assertEqual(observation["failed_path"], "sample_projet")
-        self.assertIn("incorrect guess", observation["guidance"])
-
-    def test_non_missing_tool_error_is_not_marked_recoverable(self) -> None:
-        observation = _annotate_tool_observation(
-            "delete_path",
-            {"path": "/workspace/sample_project"},
-            {
-                "ok": False,
-                "tool": "delete_path",
-                "error": "Permission denied",
-            },
-        )
-
-        self.assertNotIn("recoverable", observation)
+        self.assertIn("choose tools and resolve references", content)
 
     def test_session_updates_from_directory_read_path(self) -> None:
         session = AgentSession()
@@ -2144,8 +2135,9 @@ class PlannerToolUseTests(unittest.TestCase):
 
         session = AgentSession()
 
+        llm = FakeLLM()
         answer = run_agent(
-            llm=FakeLLM(),  # type: ignore[arg-type]
+            llm=llm,  # type: ignore[arg-type]
             rust=FakeRust(),  # type: ignore[arg-type]
             workspace_root="/workspace",
             user_prompt="find sample_project",
@@ -2157,7 +2149,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(session.focus_paths, ["/workspace/sample_project"])
         self.assertEqual(session.last_candidates, [{"path": "/workspace/sample_project", "kind": "directory"}])
 
-    def test_run_agent_does_not_accept_partial_prose_as_completion(self) -> None:
+    def test_run_agent_accepts_plain_assistant_response_as_completion(self) -> None:
         class FakeLLM:
             def __init__(self) -> None:
                 self.calls = 0
@@ -2178,16 +2170,91 @@ class PlannerToolUseTests(unittest.TestCase):
                     output_text="",
                 )
 
+        llm = FakeLLM()
         answer = run_agent(
-            llm=FakeLLM(),  # type: ignore[arg-type]
+            llm=llm,  # type: ignore[arg-type]
             rust=object(),
             workspace_root="/workspace",
             user_prompt="inspect the repo",
         )
 
-        self.assertEqual(answer, "final answer")
+        self.assertEqual(answer, "A few things stood out.")
+        self.assertEqual(llm.calls, 1)
 
-    def test_run_agent_accepts_plain_text_completion_when_pending_target_selection_blocks(self) -> None:
+    def test_run_agent_accepts_model_finish_task_without_prompt_classification(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(
+                        output=[{
+                            "type": "function_call",
+                            "name": "finish_task",
+                            "call_id": "finish-1",
+                            "arguments": '{"answer":"Created the file."}',
+                        }],
+                        output_text="",
+                    )
+                return SimpleNamespace(output=[], output_text="Created the file.")
+
+        with TemporaryDirectory() as tmp:
+            answer = run_agent(
+                llm=FakeLLM(),  # type: ignore[arg-type]
+                rust=object(),
+                workspace_root=tmp,
+                user_prompt="create a new file named proof.txt",
+                max_steps=1,
+            )
+
+        self.assertEqual(answer, "Created the file.")
+
+    def test_run_agent_reports_fake_write_result_to_model_as_unverified(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.messages: list[list[dict[str, Any]]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                self.messages.append(list(kwargs.get("messages", [])))
+                if self.calls == 1:
+                    return SimpleNamespace(
+                        output=[{
+                            "type": "function_call",
+                            "name": "write_file",
+                            "call_id": "write-1",
+                            "arguments": '{"path":"proof.txt","content":"hello"}',
+                        }],
+                        output_text="",
+                    )
+                return SimpleNamespace(output=[], output_text="Created proof.txt.")
+
+        class FakeRust:
+            def write_file(self, **kwargs: object) -> dict[str, object]:
+                return {
+                    "path": str(kwargs["path"]),
+                    "created": True,
+                    "after_sha256": "0" * 64,
+                }
+
+        llm = FakeLLM()
+        with TemporaryDirectory() as tmp:
+            answer = run_agent(
+                llm=llm,  # type: ignore[arg-type]
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=tmp,
+                user_prompt="create a new file named proof.txt",
+            )
+
+            self.assertFalse((Path(tmp) / "proof.txt").exists())
+
+        self.assertEqual(answer, "Created proof.txt.")
+        self.assertIn("mutation_verification_failed", json.dumps(llm.messages[1]))
+
+    def test_run_agent_accepts_plain_text_clarification(self) -> None:
         class FakeLLM:
             def __init__(self) -> None:
                 self.calls = 0
@@ -2202,33 +2269,43 @@ class PlannerToolUseTests(unittest.TestCase):
                     ),
                 )
 
-        session = AgentSession(
-            pending_action={
-                "status": "unresolved",
-                "action": "answer",
-                "query": "RA",
-                "candidates": [
-                    {"path": "/workspace/RA_publish", "kind": "directory"},
-                    {"path": "/workspace/RA_clean", "kind": "directory"},
-                    {"path": "/workspace/RA2_clean", "kind": "directory"},
-                ],
-            }
-        )
-
         answer = run_agent(
             llm=FakeLLM(),  # type: ignore[arg-type]
             rust=object(),
             workspace_root="/workspace",
             user_prompt="tell me about RA",
-            session=session,
         )
 
         self.assertIn("multiple possible RA projects", answer)
 
+    def test_local_obvious_chat_skips_router_call(self) -> None:
+        class FakeLLM:
+            mode = "local"
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                return SimpleNamespace(output=[], output_text="Hi there.")
+
+        llm = FakeLLM()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=object(),
+            workspace_root="/workspace",
+            user_prompt="hi",
+        )
+
+        self.assertEqual(answer, "Hi there.")
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(llm.calls[0]["tools"], [])
+
     def test_run_agent_waits_for_approval_before_external_delete(self) -> None:
         class FakeLLM:
-            def __init__(self) -> None:
+            def __init__(self, target: Path) -> None:
                 self.calls = 0
+                self.target = target
 
             def respond(self, **kwargs: Any) -> Any:
                 self.calls += 1
@@ -2239,7 +2316,7 @@ class PlannerToolUseTests(unittest.TestCase):
                                 "type": "function_call",
                                 "name": "delete_path",
                                 "call_id": "call-1",
-                                "arguments": '{"path":"/tmp/external.txt"}',
+                                "arguments": json.dumps({"path": str(self.target)}),
                             }
                         ],
                         output_text="",
@@ -2252,7 +2329,9 @@ class PlannerToolUseTests(unittest.TestCase):
 
             def delete_path(self, **kwargs: object) -> dict[str, object]:
                 self.calls.append(kwargs)
-                return {"ok": True, "path": str(kwargs["path"])}
+                path = Path(str(kwargs["path"]))
+                path.unlink()
+                return {"ok": True, "path": str(path), "deleted": True}
 
         session = AgentSession()
         seen_requests: list[dict[str, Any]] = []
@@ -2261,22 +2340,183 @@ class PlannerToolUseTests(unittest.TestCase):
             seen_requests.append(dict(request))
             return "approved"
 
-        answer = run_agent(
-            llm=FakeLLM(),  # type: ignore[arg-type]
-            rust=FakeRust(),  # type: ignore[arg-type]
-            workspace_root="/workspace",
-            user_prompt="delete the file in /tmp/external.txt",
-            session=session,
-            approval_requester=approve_request,
-        )
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            external = Path(tmp) / "external.txt"
+            external.write_text("delete me")
+            answer = run_agent(
+                llm=FakeLLM(external),  # type: ignore[arg-type]
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=str(workspace),
+                user_prompt=f"delete the file in {external}",
+                session=session,
+                approval_requester=approve_request,
+            )
+
+            self.assertFalse(external.exists())
 
         self.assertEqual(answer, "done")
         self.assertEqual(len(seen_requests), 1)
         self.assertEqual(seen_requests[0]["reason"], "external_delete_requires_confirmation")
-        self.assertEqual(seen_requests[0]["requested_path"], "/tmp/external.txt")
-        self.assertIn("/tmp/external.txt", session.approved_external_delete_roots)
+        self.assertEqual(seen_requests[0]["requested_path"], str(external))
+        self.assertIn(str(external), session.approved_external_delete_roots)
         self.assertTrue(session.pending_approvals)
         self.assertEqual(session.pending_approvals[0]["status"], "pending")
+
+    def test_run_agent_trims_tool_names_before_dispatch(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": " glob ",
+                                "call_id": "call-1",
+                                "arguments": '{"pattern":"*.py"}',
+                            }
+                        ],
+                        output_text="",
+                    )
+                return SimpleNamespace(output=[], output_text="done")
+
+        class FakeRust:
+            def glob_files(self, **kwargs: object) -> dict[str, object]:
+                return {"matches": [], "truncated": False}
+
+        answer = run_agent(
+            llm=FakeLLM(),  # type: ignore[arg-type]
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="find python files",
+        )
+
+        self.assertEqual(answer, "done")
+
+    def test_run_agent_breaks_repeated_unknown_tool_loop(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                if kwargs.get("tools"):
+                    return SimpleNamespace(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": "exec",
+                                "call_id": f"call-{len(self.calls)}",
+                                "arguments": json.dumps({"command": f"echo {len(self.calls)}"}),
+                            }
+                        ],
+                        output_text="",
+                    )
+                return SimpleNamespace(output=[], output_text="Answered without exec.")
+
+        llm = FakeLLM()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=object(),
+            workspace_root="/workspace",
+            user_prompt="run a shell command",
+            max_steps=20,
+        )
+
+        self.assertEqual(answer, "Answered without exec.")
+        self.assertEqual(len(llm.calls), 11)
+        self.assertEqual(llm.calls[-1]["tools"], [])
+        self.assertIn("unavailable tool exec 10 times", llm.calls[-1]["messages"][-1]["content"])
+
+    def test_run_agent_retries_one_empty_assistant_response(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    return SimpleNamespace(output=[], output_text="")
+                return SimpleNamespace(output=[], output_text="Visible answer.")
+
+        llm = FakeLLM()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=object(),
+            workspace_root="/workspace",
+            user_prompt="answer me",
+            max_steps=3,
+        )
+
+        self.assertEqual(answer, "Visible answer.")
+        self.assertEqual(len(llm.calls), 2)
+        self.assertIn(
+            "previous attempt did not produce a user-visible answer",
+            llm.calls[1]["messages"][-1]["content"],
+        )
+
+    def test_run_agent_blocks_generic_repeated_no_progress_tool_loop(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                if "generic_repeat" in json.dumps(kwargs.get("messages", [])):
+                    return SimpleNamespace(output=[], output_text="Stopped after loop block.")
+                return SimpleNamespace(
+                    output=[
+                        {
+                            "type": "function_call",
+                            "name": "glob",
+                            "call_id": f"call-{len(self.calls)}",
+                            "arguments": '{"pattern":"*.missing"}',
+                        }
+                    ],
+                    output_text="",
+                )
+
+        class FakeRust:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def glob_files(self, **kwargs: object) -> dict[str, object]:
+                self.calls += 1
+                return {"matches": [], "truncated": False}
+
+        llm = FakeLLM()
+        rust = FakeRust()
+        session = AgentSession()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=rust,  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="keep searching",
+            session=session,
+            max_steps=25,
+        )
+
+        self.assertEqual(answer, "Stopped after loop block.")
+        self.assertEqual(rust.calls, 20)
+        self.assertTrue(session.tool_loop_history)
+        self.assertTrue(all(record.get("run_id") for record in session.tool_loop_history))
+
+        second_llm = FakeLLM()
+        second_answer = run_agent(
+            llm=second_llm,  # type: ignore[arg-type]
+            rust=rust,  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="new turn",
+            session=session,
+            max_steps=3,
+        )
+
+        self.assertNotEqual(second_answer, "Stopped after loop block.")
 
 
 if __name__ == "__main__":

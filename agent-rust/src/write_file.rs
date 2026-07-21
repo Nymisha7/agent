@@ -286,7 +286,7 @@ fn temp_write_path(parent: &Path) -> Result<PathBuf> {
         .as_nanos();
 
     for attempt in 0..16 {
-        let candidate = parent.join(format!(".nym-write-{pid}-{nanos}-{attempt}.tmp"));
+        let candidate = parent.join(format!(".agent-write-{pid}-{nanos}-{attempt}.tmp"));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -326,7 +326,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "nym-write-test-{}-{}",
+            "agent-write-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -435,7 +435,7 @@ mod tests {
     fn rejects_outside_workspace() {
         let dir = temp_dir();
         let outside = std::env::temp_dir().join(format!(
-            "nym-write-outside-{}-{}",
+            "agent-write-outside-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
