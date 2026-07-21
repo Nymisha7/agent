@@ -4403,9 +4403,11 @@ def _slash_palette_entries(prompt: str, *, ctx: Any | None = None) -> list[Palet
     if provider_command is not None:
         return _provider_palette_entries(provider_command, parts[1] if len(parts) >= 2 else "")
     if _is_install_palette_prompt(prompt, parts):
-        return _install_palette_entries(parts[1] if len(parts) >= 2 else "")
+        provider, query = _palette_provider_and_query(prompt, parts, LOCAL_PROVIDERS)
+        return _install_palette_entries(query, provider=provider)
     if _is_model_palette_prompt(prompt, parts):
-        return _model_palette_entries(parts[1] if len(parts) >= 2 else "", ctx=ctx)
+        provider, query = _palette_provider_and_query(prompt, parts, set(PROVIDER_MODEL_HINTS))
+        return _model_palette_entries(query, provider=provider, ctx=ctx)
     if _is_reasoning_palette_prompt(prompt, parts):
         return _reasoning_palette_entries(parts[1] if len(parts) >= 2 else "")
 
@@ -4476,16 +4478,44 @@ def _provider_palette_description(command: str, provider: str) -> str:
     return f"default model: {PROVIDER_MODEL_HINTS.get(provider, ('custom-model',))[0]}"
 
 
-def _model_palette_entries(query: str, *, ctx: Any | None = None) -> list[PaletteEntry]:
+def _palette_provider_and_query(
+    prompt: str,
+    parts: list[str],
+    allowed_providers: set[str],
+) -> tuple[str | None, str]:
+    if len(parts) < 2:
+        return None, ""
+    candidate = parts[1].casefold()
+    if candidate not in allowed_providers:
+        return None, parts[1]
+    if len(parts) >= 3:
+        return candidate, parts[2]
+    if prompt.endswith(" "):
+        return candidate, ""
+    return None, parts[1]
+
+
+def _model_palette_entries(
+    query: str,
+    *,
+    provider: str | None = None,
+    ctx: Any | None = None,
+) -> list[PaletteEntry]:
     normalized = query.casefold()
     options = _model_options_for_display(ctx) if ctx is not None else _model_options()
     matches = [
         option for option in options
-        if option["model"].casefold().startswith(normalized)
-        or option["provider"].casefold().startswith(normalized)
+        if (provider is None or option["provider"] == provider)
+        and (
+            option["model"].casefold().startswith(normalized)
+            or option["provider"].casefold().startswith(normalized)
+        )
     ]
     if not matches:
-        matches = options
+        matches = [
+            option for option in options
+            if provider is None or option["provider"] == provider
+        ]
     return [
         PaletteEntry(
             value=f"{option['provider']}/{option['model']}",
@@ -4506,16 +4536,22 @@ def _model_palette_entries(query: str, *, ctx: Any | None = None) -> list[Palett
     ]
 
 
-def _install_palette_entries(query: str) -> list[PaletteEntry]:
+def _install_palette_entries(query: str, *, provider: str | None = None) -> list[PaletteEntry]:
     normalized = query.casefold()
     entries = [
         entry
         for entry in LOCAL_INSTALL_CATALOG
-        if entry["model"].casefold().startswith(normalized)
-        or entry["provider"].casefold().startswith(normalized)
+        if (provider is None or entry["provider"] == provider)
+        and (
+            entry["model"].casefold().startswith(normalized)
+            or entry["provider"].casefold().startswith(normalized)
+        )
     ]
     if not entries:
-        entries = list(LOCAL_INSTALL_CATALOG)
+        entries = [
+            entry for entry in LOCAL_INSTALL_CATALOG
+            if provider is None or entry["provider"] == provider
+        ]
     return [
         PaletteEntry(
             value=f"{entry['provider']}/{entry['model']}",
@@ -4589,14 +4625,14 @@ def _provider_argument_command(prompt: str, parts: list[str]) -> str | None:
 
 def _is_model_palette_prompt(prompt: str, parts: list[str]) -> bool:
     return (
-        len(parts) <= 2
+        len(parts) <= 3
         and (prompt.startswith("/model ") or (len(parts) >= 1 and parts[0].casefold() == "/model" and prompt.endswith(" ")))
     )
 
 
 def _is_install_palette_prompt(prompt: str, parts: list[str]) -> bool:
     return (
-        len(parts) <= 2
+        len(parts) <= 3
         and (
             prompt.startswith("/install ")
             or (

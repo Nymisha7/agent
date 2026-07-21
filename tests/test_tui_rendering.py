@@ -911,6 +911,21 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertIn("open source · local runtime/install · no login", entries[0].description)
         self.assertEqual(_complete_slash_command("/model llama"), "/model ollama llama3.3")
 
+    def test_model_palette_filters_inside_selected_provider(self) -> None:
+        entries = _slash_palette_entries("/model ollama qwen")
+
+        self.assertTrue(entries)
+        self.assertTrue(all(entry.value.startswith("ollama/") for entry in entries))
+        self.assertTrue(entries[0].complete_to.startswith("/model ollama qwen"))
+        self.assertIn("params", entries[0].description)
+        self.assertTrue(_complete_slash_command("/model ollama qwen").startswith("/model ollama qwen"))
+
+    def test_model_palette_shows_provider_models_after_provider_space(self) -> None:
+        entries = _slash_palette_entries("/model anthropic ")
+
+        self.assertTrue(entries)
+        self.assertTrue(all(entry.value.startswith("anthropic/") for entry in entries))
+
     def test_install_palette_offers_explicit_ollama_download_action(self) -> None:
         entries = _slash_palette_entries("/install ollama")
 
@@ -940,6 +955,14 @@ class TuiRenderingTests(unittest.TestCase):
         )
         self.assertTrue(all("installs locally" in entry.description for entry in entries))
         self.assertTrue(all("no login" in entry.description for entry in entries))
+
+    def test_install_palette_filters_inside_selected_provider(self) -> None:
+        entries = _slash_palette_entries("/install llamacpp qwen")
+
+        self.assertTrue(entries)
+        self.assertTrue(all(entry.value.startswith("llamacpp/") for entry in entries))
+        self.assertEqual(entries[0].complete_to, "/install llamacpp qwen2.5-coder-7b-instruct")
+        self.assertIn("7B params", entries[0].description)
 
     def test_reasoning_palette_exposes_effort_without_raw_thinking(self) -> None:
         entries = _slash_palette_entries("/reasoning ")
