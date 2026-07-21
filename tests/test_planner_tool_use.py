@@ -13,7 +13,6 @@ from unittest.mock import patch
 from agent.main import default_workspace_root, resolve_rust_bin
 from agent.planner import (
     AgentSession,
-    LOCAL_GATE_PROMPT,
     ModelToolCall,
     _approval_request_from_observation,
     _build_initial_messages,
@@ -2426,11 +2425,13 @@ class PlannerToolUseTests(unittest.TestCase):
                     if isinstance(tool, dict)
                 })
                 if self.calls == 1:
+                    return SimpleNamespace(output=[], output_text="HOST")
+                if self.calls == 2:
                     return SimpleNamespace(
                         output=[],
                         output_text="Likely processes include systemd and bash.",
                     )
-                if self.calls == 2:
+                if self.calls == 3:
                     return SimpleNamespace(
                         output=[{
                             "type": "function_call",
@@ -2476,9 +2477,9 @@ class PlannerToolUseTests(unittest.TestCase):
 
         self.assertEqual(answer, "Open applications: Terminal.")
         self.assertEqual(rust.observed, [{"scope": "applications", "limit": 20}])
-        self.assertNotIn(LOCAL_GATE_PROMPT, llm.instructions)
-        self.assertIn("desktop_observe", llm.tool_names[0])
-        self.assertNotIn("glob", llm.tool_names[0])
+        self.assertEqual(llm.tool_names[0], set())
+        self.assertIn("desktop_observe", llm.tool_names[1])
+        self.assertNotIn("glob", llm.tool_names[1])
 
     def test_run_agent_accepts_model_finish_task_without_prompt_classification(self) -> None:
         class FakeLLM:
@@ -2577,7 +2578,7 @@ class PlannerToolUseTests(unittest.TestCase):
 
         self.assertIn("multiple possible RA projects", answer)
 
-    def test_local_obvious_chat_skips_router_call(self) -> None:
+    def test_local_chat_uses_router_then_tool_free_answer(self) -> None:
         class FakeLLM:
             mode = "local"
 
@@ -2586,6 +2587,8 @@ class PlannerToolUseTests(unittest.TestCase):
 
             def respond(self, **kwargs: Any) -> Any:
                 self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    return SimpleNamespace(output=[], output_text="CHAT")
                 return SimpleNamespace(output=[], output_text="Hi there.")
 
         llm = FakeLLM()
@@ -2597,8 +2600,9 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertEqual(answer, "Hi there.")
-        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(len(llm.calls), 2)
         self.assertEqual(llm.calls[0]["tools"], [])
+        self.assertEqual(llm.calls[1]["tools"], [])
 
     def test_run_agent_waits_for_approval_before_external_delete(self) -> None:
         class FakeLLM:

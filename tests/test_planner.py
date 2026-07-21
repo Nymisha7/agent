@@ -17,8 +17,11 @@ def test_planner_has_no_commented_out_or_rule_router_functions() -> None:
         "_ordinal_selection",
         "_named_project_scope",
         "_should_offer_tools",
+        "_preclassified_local_route",
+        "_obvious_local_chat_prompt",
     ):
         assert removed_name not in source
+    assert "what applications are open" not in source
 
 
 class RecordingLLM:
@@ -182,17 +185,47 @@ def test_local_chat_retries_fenced_tool_json_as_normal_text() -> None:
 
 
 def test_local_gate_escalates_tool_work_with_compact_schemas() -> None:
-    llm = LocalGateLLM(["WORKSPACE"])
+    class InspectThenFinishLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def respond(self, **kwargs: Any) -> Any:
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return SimpleNamespace(output=[], output_text="WORKSPACE")
+            if len(self.requests) == 2:
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "inspect_tree",
+                        "call_id": "inspect-local-tools",
+                        "arguments": '{"path":"/workspace","max_files":20}',
+                    }],
+                    output_text="",
+                )
+            return SimpleNamespace(
+                output=[{
+                    "type": "function_call",
+                    "name": "finish_task",
+                    "call_id": "finish-local-tools",
+                    "arguments": '{"answer":"tool path completed"}',
+                }],
+                output_text="",
+            )
+
+    llm = InspectThenFinishLLM()
 
     answer = run_agent(
         llm=llm,
-        rust=object(),
+        rust=FakeRust(),
         workspace_root=".",
         user_prompt="inspect my project",
     )
 
     assert answer == "tool path completed"
-    assert len(llm.requests) == 2
+    assert len(llm.requests) == 3
     assert llm.requests[0]["tools"] == []
     assert len(llm.requests[1]["tools"]) > 0
     assert len(json.dumps(llm.requests[1]["tools"])) < 7_000
@@ -203,22 +236,56 @@ def test_local_gate_escalates_tool_work_with_compact_schemas() -> None:
 
 
 def test_local_agent_retries_printed_command_json_without_executing_it() -> None:
-    llm = LocalGateLLM([
-        "WORKSPACE",
-        '{"command":"read_directory","directory_path":"/workspace"}',
-    ])
+    class JsonThenToolLLM:
+        mode = "local"
 
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def respond(self, **kwargs: Any) -> Any:
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return SimpleNamespace(output=[], output_text="WORKSPACE")
+            if len(self.requests) == 2:
+                return SimpleNamespace(
+                    output=[],
+                    output_text='{"command":"read_directory","directory_path":"/workspace"}',
+                )
+            if len(self.requests) == 3:
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "inspect_tree",
+                        "call_id": "inspect-after-json",
+                        "arguments": '{"path":"/workspace","max_files":20}',
+                    }],
+                    output_text="",
+                )
+            return SimpleNamespace(
+                output=[{
+                    "type": "function_call",
+                    "name": "finish_task",
+                    "call_id": "finish-after-tool",
+                    "arguments": '{"answer":"tool path completed"}',
+                }],
+                output_text="",
+            )
+
+    llm = JsonThenToolLLM()
     answer = run_agent(
         llm=llm,
-        rust=object(),
+        rust=FakeRust(),
         workspace_root=".",
         user_prompt="inspect my project",
     )
 
     assert answer == "tool path completed"
-    assert len(llm.requests) == 3
-    correction = llm.requests[2]["messages"][-1]["content"]
-    assert "not an executed action" in correction
+    assert len(llm.requests) == 4
+    assert any(
+        "not an executed action" in str(message.get("content", ""))
+        for message in llm.requests[2]["messages"]
+        if isinstance(message, dict)
+    )
 
 
 def test_default_language_server_catalog_covers_requested_languages() -> None:

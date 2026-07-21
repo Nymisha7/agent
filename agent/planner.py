@@ -43,15 +43,9 @@ FINISH_TASK_TOOL = {
 
 LOCAL_GATE_PROMPT = """You are a request router. Output only CHAT, WORKSPACE, or HOST; never answer the request.
 WORKSPACE means projects, repositories, files, paths, code, or file actions. HOST means devices, processes, desktop, audio, network, current-machine facts, or host actions. CHAT means only a greeting, ordinary conversation, or stable general knowledge.
-Examples:
-hi -> CHAT
-explain recursion -> CHAT
-tell me about my alpha project -> WORKSPACE
-inspect the red project -> WORKSPACE
-edit main.py -> WORKSPACE
-what applications are open -> HOST
-what devices are connected -> HOST
-set volume to zero -> HOST
+Route current, live, visible, connected, installed, running, or machine-specific state as HOST unless the state is inside workspace files.
+Route requests that require inspecting, editing, creating, deleting, or explaining workspace files/projects/code as WORKSPACE.
+Route stable general knowledge and ordinary conversation as CHAT.
 When uncertain, output WORKSPACE."""
 
 LOCAL_CHAT_PROMPT = """You are Agent. Respond naturally and concisely to ordinary conversation or stable general-knowledge questions. Do not claim to have inspected the user's workspace or machine."""
@@ -156,22 +150,20 @@ def run_agent(
         tools = [_compact_tool_schema(schema) for schema in tools]
     tool_output_max_bytes = 4_000 if compact_local_context else 12_000
     policy = PolicyEngine()
+    requires_tool_evidence = False
+    tool_evidence_seen = False
 
     if compact_local_context:
-        gate_text = _preclassified_local_route(user_prompt)
-        if gate_text is None and _obvious_local_chat_prompt(user_prompt):
-            gate_text = LOCAL_CHAT_GATE
-        if gate_text is None:
-            gate_response = llm.respond(
-                instructions=LOCAL_GATE_PROMPT,
-                messages=_local_gate_messages(user_prompt, conversation_history),
-                tools=[],
-                previous_response_id=None,
-                tool_choice=None,
-                stream=False,
-                event_handler=None,
-            )
-            gate_text = _raw_response_text(gate_response).strip().upper()
+        gate_response = llm.respond(
+            instructions=LOCAL_GATE_PROMPT,
+            messages=_local_gate_messages(user_prompt, conversation_history),
+            tools=[],
+            previous_response_id=None,
+            tool_choice=None,
+            stream=False,
+            event_handler=None,
+        )
+        gate_text = _normalize_local_route(_raw_response_text(gate_response))
         if gate_text == LOCAL_CHAT_GATE:
             chat_messages = _local_chat_messages(user_prompt, conversation_history)
             chat_response = llm.respond(
@@ -215,6 +207,7 @@ def run_agent(
                     )
             return policy.redact_text(chat_text)
         tools = _local_tools_for_route(tools, gate_text)
+        requires_tool_evidence = gate_text in {LOCAL_HOST_GATE, LOCAL_WORKSPACE_GATE}
 
     context_text = stored_context.strip() if stored_context else ""
     if compact_local_context:
@@ -276,17 +269,6 @@ def run_agent(
             if (
                 compact_local_context
                 and step + 1 < max_steps
-                and gate_text in {LOCAL_HOST_GATE, LOCAL_WORKSPACE_GATE}
-            ):
-                msg_history.append({"role": "assistant", "content": response_text})
-                msg_history.append({
-                    "role": "user",
-                    "content": _missing_tool_retry_instruction(gate_text, user_prompt),
-                })
-                continue
-            if (
-                compact_local_context
-                and step + 1 < max_steps
                 and _looks_like_unexecuted_action(response_text)
             ):
                 msg_history.append({"role": "assistant", "content": response_text})
@@ -299,6 +281,18 @@ def run_agent(
                     ),
                 })
                 continue
+            if (
+                compact_local_context
+                and step + 1 < max_steps
+                and requires_tool_evidence
+                and not tool_evidence_seen
+            ):
+                msg_history.append({"role": "assistant", "content": response_text})
+                msg_history.append({
+                    "role": "user",
+                    "content": _missing_tool_retry_instruction(gate_text, user_prompt),
+                })
+                continue
             return policy.redact_text(response_text)
 
         tool_outputs: list[dict[str, Any]] = []
@@ -308,6 +302,23 @@ def run_agent(
             if call.name == "finish_task":
                 unknown_tool_streak = 0
                 answer = _finish_task_answer(call.arguments)
+                if (
+                    answer is not None
+                    and len(tool_calls) == 1
+                    and requires_tool_evidence
+                    and not tool_evidence_seen
+                    and step + 1 < max_steps
+                ):
+                    tool_outputs.append({
+                        "type": "function_call_output",
+                        "call_id": call.call_id,
+                        "output": _prepare_tool_output({
+                            "ok": False,
+                            "tool": call.name,
+                            "error": _missing_tool_retry_instruction(gate_text, user_prompt),
+                        }, max_bytes=tool_output_max_bytes),
+                    })
+                    continue
                 if answer is not None and len(tool_calls) == 1:
                     finished_answer = answer
                     break
@@ -364,6 +375,8 @@ def run_agent(
                         "args": call.arguments,
                         "error": str(exc),
                     }
+            if _counts_as_tool_evidence(call.name, available_tool_names):
+                tool_evidence_seen = True
             approval_request = _approval_request_from_observation(
                 call,
                 observation,
@@ -572,43 +585,24 @@ def _prefers_compact_local_context(llm: LLMClient) -> bool:
     return getattr(llm, "mode", None) == "local"
 
 
-def _obvious_local_chat_prompt(user_prompt: str) -> bool:
-    text = user_prompt.strip().casefold()
-    text = re.sub(r"[.!?\s]+$", "", text)
-    return bool(re.fullmatch(r"(hi|hello|hey|yo|thanks|thank you|ok|okay)", text))
+def _normalize_local_route(value: str) -> str:
+    route = value.strip().upper()
+    if route in {LOCAL_CHAT_GATE, LOCAL_WORKSPACE_GATE, LOCAL_HOST_GATE}:
+        return route
+    return LOCAL_WORKSPACE_GATE
 
 
-def _preclassified_local_route(user_prompt: str) -> str | None:
-    text = re.sub(r"\s+", " ", user_prompt.strip().casefold())
-    if not text:
-        return None
-
-    if re.search(r"\b(app|apps|application|applications|window|windows)\b", text) and re.search(
-        r"\b(open|opened|running|visible|active|focused|current|list|show|tell|what|which)\b",
-        text,
-    ):
-        return LOCAL_HOST_GATE
-    if re.search(
-        r"\b(device|devices|usb|bluetooth|wifi|wi-fi|network|networks|display|monitor|screen|audio|volume|speaker|microphone|clipboard|dialog|download|downloads|process|processes|port|ports)\b",
-        text,
-    ):
-        return LOCAL_HOST_GATE
-    if re.search(
-        r"\b(file|files|folder|folders|directory|directories|path|paths|project|projects|repo|repository|codebase|workspace)\b",
-        text,
-    ):
-        return LOCAL_WORKSPACE_GATE
-    return None
+def _counts_as_tool_evidence(tool_name: str, available_tool_names: set[str]) -> bool:
+    return tool_name in available_tool_names and tool_name not in {"finish_task", "load_skill"}
 
 
 def _missing_tool_retry_instruction(route: str, user_prompt: str) -> str:
     if route == LOCAL_HOST_GATE:
         return (
             "This request asks for live host or desktop state. Do not answer from memory, "
-            "examples, /proc guesses, or command suggestions. Call the relevant available "
-            "host tool now. For open applications or windows, call desktop_observe with "
-            "scope applications, windows, active_window, or all, then summarize only the "
-            f"tool result. Original request: {_truncate_text(user_prompt, 500)}"
+            "examples, guessed process names, or command suggestions. Call the relevant "
+            "available host-observation tool now, then summarize only the tool result. "
+            f"Original request: {_truncate_text(user_prompt, 500)}"
         )
     return (
         "This request asks about the user's workspace. Do not answer without inspecting "
