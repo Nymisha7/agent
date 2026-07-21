@@ -13,6 +13,7 @@ from unittest.mock import patch
 from agent.main import default_workspace_root, resolve_rust_bin
 from agent.planner import (
     AgentSession,
+    LOCAL_GATE_PROMPT,
     ModelToolCall,
     _approval_request_from_observation,
     _build_initial_messages,
@@ -2406,6 +2407,78 @@ class PlannerToolUseTests(unittest.TestCase):
 
         self.assertEqual(answer, "A few things stood out.")
         self.assertEqual(llm.calls, 1)
+
+    def test_local_host_prompt_requires_desktop_observation_before_answer(self) -> None:
+        class FakeLLM:
+            mode = "local"
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.instructions: list[str] = []
+                self.tool_names: list[set[str]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                self.instructions.append(str(kwargs.get("instructions") or ""))
+                self.tool_names.append({
+                    str(tool.get("name"))
+                    for tool in kwargs.get("tools", [])
+                    if isinstance(tool, dict)
+                })
+                if self.calls == 1:
+                    return SimpleNamespace(
+                        output=[],
+                        output_text="Likely processes include systemd and bash.",
+                    )
+                if self.calls == 2:
+                    return SimpleNamespace(
+                        output=[{
+                            "type": "function_call",
+                            "name": "desktop_observe",
+                            "call_id": "observe-1",
+                            "arguments": '{"scope":"applications","limit":20}',
+                        }],
+                        output_text="",
+                    )
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "finish_task",
+                        "call_id": "finish-1",
+                        "arguments": '{"answer":"Open applications: Terminal."}',
+                    }],
+                    output_text="",
+                )
+
+        class FakeRust:
+            def __init__(self) -> None:
+                self.observed: list[dict[str, object]] = []
+
+            def desktop_observe(self, **kwargs: object) -> dict[str, object]:
+                self.observed.append(dict(kwargs))
+                return {
+                    "ok": True,
+                    "tool": "desktop_observe",
+                    "scope": kwargs["scope"],
+                    "applications": {
+                        "items": [{"name": "Terminal", "id": "terminal.desktop"}],
+                    },
+                }
+
+        llm = FakeLLM()
+        rust = FakeRust()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=rust,  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="can you tell me what all applications are open",
+        )
+
+        self.assertEqual(answer, "Open applications: Terminal.")
+        self.assertEqual(rust.observed, [{"scope": "applications", "limit": 20}])
+        self.assertNotIn(LOCAL_GATE_PROMPT, llm.instructions)
+        self.assertIn("desktop_observe", llm.tool_names[0])
+        self.assertNotIn("glob", llm.tool_names[0])
 
     def test_run_agent_accepts_model_finish_task_without_prompt_classification(self) -> None:
         class FakeLLM:

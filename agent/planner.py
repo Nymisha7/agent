@@ -49,6 +49,7 @@ explain recursion -> CHAT
 tell me about my alpha project -> WORKSPACE
 inspect the red project -> WORKSPACE
 edit main.py -> WORKSPACE
+what applications are open -> HOST
 what devices are connected -> HOST
 set volume to zero -> HOST
 When uncertain, output WORKSPACE."""
@@ -157,8 +158,10 @@ def run_agent(
     policy = PolicyEngine()
 
     if compact_local_context:
-        gate_text = LOCAL_CHAT_GATE
-        if not _obvious_local_chat_prompt(user_prompt):
+        gate_text = _preclassified_local_route(user_prompt)
+        if gate_text is None and _obvious_local_chat_prompt(user_prompt):
+            gate_text = LOCAL_CHAT_GATE
+        if gate_text is None:
             gate_response = llm.respond(
                 instructions=LOCAL_GATE_PROMPT,
                 messages=_local_gate_messages(user_prompt, conversation_history),
@@ -270,6 +273,17 @@ def run_agent(
                 })
                 continue
             response_text = _response_text(response)
+            if (
+                compact_local_context
+                and step + 1 < max_steps
+                and gate_text in {LOCAL_HOST_GATE, LOCAL_WORKSPACE_GATE}
+            ):
+                msg_history.append({"role": "assistant", "content": response_text})
+                msg_history.append({
+                    "role": "user",
+                    "content": _missing_tool_retry_instruction(gate_text, user_prompt),
+                })
+                continue
             if (
                 compact_local_context
                 and step + 1 < max_steps
@@ -562,6 +576,45 @@ def _obvious_local_chat_prompt(user_prompt: str) -> bool:
     text = user_prompt.strip().casefold()
     text = re.sub(r"[.!?\s]+$", "", text)
     return bool(re.fullmatch(r"(hi|hello|hey|yo|thanks|thank you|ok|okay)", text))
+
+
+def _preclassified_local_route(user_prompt: str) -> str | None:
+    text = re.sub(r"\s+", " ", user_prompt.strip().casefold())
+    if not text:
+        return None
+
+    if re.search(r"\b(app|apps|application|applications|window|windows)\b", text) and re.search(
+        r"\b(open|opened|running|visible|active|focused|current|list|show|tell|what|which)\b",
+        text,
+    ):
+        return LOCAL_HOST_GATE
+    if re.search(
+        r"\b(device|devices|usb|bluetooth|wifi|wi-fi|network|networks|display|monitor|screen|audio|volume|speaker|microphone|clipboard|dialog|download|downloads|process|processes|port|ports)\b",
+        text,
+    ):
+        return LOCAL_HOST_GATE
+    if re.search(
+        r"\b(file|files|folder|folders|directory|directories|path|paths|project|projects|repo|repository|codebase|workspace)\b",
+        text,
+    ):
+        return LOCAL_WORKSPACE_GATE
+    return None
+
+
+def _missing_tool_retry_instruction(route: str, user_prompt: str) -> str:
+    if route == LOCAL_HOST_GATE:
+        return (
+            "This request asks for live host or desktop state. Do not answer from memory, "
+            "examples, /proc guesses, or command suggestions. Call the relevant available "
+            "host tool now. For open applications or windows, call desktop_observe with "
+            "scope applications, windows, active_window, or all, then summarize only the "
+            f"tool result. Original request: {_truncate_text(user_prompt, 500)}"
+        )
+    return (
+        "This request asks about the user's workspace. Do not answer without inspecting "
+        "the relevant file, path, or project with the available workspace tools. Use a "
+        f"tool now, then summarize the result. Original request: {_truncate_text(user_prompt, 500)}"
+    )
 
 
 def _compact_tool_schema(value: Any, *, depth: int = 0) -> Any:
