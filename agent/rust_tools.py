@@ -289,12 +289,24 @@ class RustTools:
         action: str,
         target: str | None = None,
         value: str | None = None,
+        backend_bus: str | None = None,
+        backend_path: str | None = None,
     ) -> Any:
         args = ["desktop-action", action]
         if target is not None:
             args.extend(["--target", target])
         if value is not None:
             args.extend(["--value", value])
+        if backend_bus is not None:
+            args.extend(["--backend-bus", backend_bus])
+        if backend_path is not None:
+            args.extend(["--backend-path", backend_path])
+        return self.run_json(args, timeout=30)
+
+    def desktop_clipboard_files(self, *, paths: list[str], operation: str = "copy") -> Any:
+        args = ["desktop-clipboard-files", "--operation", operation]
+        for path in paths:
+            args.extend(["--path", path])
         return self.run_json(args, timeout=30)
 
     def process_list(self, *, limit: int = 20, sort_by: str = "cpu") -> Any:

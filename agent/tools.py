@@ -661,7 +661,7 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 properties={
                     "scope": {
                         "type": "string",
-                        "enum": ["all", "applications", "windows", "active_window", "clipboard", "ui_tree", "displays", "audio"],
+                        "enum": ["all", "applications", "windows", "active_window", "clipboard", "ui_tree", "displays", "audio", "dialogs", "downloads"],
                         "description": "Desktop observation scope to return.",
                         "default": "all",
                     },
@@ -799,6 +799,7 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                             "focus_window", "minimize_window", "maximize_window",
                             "restore_window", "close_window", "clipboard_write",
                             "send_key", "type_text", "mouse_click", "scroll",
+                            "focus_element", "invoke_element", "set_field_text",
                         ],
                         "description": "Typed desktop operation to perform.",
                     },
@@ -815,6 +816,27 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                     },
                 },
                 required=["action"],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
+            name="desktop_clipboard_files",
+            handler=_desktop_clipboard_files,
+            schema=_function_schema(
+                name="desktop_clipboard_files",
+                description="Place existing local files or folders on the desktop clipboard without reading their contents.",
+                properties={
+                    "paths": {
+                        "type": "array", "items": {"type": "string"},
+                        "minItems": 1, "maxItems": 32,
+                    },
+                    "operation": {
+                        "type": "string", "enum": ["copy", "cut"], "default": "copy",
+                    },
+                },
+                required=["paths"],
             ),
         )
     )
@@ -1932,7 +1954,7 @@ def _desktop_observe(args: dict[str, Any], ctx: ToolContext) -> Any:
     scope = _enum_arg(
         args.get("scope"),
         default="all",
-        allowed={"all", "applications", "windows", "active_window", "clipboard", "ui_tree", "displays", "audio"},
+        allowed={"all", "applications", "windows", "active_window", "clipboard", "ui_tree", "displays", "audio", "dialogs", "downloads"},
     )
     limit = _int_arg(args.get("limit"), default=50, minimum=1, maximum=200)
     return ctx.rust.desktop_observe(scope=scope, limit=limit)
@@ -1965,6 +1987,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             "focus_window", "minimize_window", "maximize_window",
                             "restore_window", "close_window", "clipboard_write",
             "send_key", "type_text", "mouse_click", "scroll",
+            "focus_element", "invoke_element", "set_field_text",
         },
     )
     if not action:
@@ -1977,6 +2000,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
         "launch_application", "open_path", "open_url",
         "focus_window", "minimize_window", "maximize_window",
         "restore_window", "close_window", "mouse_click",
+        "focus_element", "invoke_element", "set_field_text",
     } and target is None:
         return {
             "ok": False,
@@ -1987,7 +2011,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             "operation": "desktop",
             "guidance": f"{action} requires a concrete target before approval can be requested.",
         }
-    if action in {"set_volume", "set_brightness", "clipboard_write", "send_key", "type_text", "scroll"} and value is None:
+    if action in {"set_volume", "set_brightness", "clipboard_write", "send_key", "type_text", "scroll", "invoke_element", "set_field_text"} and value is None:
         return {
             "ok": False,
             "tool": "desktop_action",
@@ -1999,7 +2023,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
                 f"{action} requires clipboard text."
                 if action == "clipboard_write"
                 else f"{action} requires a value."
-                if action in {"send_key", "type_text", "scroll"}
+                if action in {"send_key", "type_text", "scroll", "invoke_element", "set_field_text"}
                 else f"{action} requires a value between 0 and 100."
             ),
         }
@@ -2032,7 +2056,49 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
                 "exact action before retrying."
             ),
         }
-    return ctx.rust.desktop_action(action=action, target=target, value=value)
+    backend_bus = _optional_desktop_backend_arg(args.get("_backend_bus"), "_backend_bus")
+    backend_path = _optional_desktop_backend_arg(args.get("_backend_path"), "_backend_path")
+    rust_args: dict[str, Any] = {"action": action, "target": target, "value": value}
+    if backend_bus is not None:
+        rust_args["backend_bus"] = backend_bus
+    if backend_path is not None:
+        rust_args["backend_path"] = backend_path
+    return ctx.rust.desktop_action(**rust_args)
+
+
+def _desktop_clipboard_files(args: dict[str, Any], ctx: ToolContext) -> Any:
+    raw_paths = args.get("paths")
+    if not isinstance(raw_paths, list) or not 1 <= len(raw_paths) <= 32:
+        raise ValueError("desktop_clipboard_files requires between 1 and 32 paths.")
+    operation = _enum_arg(args.get("operation"), default="copy", allowed={"copy", "cut"})
+    resolved_paths: list[Path] = []
+    seen: set[Path] = set()
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError("desktop_clipboard_files paths must be non-empty strings.")
+        resolved = _resolve_tool_path(raw_path.strip(), ctx, tool="desktop_clipboard_files", operation="read")
+        if isinstance(resolved, dict):
+            return resolved
+        canonical = resolved.resolve()
+        if not canonical.exists():
+            raise ValueError(f"desktop clipboard path does not exist: {raw_path}")
+        if canonical not in seen:
+            seen.add(canonical)
+            resolved_paths.append(canonical)
+
+    approval_key = _desktop_clipboard_files_approval_key(operation, resolved_paths)
+    args["_approval_key"] = approval_key
+    if approval_key not in ctx.approved_system_commands:
+        return {
+            "ok": False, "tool": "desktop_clipboard_files", "blocked": True,
+            "recoverable": True, "reason": "desktop_action_requires_approval",
+            "operation": "desktop", "requested_path": approval_key,
+            "paths": [str(path) for path in resolved_paths], "item_count": len(resolved_paths),
+            "guidance": "Ask the user to approve placing these exact paths on the desktop clipboard.",
+        }
+    return ctx.rust.desktop_clipboard_files(
+        paths=[str(path) for path in resolved_paths], operation=operation
+    )
 
 
 def _optional_desktop_arg(value: Any, name: str) -> str | None:
@@ -2756,13 +2822,31 @@ def _desktop_action_approval_key(
     if target:
         parts.append(target.strip())
     if value:
-        if action in {"clipboard_write", "type_text"}:
+        if action in {"clipboard_write", "type_text", "set_field_text"}:
             digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
             parts.append(f"sha256:{digest}")
             parts.append(f"bytes:{len(value.encode('utf-8'))}")
         else:
             parts.append(value.strip())
     return " ".join(parts)
+
+
+def _desktop_clipboard_files_approval_key(operation: str, paths: list[Path]) -> str:
+    encoded = b"\0".join(os.fsencode(path) for path in paths)
+    return f"desktop clipboard_files {operation} sha256:{hashlib.sha256(encoded).hexdigest()} items:{len(paths)}"
+
+
+def _optional_desktop_backend_arg(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 1024:
+        raise ValueError(f"{name} is invalid.")
+    normalized = value.strip()
+    if name == "_backend_bus" and not re.fullmatch(r"(?::[0-9]+\.[0-9]+|[A-Za-z_][A-Za-z0-9_.-]*)", normalized):
+        raise ValueError("_backend_bus is invalid.")
+    if name == "_backend_path" and not re.fullmatch(r"/(?:[A-Za-z0-9_]+/?)*", normalized):
+        raise ValueError("_backend_path is invalid.")
+    return normalized
 
 
 def _glob_has_matches(result: Any) -> bool:

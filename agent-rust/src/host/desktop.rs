@@ -4,10 +4,13 @@ use super::{
 };
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
@@ -22,6 +25,7 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
     let has_powershell_host = windows_host_powershell_available();
     let has_gtk_launch = command_exists("gtk-launch");
     let has_xdg_open = command_exists("xdg-open");
+    let accessibility = accessibility_backend();
 
     Ok(json!({
         "ok": true,
@@ -117,8 +121,8 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
                 if linux_supported { None } else { Some("unsupported_platform") },
             ),
             "accessibility_tree": backend_status(
-                linux_supported && accessibility_backend() != "unavailable",
-                accessibility_backend(),
+                linux_supported && accessibility != "unavailable",
+                accessibility,
                 if linux_supported { None } else { Some("unsupported_platform") },
             ),
             "display_observation": backend_status(
@@ -146,10 +150,14 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
             action_capability("restore_window", linux_supported && command_exists("wmctrl"), "wmctrl", "approval_required", Some("target_required")),
             action_capability("close_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool")), window_control_backend(), "approval_required", Some("target_required")),
             action_capability("clipboard_write", linux_supported && clipboard_backend() != "unavailable", clipboard_backend(), "approval_required", None),
+            action_capability("clipboard_files", linux_supported && file_clipboard_backend() != "unavailable", file_clipboard_backend(), "approval_required", Some("existing_paths_required")),
             action_capability("send_key", linux_supported && command_exists("xdotool"), "xdotool", "approval_required", None),
             action_capability("type_text", linux_supported && keyboard_backend() != "unavailable", keyboard_backend(), "approval_required", None),
             action_capability("mouse_click", linux_supported && pointer_backend() != "unavailable", pointer_backend(), "approval_required", Some("target_required")),
             action_capability("scroll", linux_supported && pointer_backend() != "unavailable", pointer_backend(), "approval_required", None),
+            action_capability("focus_element", linux_supported && accessibility == "atspi_dbus", accessibility, "approval_required", Some("observed_element_required")),
+            action_capability("invoke_element", linux_supported && accessibility == "atspi_dbus", accessibility, "approval_required", Some("observed_element_and_action_required")),
+            action_capability("set_field_text", linux_supported && accessibility == "atspi_dbus", accessibility, "approval_required", Some("observed_editable_element_required")),
         ],
         "limitations": desktop_limitations(linux_supported, wsl),
     }))
@@ -158,7 +166,7 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
 pub(crate) fn desktop_observe(scope: &str, limit: usize) -> Result<Value> {
     let normalized_scope = match scope {
         "all" | "applications" | "windows" | "active_window" | "clipboard" | "ui_tree"
-        | "displays" | "audio" => scope,
+        | "displays" | "audio" | "dialogs" | "downloads" => scope,
         "active-window" => "active_window",
         "clipboard_metadata" | "clipboard-metadata" => "clipboard",
         "accessibility" | "accessibility_tree" | "accessibility-tree" => "ui_tree",
@@ -169,6 +177,8 @@ pub(crate) fn desktop_observe(scope: &str, limit: usize) -> Result<Value> {
     let linux_supported = cfg!(target_os = "linux");
     let wsl = is_wsl_runtime();
     let has_powershell_host = windows_host_powershell_available();
+    let accessibility = accessibility_backend();
+    let snapshot_id = format!("desktop-{}", now_unix_millis());
     let mut payload = json!({
         "ok": linux_supported,
         "tool": "desktop_observe",
@@ -177,7 +187,7 @@ pub(crate) fn desktop_observe(scope: &str, limit: usize) -> Result<Value> {
         "runtime": desktop_runtime(),
         "platform": std::env::consts::OS,
         "wsl": wsl,
-        "snapshot_id": format!("desktop-{}", now_unix_millis()),
+        "snapshot_id": snapshot_id,
         "observed_at_unix_ms": now_unix_millis(),
         "backends": {
             "applications": backend_status(
@@ -213,8 +223,8 @@ pub(crate) fn desktop_observe(scope: &str, limit: usize) -> Result<Value> {
                 if linux_supported { None } else { Some("unsupported_platform") },
             ),
             "ui_tree": backend_status(
-                linux_supported && accessibility_backend() != "unavailable",
-                accessibility_backend(),
+                linux_supported && accessibility != "unavailable",
+                accessibility,
                 if linux_supported { None } else { Some("unsupported_platform") },
             ),
             "displays": backend_status(
@@ -225,6 +235,16 @@ pub(crate) fn desktop_observe(scope: &str, limit: usize) -> Result<Value> {
             "audio": backend_status(
                 linux_supported && command_exists("pactl"),
                 if command_exists("pactl") { "pactl" } else { "unavailable" },
+                if linux_supported { None } else { Some("unsupported_platform") },
+            ),
+            "dialogs": backend_status(
+                linux_supported && accessibility != "unavailable",
+                accessibility,
+                if linux_supported { None } else { Some("unsupported_platform") },
+            ),
+            "downloads": backend_status(
+                linux_supported && downloads_directory().is_some_and(|path| path.is_dir()),
+                "freedesktop_user_dirs",
                 if linux_supported { None } else { Some("unsupported_platform") },
             ),
         },
@@ -263,13 +283,31 @@ pub(crate) fn desktop_observe(scope: &str, limit: usize) -> Result<Value> {
         insert_payload_value(&mut payload, "clipboard", clipboard_metadata()?);
     }
     if normalized_scope == "ui_tree" {
-        insert_payload_value(&mut payload, "ui_tree", accessibility_tree(bounded_limit)?);
+        insert_payload_value(
+            &mut payload,
+            "ui_tree",
+            accessibility_tree(&snapshot_id, bounded_limit)?,
+        );
     }
     if matches!(normalized_scope, "all" | "displays") {
         insert_payload_value(&mut payload, "displays", display_inventory(bounded_limit)?);
     }
     if normalized_scope == "audio" {
         insert_payload_value(&mut payload, "audio", audio_observation()?);
+    }
+    if normalized_scope == "dialogs" {
+        insert_payload_value(
+            &mut payload,
+            "dialogs",
+            dialog_inventory(&snapshot_id, bounded_limit)?,
+        );
+    }
+    if normalized_scope == "downloads" {
+        insert_payload_value(
+            &mut payload,
+            "downloads",
+            download_inventory(bounded_limit)?,
+        );
     }
 
     Ok(payload)
@@ -327,6 +365,8 @@ pub(crate) fn desktop_action(
     action: &str,
     target: Option<&str>,
     value: Option<&str>,
+    backend_bus: Option<&str>,
+    backend_path: Option<&str>,
 ) -> Result<Value> {
     if !cfg!(target_os = "linux") {
         return Ok(json!({
@@ -491,6 +531,13 @@ pub(crate) fn desktop_action(
         "type_text" => keyboard_action(action, value),
         "mouse_click" => pointer_action(action, target, value),
         "scroll" => pointer_action(action, target, value),
+        "focus_element" | "invoke_element" | "set_field_text" => ui_element_action(
+            action,
+            required_target(action, target)?,
+            value,
+            backend_bus,
+            backend_path,
+        ),
         _ => Ok(json!({
             "ok": false,
             "tool": "desktop_action",
@@ -621,6 +668,111 @@ fn now_unix_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+fn downloads_directory() -> Option<PathBuf> {
+    let home = env::var_os("HOME").map(PathBuf::from)?;
+    let config_home = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let configured = fs::read_to_string(config_home.join("user-dirs.dirs"))
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let value = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=")?.trim();
+                let value = value.strip_prefix('"')?.strip_suffix('"')?;
+                if value == "$HOME" {
+                    Some(home.clone())
+                } else if let Some(relative) = value.strip_prefix("$HOME/") {
+                    Some(home.join(relative))
+                } else {
+                    let path = PathBuf::from(value);
+                    path.is_absolute().then_some(path)
+                }
+            })
+        });
+    configured.or_else(|| Some(home.join("Downloads")))
+}
+
+fn download_inventory(limit: usize) -> Result<Value> {
+    let Some(directory) = downloads_directory() else {
+        return Ok(json!({
+            "ok": false,
+            "reason": "downloads_directory_unavailable",
+            "items": [],
+        }));
+    };
+    download_inventory_at(&directory, limit)
+}
+
+fn download_inventory_at(directory: &Path, limit: usize) -> Result<Value> {
+    if !directory.is_dir() {
+        return Ok(json!({
+            "ok": false,
+            "reason": "downloads_directory_missing",
+            "directory": directory,
+            "items": [],
+        }));
+    }
+    let mut items = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let modified_unix_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let partial = is_partial_download_name(&name);
+        items.push(json!({
+            "name": name,
+            "path": entry.path(),
+            "kind": if metadata.is_file() { "file" } else if metadata.is_dir() { "directory" } else { "other" },
+            "byte_count": metadata.is_file().then_some(metadata.len()),
+            "modified_unix_ms": modified_unix_ms,
+            "status": if partial { "partial" } else { "complete" },
+        }));
+    }
+    items.sort_by(|left, right| {
+        let timestamp = |value: &Value| {
+            value
+                .get("modified_unix_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        timestamp(right).cmp(&timestamp(left)).then_with(|| {
+            left.get("name")
+                .and_then(Value::as_str)
+                .cmp(&right.get("name").and_then(Value::as_str))
+        })
+    });
+    items.truncate(limit.clamp(1, 200));
+    let partial_count = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("partial"))
+        .count();
+    Ok(json!({
+        "ok": true,
+        "directory": directory,
+        "count": items.len(),
+        "partial_count": partial_count,
+        "items": items,
+    }))
+}
+
+fn is_partial_download_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".crdownload", ".part", ".partial", ".download"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 fn windows_host_set_volume(
@@ -944,8 +1096,10 @@ fn pointer_backend() -> &'static str {
 }
 
 fn accessibility_backend() -> &'static str {
-    if command_exists("busctl") && atspi_bus_address().is_ok() {
-        "atspi_busctl"
+    if env::var("AT_SPI_BUS_ADDRESS").is_ok_and(|value| !value.trim().is_empty())
+        || (command_exists("busctl") && atspi_bus_address().is_ok())
+    {
+        "atspi_dbus"
     } else {
         "unavailable"
     }
@@ -1081,7 +1235,505 @@ fn parse_pactl_mute(output: &str) -> Option<bool> {
     }
 }
 
-fn accessibility_tree(limit: usize) -> Result<Value> {
+fn accessibility_tree(snapshot_id: &str, limit: usize) -> Result<Value> {
+    match native_accessibility_tree(snapshot_id, limit) {
+        Ok(value) => return Ok(value),
+        Err(native_error) if command_exists("busctl") => {
+            return accessibility_tree_fallback(limit, &native_error.to_string());
+        }
+        Err(error) => {
+            return Ok(json!({
+                "ok": false,
+                "backend": "unavailable",
+                "reason": "backend_unavailable",
+                "error": error.to_string(),
+                "items": [],
+                "count": 0,
+            }));
+        }
+    }
+}
+
+fn native_atspi_address() -> Result<String> {
+    if let Ok(address) = env::var("AT_SPI_BUS_ADDRESS") {
+        if !address.trim().is_empty() {
+            return Ok(address);
+        }
+    }
+    atspi_bus_address()
+}
+
+fn native_accessibility_tree(snapshot_id: &str, limit: usize) -> Result<Value> {
+    let address = native_atspi_address()?;
+    let connection = zbus::blocking::connection::Builder::address(address.as_str())?
+        .method_timeout(Duration::from_secs(2))
+        .build()?;
+    let root = AccessibilityRef {
+        bus: "org.a11y.atspi.Registry".to_string(),
+        path: "/org/a11y/atspi/accessible/root".to_string(),
+        depth: 0,
+        parent_id: None,
+    };
+    let mut queue = VecDeque::from([root]);
+    let mut visited = HashSet::new();
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+
+    while let Some(reference) = queue.pop_front() {
+        if items.len() >= limit {
+            break;
+        }
+        let key = format!("{}\0{}", reference.bus, reference.path);
+        if !visited.insert(key) {
+            continue;
+        }
+        match accessibility_element(&connection, snapshot_id, &reference) {
+            Ok((item, children)) => {
+                let parent_id = item.get("id").and_then(Value::as_str).map(str::to_string);
+                items.push(item);
+                queue.extend(children.into_iter().map(|(bus, path)| AccessibilityRef {
+                    bus,
+                    path,
+                    depth: reference.depth.saturating_add(1),
+                    parent_id: parent_id.clone(),
+                }));
+            }
+            Err(_) => skipped += 1,
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "backend": "atspi_dbus",
+        "snapshot_id": snapshot_id,
+        "content": "accessible_metadata_only",
+        "count": items.len(),
+        "items": items,
+        "truncated": !queue.is_empty(),
+        "skipped_defunct_or_unreachable": skipped,
+    }))
+}
+
+#[derive(Debug)]
+struct AccessibilityRef {
+    bus: String,
+    path: String,
+    depth: usize,
+    parent_id: Option<String>,
+}
+
+fn accessibility_element(
+    connection: &zbus::blocking::Connection,
+    snapshot_id: &str,
+    reference: &AccessibilityRef,
+) -> Result<(Value, Vec<(String, String)>)> {
+    let accessible = zbus::blocking::Proxy::new(
+        connection,
+        reference.bus.as_str(),
+        reference.path.as_str(),
+        "org.a11y.atspi.Accessible",
+    )?;
+    let name = accessible
+        .get_property::<String>("Name")
+        .unwrap_or_default();
+    let description = accessible
+        .get_property::<String>("Description")
+        .unwrap_or_default();
+    let role = accessible
+        .call::<_, _, String>("GetRoleName", &())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let state_ids = accessible
+        .call::<_, _, Vec<u32>>("GetState", &())
+        .unwrap_or_default();
+    let interfaces = accessible
+        .call::<_, _, Vec<String>>("GetInterfaces", &())
+        .unwrap_or_default();
+    let children = accessible
+        .call::<_, _, Vec<(String, zbus::zvariant::OwnedObjectPath)>>("GetChildren", &())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(bus, path)| {
+            let path = path.to_string();
+            (path != "/org/a11y/atspi/null").then_some((bus, path))
+        })
+        .collect::<Vec<_>>();
+    let bounds = accessibility_bounds(connection, reference, &interfaces);
+    let actions = accessibility_actions(connection, reference, &interfaces);
+    let target_id = accessibility_target_id(snapshot_id, &reference.bus, &reference.path);
+
+    Ok((
+        json!({
+            "id": target_id,
+            "snapshot_id": snapshot_id,
+            "depth": reference.depth,
+            "parent_id": reference.parent_id,
+            "name": bounded_accessible_text(&name),
+            "description": bounded_accessible_text(&description),
+            "role": role,
+            "state_ids": state_ids,
+            "interfaces": interfaces,
+            "actions": actions,
+            "bounds": bounds,
+            "child_count": children.len(),
+            "backend_ref": {
+                "bus": reference.bus,
+                "path": reference.path,
+            },
+        }),
+        children,
+    ))
+}
+
+fn accessibility_bounds(
+    connection: &zbus::blocking::Connection,
+    reference: &AccessibilityRef,
+    interfaces: &[String],
+) -> Option<Value> {
+    if !interfaces.iter().any(|item| item.ends_with(".Component")) {
+        return None;
+    }
+    let proxy = zbus::blocking::Proxy::new(
+        connection,
+        reference.bus.as_str(),
+        reference.path.as_str(),
+        "org.a11y.atspi.Component",
+    )
+    .ok()?;
+    let (x, y, width, height): (i32, i32, i32, i32) = proxy.call("GetExtents", &0u32).ok()?;
+    Some(json!({ "x": x, "y": y, "width": width, "height": height }))
+}
+
+fn accessibility_actions(
+    connection: &zbus::blocking::Connection,
+    reference: &AccessibilityRef,
+    interfaces: &[String],
+) -> Vec<String> {
+    if !interfaces.iter().any(|item| item.ends_with(".Action")) {
+        return Vec::new();
+    }
+    let Ok(proxy) = zbus::blocking::Proxy::new(
+        connection,
+        reference.bus.as_str(),
+        reference.path.as_str(),
+        "org.a11y.atspi.Action",
+    ) else {
+        return Vec::new();
+    };
+    let count = proxy
+        .call::<_, _, i32>("GetNActions", &())
+        .unwrap_or(0)
+        .clamp(0, 32);
+    (0..count)
+        .filter_map(|index| proxy.call::<_, _, String>("GetName", &index).ok())
+        .map(|name| bounded_accessible_text(&name))
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn accessibility_target_id(snapshot_id: &str, bus: &str, path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(snapshot_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(bus.as_bytes());
+    hasher.update([0]);
+    hasher.update(path.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("ui-{}", &digest[..16])
+}
+
+fn bounded_accessible_text(value: &str) -> String {
+    value.chars().take(256).collect()
+}
+
+fn dialog_inventory(snapshot_id: &str, limit: usize) -> Result<Value> {
+    let tree_limit = limit.saturating_mul(10).clamp(1, 200);
+    let tree = accessibility_tree(snapshot_id, tree_limit)?;
+    if tree.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Ok(json!({
+            "ok": false,
+            "backend": tree.get("backend").cloned().unwrap_or(json!("unavailable")),
+            "reason": tree.get("reason").cloned().unwrap_or(json!("backend_unavailable")),
+            "error": tree.get("error").cloned(),
+            "items": [],
+            "count": 0,
+        }));
+    }
+    let dialogs = dialog_items(
+        tree.get("items")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        limit,
+    );
+    let total = dialogs.len();
+    Ok(json!({
+        "ok": true,
+        "backend": tree.get("backend").cloned().unwrap_or(json!("atspi_dbus")),
+        "snapshot_id": snapshot_id,
+        "count": total.min(limit),
+        "items": dialogs.into_iter().take(limit).collect::<Vec<_>>(),
+        "truncated": total > limit,
+        "tree_truncated": tree.get("truncated").cloned().unwrap_or(json!(false)),
+    }))
+}
+
+fn dialog_items(items: &[Value], control_limit: usize) -> Vec<Value> {
+    let parents = items
+        .iter()
+        .filter_map(|item| {
+            Some((
+                item.get("id")?.as_str()?.to_string(),
+                item.get("parent_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let role = item.get("role").and_then(Value::as_str)?;
+            let kind = dialog_kind(role)?;
+            let dialog_id = item.get("id").and_then(Value::as_str)?;
+            let controls = items
+                .iter()
+                .filter(|candidate| {
+                    candidate.get("id").and_then(Value::as_str) != Some(dialog_id)
+                        && accessibility_descends_from(candidate, dialog_id, &parents)
+                })
+                .take(control_limit)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut dialog = item.clone();
+            let object = dialog.as_object_mut()?;
+            object.insert("dialog_kind".to_string(), json!(kind));
+            object.insert("control_count".to_string(), json!(controls.len()));
+            object.insert("controls".to_string(), json!(controls));
+            Some(dialog)
+        })
+        .collect()
+}
+
+fn accessibility_descends_from(
+    item: &Value,
+    ancestor_id: &str,
+    parents: &std::collections::HashMap<String, Option<String>>,
+) -> bool {
+    let mut current = item
+        .get("parent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut visited = HashSet::new();
+    while let Some(id) = current {
+        if id == ancestor_id {
+            return true;
+        }
+        if !visited.insert(id.clone()) {
+            return false;
+        }
+        current = parents.get(&id).cloned().flatten();
+    }
+    false
+}
+
+fn dialog_kind(role: &str) -> Option<&'static str> {
+    let normalized = role.trim().to_ascii_lowercase().replace(['_', '-'], " ");
+    if normalized.contains("file chooser") || normalized.contains("file picker") {
+        Some("file_picker")
+    } else if normalized == "alert" || normalized.contains("alert dialog") {
+        Some("alert")
+    } else if normalized == "dialog" || normalized.ends_with(" dialog") {
+        Some("dialog")
+    } else {
+        None
+    }
+}
+
+fn ui_element_action(
+    action: &str,
+    target_id: &str,
+    value: Option<&str>,
+    backend_bus: Option<&str>,
+    backend_path: Option<&str>,
+) -> Result<Value> {
+    let bus =
+        backend_bus.ok_or_else(|| anyhow::anyhow!("{action} requires an observed UI element"))?;
+    let path =
+        backend_path.ok_or_else(|| anyhow::anyhow!("{action} requires an observed UI element"))?;
+    validate_accessibility_reference(bus, path)?;
+    let address = native_atspi_address()?;
+    let connection = zbus::blocking::connection::Builder::address(address.as_str())?
+        .method_timeout(Duration::from_secs(2))
+        .build()?;
+
+    match action {
+        "focus_element" => focus_accessibility_element(&connection, target_id, bus, path),
+        "invoke_element" => invoke_accessibility_element(
+            &connection,
+            target_id,
+            bus,
+            path,
+            value.ok_or_else(|| {
+                anyhow::anyhow!("invoke_element requires an advertised action name")
+            })?,
+        ),
+        "set_field_text" => set_accessibility_text(
+            &connection,
+            target_id,
+            bus,
+            path,
+            value.ok_or_else(|| anyhow::anyhow!("set_field_text requires text"))?,
+        ),
+        _ => unreachable!("semantic action was validated by caller"),
+    }
+}
+
+fn validate_accessibility_reference(bus: &str, path: &str) -> Result<()> {
+    zbus::names::BusName::try_from(bus)
+        .map_err(|_| anyhow::anyhow!("Invalid accessibility bus name"))?;
+    zbus::zvariant::ObjectPath::try_from(path)
+        .map_err(|_| anyhow::anyhow!("Invalid accessibility object path"))?;
+    Ok(())
+}
+
+fn focus_accessibility_element(
+    connection: &zbus::blocking::Connection,
+    target_id: &str,
+    bus: &str,
+    path: &str,
+) -> Result<Value> {
+    const ATSPI_STATE_FOCUSED: u32 = 12;
+    let before = accessibility_state(connection, bus, path);
+    let proxy = zbus::blocking::Proxy::new(connection, bus, path, "org.a11y.atspi.Component")?;
+    let dispatched: bool = proxy.call("GrabFocus", &())?;
+    thread::sleep(Duration::from_millis(75));
+    let after = accessibility_state(connection, bus, path);
+    let verified = dispatched
+        && after
+            .as_ref()
+            .is_some_and(|states| states.contains(&ATSPI_STATE_FOCUSED));
+    Ok(json!({
+        "ok": dispatched,
+        "tool": "desktop_action",
+        "action": "focus_element",
+        "target": target_id,
+        "backend": "atspi_dbus",
+        "before": { "state_ids": before },
+        "after": { "state_ids": after },
+        "verified": verified,
+        "verification": if verified { "confirmed" } else { "not_confirmed" },
+        "reason": if dispatched && !verified { Some("verification_failed") } else if !dispatched { Some("dispatch_rejected") } else { None },
+    }))
+}
+
+fn invoke_accessibility_element(
+    connection: &zbus::blocking::Connection,
+    target_id: &str,
+    bus: &str,
+    path: &str,
+    requested_action: &str,
+) -> Result<Value> {
+    let proxy = zbus::blocking::Proxy::new(connection, bus, path, "org.a11y.atspi.Action")?;
+    let count = proxy.call::<_, _, i32>("GetNActions", &())?.clamp(0, 32);
+    let mut index = None;
+    let mut advertised = Vec::new();
+    for candidate in 0..count {
+        if let Ok(name) = proxy.call::<_, _, String>("GetName", &candidate) {
+            if name == requested_action {
+                index = Some(candidate);
+            }
+            advertised.push(name);
+        }
+    }
+    let index = index.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Element does not advertise action {requested_action:?}; available: {}",
+            advertised.join(", ")
+        )
+    })?;
+    let before = accessibility_state(connection, bus, path);
+    let dispatched: bool = proxy.call("DoAction", &index)?;
+    thread::sleep(Duration::from_millis(100));
+    let after = accessibility_state(connection, bus, path);
+    let observable_change = before != after || (before.is_some() && after.is_none());
+    let verified = dispatched && observable_change;
+    Ok(json!({
+        "ok": dispatched,
+        "tool": "desktop_action",
+        "action": "invoke_element",
+        "target": target_id,
+        "element_action": requested_action,
+        "backend": "atspi_dbus",
+        "before": { "state_ids": before },
+        "after": { "state_ids": after },
+        "verified": verified,
+        "verification": if verified { "confirmed" } else if dispatched { "dispatch_confirmed" } else { "failed" },
+        "reason": if dispatched && !verified { Some("effect_not_observable_on_target") } else if !dispatched { Some("dispatch_rejected") } else { None },
+    }))
+}
+
+fn set_accessibility_text(
+    connection: &zbus::blocking::Connection,
+    target_id: &str,
+    bus: &str,
+    path: &str,
+    text: &str,
+) -> Result<Value> {
+    if text.len() > 64 * 1024 {
+        return Err(anyhow::anyhow!(
+            "set_field_text is limited to 65536 UTF-8 bytes"
+        ));
+    }
+    let before_hash = accessibility_text_hash(connection, bus, path);
+    let proxy = zbus::blocking::Proxy::new(connection, bus, path, "org.a11y.atspi.EditableText")?;
+    let dispatched: bool = proxy.call("SetTextContents", &text)?;
+    thread::sleep(Duration::from_millis(75));
+    let after_hash = accessibility_text_hash(connection, bus, path);
+    let expected_hash = sha256_text(text);
+    let verified = dispatched && after_hash.as_deref() == Some(expected_hash.as_str());
+    Ok(json!({
+        "ok": dispatched,
+        "tool": "desktop_action",
+        "action": "set_field_text",
+        "target": target_id,
+        "backend": "atspi_dbus",
+        "value": { "redacted": true, "sha256": expected_hash, "bytes": text.len(), "characters": text.chars().count() },
+        "before": { "sha256": before_hash },
+        "after": { "sha256": after_hash },
+        "verified": verified,
+        "verification": if verified { "confirmed" } else { "not_confirmed" },
+        "reason": if dispatched && !verified { Some("verification_failed") } else if !dispatched { Some("dispatch_rejected") } else { None },
+    }))
+}
+
+fn accessibility_state(
+    connection: &zbus::blocking::Connection,
+    bus: &str,
+    path: &str,
+) -> Option<Vec<u32>> {
+    let proxy =
+        zbus::blocking::Proxy::new(connection, bus, path, "org.a11y.atspi.Accessible").ok()?;
+    proxy.call("GetState", &()).ok()
+}
+
+fn accessibility_text_hash(
+    connection: &zbus::blocking::Connection,
+    bus: &str,
+    path: &str,
+) -> Option<String> {
+    let proxy = zbus::blocking::Proxy::new(connection, bus, path, "org.a11y.atspi.Text").ok()?;
+    let value: String = proxy.call("GetText", &(0i32, -1i32)).ok()?;
+    Some(sha256_text(&value))
+}
+
+fn sha256_text(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn accessibility_tree_fallback(limit: usize, native_error: &str) -> Result<Value> {
     let address = match atspi_bus_address() {
         Ok(address) => address,
         Err(error) => {
@@ -1113,12 +1765,13 @@ fn accessibility_tree(limit: usize) -> Result<Value> {
         .collect();
     Ok(json!({
         "ok": output.status == 0,
-        "backend": "atspi_busctl",
+        "backend": "atspi_busctl_fallback",
         "content": "object_paths_only",
         "count": items.len(),
         "items": items,
         "truncated": output.stdout.lines().count() > limit,
         "stderr": output.stderr,
+        "native_backend_error": native_error,
     }))
 }
 
@@ -1698,6 +2351,119 @@ fn clipboard_write_backend(backend: &str, text: &str) -> Result<DesktopCommandOu
             stderr: String::from("Clipboard backend unavailable."),
         }),
     }
+}
+
+pub(crate) fn desktop_clipboard_files(paths: &[PathBuf], operation: &str) -> Result<Value> {
+    if paths.is_empty() || paths.len() > 32 {
+        return Err(anyhow::anyhow!(
+            "file clipboard requires between 1 and 32 paths"
+        ));
+    }
+    if !matches!(operation, "copy" | "cut") {
+        return Err(anyhow::anyhow!(
+            "file clipboard operation must be copy or cut"
+        ));
+    }
+
+    let mut canonical = Vec::with_capacity(paths.len());
+    let mut seen = HashSet::new();
+    for path in paths {
+        let resolved = fs::canonicalize(path)
+            .map_err(|error| anyhow::anyhow!("cannot use {}: {error}", path.display()))?;
+        if seen.insert(resolved.clone()) {
+            canonical.push(resolved);
+        }
+    }
+    let backend = file_clipboard_backend();
+    if backend == "unavailable" {
+        return Ok(json!({
+            "ok": false,
+            "tool": "desktop_clipboard_files",
+            "operation": operation,
+            "reason": "dependency_unavailable",
+            "error": "File clipboard support requires wl-clipboard or xclip.",
+        }));
+    }
+
+    let uris = canonical
+        .iter()
+        .map(|path| file_uri(path))
+        .collect::<Result<Vec<_>>>()?;
+    let (mime, payload) = if operation == "cut" {
+        (
+            "x-special/gnome-copied-files",
+            format!("cut\n{}\n", uris.join("\n")),
+        )
+    } else {
+        ("text/uri-list", format!("{}\r\n", uris.join("\r\n")))
+    };
+    let output = match backend {
+        "wl-clipboard" => run_desktop_capture_with_stdin(&["wl-copy", "--type", mime], &payload)?,
+        "xclip" => run_desktop_capture_with_stdin(
+            &["xclip", "-selection", "clipboard", "-t", mime, "-i"],
+            &payload,
+        )?,
+        _ => unreachable!(),
+    };
+    thread::sleep(Duration::from_millis(75));
+    let types = clipboard_types(backend)?;
+    let advertised = types
+        .get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(mime)));
+    let verified = output.status == 0 && advertised;
+    Ok(json!({
+        "ok": output.status == 0,
+        "tool": "desktop_clipboard_files",
+        "operation": operation,
+        "backend": backend,
+        "item_count": canonical.len(),
+        "paths": canonical,
+        "content_returned": false,
+        "mime_type": mime,
+        "advertised_types": types,
+        "verified": verified,
+        "verification": if output.status != 0 { "failed" } else if verified { "confirmed" } else { "not_confirmed" },
+        "exit_code": output.status,
+        "stderr": output.stderr,
+    }))
+}
+
+fn file_clipboard_backend() -> &'static str {
+    if command_exists("wl-copy")
+        && command_exists("wl-paste")
+        && env::var_os("WAYLAND_DISPLAY").is_some()
+    {
+        "wl-clipboard"
+    } else if command_exists("xclip") && env::var_os("DISPLAY").is_some() {
+        "xclip"
+    } else {
+        "unavailable"
+    }
+}
+
+#[cfg(unix)]
+fn file_uri(path: &Path) -> Result<String> {
+    if !path.is_absolute() {
+        return Err(anyhow::anyhow!("file clipboard paths must be absolute"));
+    }
+    let mut uri = String::from("file://");
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(*byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut uri, "%{byte:02X}")?;
+        }
+    }
+    Ok(uri)
+}
+
+#[cfg(not(unix))]
+fn file_uri(_path: &Path) -> Result<String> {
+    Err(anyhow::anyhow!(
+        "file clipboard is not supported on this platform"
+    ))
 }
 
 #[derive(Debug)]
@@ -2376,7 +3142,8 @@ fn process_state(pid: i32) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        accessibility_tree_item, desktop_capabilities, desktop_observe, parse_busctl_string,
+        accessibility_target_id, accessibility_tree_item, bounded_accessible_text,
+        desktop_capabilities, desktop_observe, dialog_items, dialog_kind, parse_busctl_string,
         parse_pactl_mute, parse_pactl_volume_percent, parse_xrandr_displays,
         windows_host_volume_script,
     };
@@ -2457,6 +3224,65 @@ mod tests {
             Some("accessible_object")
         );
         assert!(accessibility_tree_item("├─/unrelated/path").is_none());
+    }
+
+    #[test]
+    fn accessibility_target_ids_are_snapshot_bound_and_deterministic() {
+        let first = accessibility_target_id("desktop-1", ":1.42", "/org/example/button/1");
+        let repeated = accessibility_target_id("desktop-1", ":1.42", "/org/example/button/1");
+        let newer = accessibility_target_id("desktop-2", ":1.42", "/org/example/button/1");
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, newer);
+        assert!(first.starts_with("ui-"));
+    }
+
+    #[test]
+    fn accessibility_text_is_bounded_by_characters() {
+        let text = format!("{}é", "a".repeat(300));
+        let bounded = bounded_accessible_text(&text);
+
+        assert_eq!(bounded.chars().count(), 256);
+        assert!(bounded.is_char_boundary(bounded.len()));
+    }
+
+    #[test]
+    fn classifies_protocol_dialog_roles_without_application_names() {
+        assert_eq!(dialog_kind("dialog"), Some("dialog"));
+        assert_eq!(dialog_kind("alert dialog"), Some("alert"));
+        assert_eq!(dialog_kind("file chooser"), Some("file_picker"));
+        assert_eq!(dialog_kind("push button"), None);
+    }
+
+    #[test]
+    fn groups_dialog_controls_by_accessibility_parentage() {
+        let items = vec![
+            json!({"id": "root", "parent_id": null, "role": "application"}),
+            json!({"id": "dialog", "parent_id": "root", "role": "file chooser"}),
+            json!({"id": "panel", "parent_id": "dialog", "role": "panel"}),
+            json!({"id": "name", "parent_id": "panel", "role": "text", "name": "Name"}),
+            json!({"id": "save", "parent_id": "dialog", "role": "push button", "name": "Save"}),
+            json!({"id": "outside", "parent_id": "root", "role": "push button"}),
+        ];
+
+        let dialogs = dialog_items(&items, 10);
+
+        assert_eq!(dialogs.len(), 1);
+        assert_eq!(
+            dialogs[0].get("dialog_kind").and_then(Value::as_str),
+            Some("file_picker")
+        );
+        let controls = dialogs[0]
+            .get("controls")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(controls.len(), 3);
+        assert!(controls
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some("name")));
+        assert!(!controls
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some("outside")));
     }
 
     #[test]
@@ -2580,6 +3406,40 @@ mod tests {
             .expect_err("missing clipboard value should fail");
 
         assert!(error.to_string().contains("requires --value"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_clipboard_uri_percent_encodes_path_bytes() {
+        let uri = super::file_uri(std::path::Path::new("/tmp/a file#1.txt")).expect("file URI");
+
+        assert_eq!(uri, "file:///tmp/a%20file%231.txt");
+    }
+
+    #[test]
+    fn partial_download_detection_is_case_insensitive_and_bounded_to_suffixes() {
+        assert!(super::is_partial_download_name("archive.zip.crdownload"));
+        assert!(super::is_partial_download_name("video.PART"));
+        assert!(!super::is_partial_download_name("part-notes.txt"));
+        assert!(!super::is_partial_download_name("archive.zip"));
+    }
+
+    #[test]
+    fn download_inventory_distinguishes_complete_and_partial_files() {
+        let directory =
+            std::env::temp_dir().join(format!("agent-download-test-{}", super::now_unix_millis()));
+        std::fs::create_dir(&directory).expect("create download test directory");
+        std::fs::write(directory.join("ready.zip"), b"ready").expect("write complete file");
+        std::fs::write(directory.join("pending.zip.part"), b"pending").expect("write partial file");
+
+        let inventory = super::download_inventory_at(&directory, 10).expect("download inventory");
+        std::fs::remove_dir_all(&directory).expect("remove download test directory");
+
+        assert_eq!(inventory.get("count").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            inventory.get("partial_count").and_then(Value::as_u64),
+            Some(1)
+        );
     }
 
     #[test]

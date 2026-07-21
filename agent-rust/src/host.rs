@@ -7,6 +7,7 @@ mod desktop;
 mod inventory;
 pub(crate) use desktop::desktop_action;
 pub(crate) use desktop::desktop_capabilities;
+pub(crate) use desktop::desktop_clipboard_files;
 pub(crate) use desktop::desktop_observe;
 pub(crate) use desktop::desktop_resolve;
 #[cfg(test)]

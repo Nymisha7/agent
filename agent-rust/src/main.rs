@@ -1,6 +1,13 @@
 use anyhow::Result;
 mod host;
 
+use agent_rust::{
+    delete_path, edit_file, glob_files, grep_files, read_path, resolve_search_roots,
+    resolve_target, search_files, system_search_roots, write_file, DeletePathOptions,
+    EditFileOptions, FileSearchOptions, GlobKind, GlobOptions, GrepOptions, ReadLimits,
+    ReadPathOptions, ResolveTargetOptions, SearchKind, SearchMode, SearchStrategy, TargetKind,
+    WriteFileOptions,
+};
 use clap::{Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -11,18 +18,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use host::{
-    connected_devices, desktop_action, desktop_capabilities, desktop_observe, desktop_resolve,
-    process_list, run_system_command, system_info,
+    connected_devices, desktop_action, desktop_capabilities, desktop_clipboard_files,
+    desktop_observe, desktop_resolve, process_list, run_system_command, system_info,
 };
 #[cfg(test)]
 use host::{valid_bluetooth_address, valid_identifier, valid_path_token, windows_device_category};
-use agent_rust::{
-    delete_path, edit_file, glob_files, grep_files, read_path, resolve_search_roots,
-    resolve_target, search_files, system_search_roots, write_file, DeletePathOptions,
-    EditFileOptions, FileSearchOptions, GlobKind, GlobOptions, GrepOptions, ReadLimits,
-    ReadPathOptions, ResolveTargetOptions, SearchKind, SearchMode, SearchStrategy, TargetKind,
-    WriteFileOptions,
-};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -71,6 +71,7 @@ enum Command {
     ProcessList(ProcessListArgs),
     RunSystemCommand(RunSystemCommandArgs),
     DesktopAction(DesktopActionArgs),
+    DesktopClipboardFiles(DesktopClipboardFilesArgs),
     Tui(TuiArgs),
 }
 
@@ -127,6 +128,18 @@ struct DesktopActionArgs {
     target: Option<String>,
     #[arg(long)]
     value: Option<String>,
+    #[arg(long, hide = true)]
+    backend_bus: Option<String>,
+    #[arg(long, hide = true)]
+    backend_path: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct DesktopClipboardFilesArgs {
+    #[arg(long = "path", required = true)]
+    paths: Vec<PathBuf>,
+    #[arg(long, default_value = "copy")]
+    operation: String,
 }
 
 #[derive(Debug, Parser)]
@@ -746,7 +759,15 @@ fn main() -> Result<()> {
                     &args.action,
                     args.target.as_deref(),
                     args.value.as_deref(),
+                    args.backend_bus.as_deref(),
+                    args.backend_path.as_deref(),
                 )?)?
+            );
+        }
+        Command::DesktopClipboardFiles(args) => {
+            println!(
+                "{}",
+                serde_json::to_string(&desktop_clipboard_files(&args.paths, &args.operation)?)?
             );
         }
         Command::Search(args) => {

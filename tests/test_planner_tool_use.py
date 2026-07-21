@@ -88,6 +88,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("process_list", tool_names)
         self.assertIn("run_system_command", tool_names)
         self.assertIn("desktop_action", tool_names)
+        self.assertIn("desktop_clipboard_files", tool_names)
         desktop_action = next(schema for schema in registry.schemas() if schema["name"] == "desktop_action")
         actions = desktop_action["parameters"]["properties"]["action"]["enum"]
         self.assertIn("focus_window", actions)
@@ -229,6 +230,41 @@ class PlannerToolUseTests(unittest.TestCase):
 
         self.assertEqual(result["scope"], "audio")
 
+    def test_desktop_observe_accepts_dialogs_scope(self) -> None:
+        class FakeRust:
+            def desktop_observe(self, *, scope: str, limit: int) -> dict[str, object]:
+                return {"ok": True, "tool": "desktop_observe", "scope": scope, "limit": limit}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_observe",
+            {"scope": "dialogs"},
+            ctx,
+        )
+
+        self.assertEqual(result["scope"], "dialogs")
+
+    def test_desktop_observe_accepts_downloads_scope(self) -> None:
+        class FakeRust:
+            def desktop_observe(self, *, scope: str, limit: int) -> dict[str, object]:
+                return {"ok": True, "tool": "desktop_observe", "scope": scope, "limit": limit}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_observe", {"scope": "downloads", "limit": 25}, ctx
+        )
+
+        self.assertEqual(result["scope"], "downloads")
+        self.assertEqual(result["limit"], 25)
+
     def test_desktop_resolve_is_read_only_and_bounded(self) -> None:
         class FakeRust:
             def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, object]:
@@ -335,6 +371,57 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("sha256:", result["requested_path"])
         self.assertIn("bytes:", result["requested_path"])
         self.assertNotIn("secret clipboard text", result["requested_path"])
+
+    def test_file_clipboard_requires_exact_path_set_approval(self) -> None:
+        class FakeRust:
+            def desktop_clipboard_files(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("file clipboard must not run before approval")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "notes.txt"
+            source.write_text("private contents", encoding="utf-8")
+            ctx = ToolContext(
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=root,
+                search_roots=[],
+            )
+            result = build_tool_registry(ctx).execute(
+                "desktop_clipboard_files",
+                {"paths": ["notes.txt"], "operation": "copy"},
+                ctx,
+            )
+
+        self.assertEqual(result["reason"], "desktop_action_requires_approval")
+        self.assertIn("sha256:", result["requested_path"])
+        self.assertIn("items:1", result["requested_path"])
+        self.assertNotIn("private contents", str(result))
+
+    def test_file_clipboard_runs_after_exact_approval(self) -> None:
+        class FakeRust:
+            def desktop_clipboard_files(self, **kwargs: Any) -> dict[str, object]:
+                return {"ok": True, "verified": True, **kwargs}
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "notes.txt"
+            source.write_text("contents", encoding="utf-8")
+            initial = ToolContext(rust=FakeRust(), workspace_root=root, search_roots=[])  # type: ignore[arg-type]
+            blocked = build_tool_registry(initial).execute(
+                "desktop_clipboard_files", {"paths": ["notes.txt"]}, initial
+            )
+            approved = ToolContext(
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=root,
+                search_roots=[],
+                approved_system_commands=[blocked["requested_path"]],
+            )
+            result = build_tool_registry(approved).execute(
+                "desktop_clipboard_files", {"paths": ["notes.txt"]}, approved
+            )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["paths"], [str(source)])
 
     def test_type_text_approval_key_redacts_content(self) -> None:
         class FakeRust:
@@ -615,6 +702,145 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(session.last_desktop_snapshot["snapshot_id"], "desktop-123")
         self.assertEqual(session.desktop_targets[0]["kind"], "window")
         self.assertEqual(session.desktop_targets[0]["target"], "0x3a00007")
+
+    def test_session_remembers_snapshot_bound_ui_elements(self) -> None:
+        session = AgentSession()
+
+        _update_session_from_tool_result(
+            session,
+            tool="desktop_observe",
+            args={"scope": "ui_tree"},
+            observation={
+                "ok": True,
+                "tool": "desktop_observe",
+                "snapshot_id": "desktop-456",
+                "observed_at_unix_ms": 456,
+                "scope": "ui_tree",
+                "ui_tree": {
+                    "items": [{
+                        "id": "ui-deadbeef",
+                        "snapshot_id": "desktop-456",
+                        "name": "Save",
+                        "role": "push button",
+                        "backend_ref": {
+                            "bus": ":1.42",
+                            "path": "/org/example/save",
+                        },
+                    }],
+                },
+            },
+            workspace_root=Path("/workspace"),
+        )
+
+        target = session.desktop_targets[0]
+        self.assertEqual(target["kind"], "ui_element")
+        self.assertEqual(target["target"], "ui-deadbeef")
+        self.assertEqual(target["snapshot_id"], "desktop-456")
+        self.assertEqual(target["backend_bus"], ":1.42")
+
+    def test_session_remembers_controls_from_dialog_observation(self) -> None:
+        session = AgentSession()
+        backend = {"bus": ":1.42", "path": "/org/example/dialog"}
+        control_backend = {"bus": ":1.42", "path": "/org/example/dialog/save"}
+
+        _update_session_from_tool_result(
+            session,
+            tool="desktop_observe",
+            args={"scope": "dialogs"},
+            observation={
+                "ok": True,
+                "tool": "desktop_observe",
+                "snapshot_id": "desktop-dialog",
+                "scope": "dialogs",
+                "dialogs": {
+                    "items": [{
+                        "id": "ui-dialog",
+                        "snapshot_id": "desktop-dialog",
+                        "role": "file chooser",
+                        "backend_ref": backend,
+                        "controls": [{
+                            "id": "ui-save",
+                            "snapshot_id": "desktop-dialog",
+                            "name": "Save",
+                            "role": "push button",
+                            "actions": ["click"],
+                            "backend_ref": control_backend,
+                        }],
+                    }],
+                },
+            },
+            workspace_root=Path("/workspace"),
+        )
+
+        targets = {item["id"]: item for item in session.desktop_targets}
+        self.assertEqual(targets["ui-dialog"]["role"], "file chooser")
+        self.assertEqual(targets["ui-save"]["name"], "Save")
+        self.assertEqual(targets["ui-save"]["actions_json"], '["click"]')
+
+    def test_preflight_resolves_latest_ui_element_backend_reference(self) -> None:
+        session = AgentSession(
+            last_desktop_snapshot={"snapshot_id": "desktop-456"},
+            desktop_targets=[{
+                "kind": "ui_element",
+                "id": "ui-deadbeef",
+                "target": "ui-deadbeef",
+                "snapshot_id": "desktop-456",
+                "backend_bus": ":1.42",
+                "backend_path": "/org/example/save",
+                "actions_json": '["click"]',
+            }],
+        )
+        call = ModelToolCall(
+            name="desktop_action",
+            call_id="invoke-save",
+            arguments={"action": "invoke_element", "target": "ui-deadbeef", "value": "click"},
+        )
+
+        result = _preflight_tool_call(
+            call,
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=session,
+            user_prompt="click Save",
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(call.arguments["_backend_bus"], ":1.42")
+        self.assertEqual(call.arguments["_backend_path"], "/org/example/save")
+
+    def test_preflight_rejects_stale_ui_element(self) -> None:
+        session = AgentSession(
+            last_desktop_snapshot={"snapshot_id": "desktop-new"},
+            desktop_targets=[{
+                "kind": "ui_element",
+                "id": "ui-old",
+                "target": "ui-old",
+                "snapshot_id": "desktop-old",
+                "backend_bus": ":1.42",
+                "backend_path": "/org/example/old",
+            }],
+        )
+
+        result = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="focus-old",
+                arguments={"action": "focus_element", "target": "ui-old"},
+            ),
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=session,
+            user_prompt="focus it",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["reason"], "desktop_element_not_observed")
 
     def test_preflight_blocks_unobserved_window_action(self) -> None:
         ctx = ToolContext(
