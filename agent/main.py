@@ -43,6 +43,8 @@ from .rust_tools import RustTools
 from .session_store import SessionInfo, SessionStore, TokenUsage
 from .skills import SkillCatalog, discover_skill_catalog
 from .system_events import drain_system_events, resolve_main_system_event_session_key
+from .tool_groups import grouped_tool_names
+from .tools import ToolContext, build_tool_registry
 
 if TYPE_CHECKING:
     from .gateway_impl import AgentGateway
@@ -108,8 +110,7 @@ LOCAL_COMMANDS = (
     ("/model", "Choose a model or local runtime"),
     ("/install", "Install an open-source/open-weight model locally"),
     ("/reasoning", "Set reasoning effort for supported models"),
-    ("/devices", "Show devices visible to this runtime"),
-    ("/capabilities", "Show agent tools, safety, and current model features"),
+    ("/tools", "Show enabled tools grouped by purpose and approval policy"),
     ("/skills", "Show layered workspace and personal skills"),
     ("/gateway", "Show control-plane routing and session status"),
     ("/status", "Show model, context, and session usage"),
@@ -830,10 +831,10 @@ def resolve_rust_bin(
 
     for candidate_root in candidate_roots:
         for candidate in (
-            candidate_root / "agent-rust" / "target" / "debug" / "agent-rust",
             candidate_root / "agent-rust" / "target" / "release" / "agent-rust",
-            candidate_root / "target" / "debug" / "agent-rust",
+            candidate_root / "agent-rust" / "target" / "debug" / "agent-rust",
             candidate_root / "target" / "release" / "agent-rust",
+            candidate_root / "target" / "debug" / "agent-rust",
         ):
             if candidate.exists():
                 return candidate.resolve()
@@ -1022,6 +1023,7 @@ def _run_prompt_turn(
                 workspace_root=str(ctx.workspace_root),
                 search_roots=[str(root) for root in ctx.search_roots],
                 user_prompt=agent_prompt,
+                user_visible_prompt=prompt,
                 session=ctx.session,
                 stored_context=ctx.stored_context,
                 conversation_history=conversation_history,
@@ -1186,15 +1188,9 @@ def repl(ctx: AppContext) -> int:
 
 def create_new_session(args: argparse.Namespace, store: SessionStore) -> SessionInfo:
     workspace_root = default_workspace_root(args)
+    config = _load_startup_config(args, workspace_root)
     channel = getattr(args, "channel", None)
     if channel:
-        explicit_config = getattr(args, "config", None)
-        config_path = (
-            Path(explicit_config).expanduser().resolve()
-            if explicit_config
-            else None
-        )
-        config = load_agent_config(workspace_root, explicit_path=config_path)
         routed = start_gateway(config=config, store=store).open_session(
             create_inbound_address(
                 channel=channel,
@@ -1210,11 +1206,91 @@ def create_new_session(args: argparse.Namespace, store: SessionStore) -> Session
             model=args.model,
         )
         return routed.session
+    provider = args.provider
+    model = args.model
+    if provider is None and model is None:
+        remembered = _latest_workspace_llm_config(
+            store,
+            workspace_root,
+            config=config,
+            agent_id=config.default_agent_id,
+        )
+        if remembered is not None:
+            provider, model = remembered
     return store.create_session(
         workspace_root=workspace_root,
-        provider=args.provider,
-        model=args.model,
+        provider=provider,
+        model=model,
+        agent_id=config.default_agent_id,
     )
+
+
+def _load_startup_config(args: argparse.Namespace, workspace_root: Path) -> AgentConfig:
+    explicit_config = getattr(args, "config", None)
+    config_path = (
+        Path(explicit_config).expanduser().resolve()
+        if explicit_config
+        else None
+    )
+    return load_agent_config(workspace_root, explicit_path=config_path)
+
+
+def _latest_workspace_llm_config(
+    store: SessionStore,
+    workspace_root: Path,
+    *,
+    config: AgentConfig,
+    agent_id: str,
+) -> tuple[str | None, str | None] | None:
+    workspace_key = _workspace_root_key(workspace_root)
+    for session in store.list_sessions(limit=None):
+        if _workspace_root_key(session.workspace_root) != workspace_key:
+            continue
+        if _effective_session_agent_id(session, config) != agent_id:
+            continue
+        if session.provider or session.model:
+            return session.provider, session.model
+    return None
+
+
+def _effective_session_agent_id(session: SessionInfo, config: AgentConfig) -> str:
+    return session.agent if session.agent in config.agents else config.default_agent_id
+
+
+def _workspace_root_key(path: Path | str) -> str:
+    raw = str(path).strip()
+    wsl_key = _wsl_mount_workspace_key(raw)
+    if wsl_key is not None:
+        return wsl_key
+    drive_key = _windows_drive_workspace_key(raw)
+    if drive_key is not None:
+        return drive_key
+    resolved = str(Path(path).expanduser().resolve())
+    wsl_key = _wsl_mount_workspace_key(resolved)
+    if wsl_key is not None:
+        return wsl_key
+    drive_key = _windows_drive_workspace_key(resolved)
+    if drive_key is not None:
+        return drive_key
+    return os.path.normcase(resolved).replace("\\", "/")
+
+
+def _wsl_mount_workspace_key(value: str) -> str | None:
+    normalized = value.replace("\\", "/")
+    match = re.match(r"^/mnt/([A-Za-z])/(.+)$", normalized)
+    if not match:
+        return None
+    drive, rest = match.groups()
+    return f"{drive}:/{rest}".rstrip("/").casefold()
+
+
+def _windows_drive_workspace_key(value: str) -> str | None:
+    normalized = value.replace("\\", "/")
+    match = re.match(r"^([A-Za-z]):/(.+)$", normalized)
+    if not match:
+        return None
+    drive, rest = match.groups()
+    return f"{drive}:/{rest}".rstrip("/").casefold()
 
 
 def choose_session(store: SessionStore) -> SessionInfo | None:
@@ -1348,19 +1424,8 @@ def _handle_local_command(
     if command == "/status":
         return _status_text(ctx)
 
-    if command == "/devices":
-        if len(parts) > 2:
-            return "Usage: /devices [category]"
-        scope = parts[1].casefold() if len(parts) == 2 else "all"
-        if len(scope) > 64 or not re.fullmatch(r"[a-z0-9_-]+", scope):
-            return "Device category may contain only letters, numbers, hyphens, and underscores."
-        try:
-            return _devices_text(ctx.rust.connected_devices(scope=scope))
-        except (OSError, RuntimeError, TimeoutError) as exc:
-            return f"Could not inspect connected devices: {exc}"
-
-    if command == "/capabilities":
-        return _capabilities_text(ctx)
+    if command == "/tools":
+        return _tools_text(ctx)
 
     if command == "/skills":
         return ctx.skills.status_text()
@@ -3024,54 +3089,102 @@ def _format_loaded_local_model(item: dict[str, Any]) -> str:
     return f"{model}{suffix}"
 
 
-def _capabilities_text(ctx: AppContext) -> str:
-    effort = getattr(ctx.llm, "reasoning_effort", None)
-    desktop_line = "Desktop: runtime capability discovery unavailable"
-    try:
-        desktop = ctx.rust.desktop_capabilities()
-        actions = desktop.get("actions", []) if isinstance(desktop, dict) else []
-        backends = desktop.get("backends", {}) if isinstance(desktop, dict) else {}
-        observation = backends.get("desktop_observation", {}) if isinstance(backends, dict) else {}
-        if isinstance(actions, list):
-            available = [
-                action.get("action")
-                for action in actions
-                if isinstance(action, dict) and action.get("available") is True
-            ]
-            observe_text = (
-                "desktop observation available"
-                if isinstance(observation, dict) and observation.get("available") is True
-                else "desktop observation unavailable"
-            )
-            desktop_line = (
-                "Desktop: "
-                + (
-                    f"{len(available)} runtime-supported approved actions; {observe_text}"
-                    if available
-                    else f"no approved actions currently supported by this runtime; {observe_text}"
-                )
-            )
-    except Exception:
-        pass
-    return "\n".join([
-        "Agent capabilities",
-        f"Current model: {_model_source_label(_active_provider(ctx))} · {ctx.llm.model}",
-        f"Reasoning effort: {effort or 'provider controlled'}",
-        "",
-        "Workspace: discover, search, read, create, edit, delete, and verify files",
-        "Code intelligence: symbols, definitions, and references through configured language servers",
-        "Host visibility: system, devices, processes, ports, and allowlisted service controls",
-        desktop_line,
-        "Safety: external-path approvals, explicit deletion authorization, workspace-root protection",
-        "Verification: write/edit hashes and delete postconditions are checked on disk",
-        "Interaction: queued follow-ups, cancellable turns/downloads, model and reasoning selectors",
-        "Control plane: deterministic channel routing, durable scoped sessions, lifecycle hooks",
-        "Skills: layered SKILL.md discovery with profile allowlists and runtime requirement checks",
-        "Extensions: registered channel adapters and observer hooks cannot bypass tool policy",
-        "Subagents: one isolated, sequential, discovery-only child; the parent owns all mutations",
-        "",
-        "Raw private chain-of-thought is not shown. The activity panel exposes tool calls, results, and guardrails.",
-    ])
+
+def _tools_text(ctx: AppContext) -> str:
+    workspace_root = Path(getattr(ctx, "workspace_root", Path.cwd())).expanduser().resolve()
+    search_roots = [
+        Path(root).expanduser().resolve()
+        for root in getattr(ctx, "search_roots", [workspace_root])
+    ]
+    tool_ctx = ToolContext(
+        rust=ctx.rust,
+        workspace_root=workspace_root,
+        search_roots=search_roots,
+        skill_catalog=getattr(ctx, "skills", None),
+    )
+    schemas = build_tool_registry(tool_ctx).schemas()
+    allowlist = getattr(ctx, "tool_allowlist", None)
+    allowed = set(allowlist) if allowlist is not None else None
+    by_name = {
+        str(schema.get("name")): schema
+        for schema in schemas
+        if isinstance(schema.get("name"), str)
+    }
+    enabled_names = {
+        name for name in by_name
+        if allowed is None or name in allowed
+    }
+    lines = [
+        "Agent tools",
+        f"Profile: {getattr(ctx, 'agent_id', 'main')}",
+        f"Enabled: {len(enabled_names)} of {len(by_name)}",
+    ]
+    if allowed is not None:
+        lines.append(f"Disabled by profile allowlist: {len(set(by_name) - enabled_names)}")
+    lines.append("")
+
+    for group, names in grouped_tool_names(set(by_name)):
+        visible = [name for name in names if name in enabled_names]
+        hidden = [name for name in names if name not in enabled_names]
+        if not visible and not hidden:
+            continue
+        suffix = f" ({len(visible)} enabled"
+        if hidden:
+            suffix += f", {len(hidden)} disabled"
+        suffix += ")"
+        lines.append(f"{group.label}{suffix}")
+        lines.append(group.summary)
+        for name in visible:
+            schema = by_name[name]
+            description = _tool_schema_description(schema)
+            signature = _tool_schema_signature(schema)
+            policy = _tool_policy_label(name)
+            lines.append(f"- {name}{signature} [{policy}] - {description}")
+        if hidden:
+            lines.append(f"- disabled: {', '.join(hidden)}")
+        lines.append("")
+
+    lines.append("Use /status for session/model state. Ask natural questions for live host or desktop inspection.")
+    return "\n".join(lines).rstrip()
+
+
+def _tool_schema_description(schema: dict[str, Any]) -> str:
+    description = str(schema.get("description") or "").strip()
+    return truncate(" ".join(description.split()), 120) if description else "No description."
+
+
+def _tool_schema_signature(schema: dict[str, Any]) -> str:
+    parameters = schema.get("parameters")
+    parameters = parameters if isinstance(parameters, dict) else {}
+    properties = parameters.get("properties")
+    properties = properties if isinstance(properties, dict) else {}
+    required = set(parameters.get("required") or [])
+    if not properties:
+        return ""
+    names = list(properties)[:3]
+    parts = [
+        name if name in required else f"{name}?"
+        for name in names
+    ]
+    if len(properties) > len(names):
+        parts.append("...")
+    return f"({', '.join(parts)})"
+
+
+def _tool_policy_label(name: str) -> str:
+    if name in {"write_file", "edit_file"}:
+        return "writes files"
+    if name == "delete_path":
+        return "requires explicit delete request"
+    if name in {"desktop_action", "desktop_send_message", "desktop_clipboard_files"}:
+        return "requires approval"
+    if name == "run_system_command":
+        return "allowlisted; service changes require approval"
+    if name == "language_server":
+        return "read-mostly; lifecycle actions scoped"
+    if name in {"load_skill", "discovery_subagent"}:
+        return "instructions/read-only"
+    return "read-only"
 
 
 def _gateway_text(ctx: AppContext) -> str:
@@ -3120,125 +3233,6 @@ def _gateway_control_snapshot(ctx: AppContext) -> dict[str, Any]:
             ),
         })
     return snapshot
-
-
-def _devices_text(payload: Any) -> str:
-    if not isinstance(payload, dict) or payload.get("ok") is False:
-        detail = payload.get("error") if isinstance(payload, dict) else None
-        return f"Could not inspect connected devices{f': {detail}' if detail else '.'}"
-
-    runtime = str(payload.get("runtime") or "unknown")
-    visibility = str(payload.get("visibility") or "runtime visible")
-    lines = ["Connected devices", f"Runtime: {runtime} · Visibility: {visibility}"]
-    limitations = payload.get("limitations")
-    availability = payload.get("availability")
-    availability = availability if isinstance(availability, dict) else {}
-    category_payload = payload.get("categories")
-    if isinstance(category_payload, dict):
-        discovered = {
-            str(category): section
-            for category, section in category_payload.items()
-            if isinstance(category, str) and isinstance(section, dict)
-        }
-        preferred = [
-            "usb", "bluetooth", "storage", "network", "audio",
-            "display", "camera", "printer", "input", "power",
-        ]
-        category_names = [name for name in preferred if name in discovered]
-        category_names.extend(sorted(name for name in discovered if name not in preferred))
-    else:
-        discovered = {}
-        category_names = [
-            category for category in (
-                "usb", "bluetooth", "storage", "network", "audio",
-                "display", "camera", "printer", "input", "power", "other",
-            )
-            if category in payload
-        ]
-
-    for category in category_names:
-        section = discovered.get(category)
-        records = section.get("records") if isinstance(section, dict) else payload.get(category)
-        records = records if isinstance(records, list) else []
-        state = section.get("state") if isinstance(section, dict) else availability.get(category)
-        available = state.get("available") if isinstance(state, dict) else True
-        lines.extend(["", f"{category.replace('_', ' ').title()} ({len(records)})"])
-        if not records:
-            lines.append("- No visible devices" if available else "- Unavailable from this runtime")
-            continue
-        visible_records = records[:50]
-        for record in visible_records:
-            if not isinstance(record, dict):
-                continue
-            name = _device_record_name(record)
-            status = str(record.get("status") or "unknown")
-            details = _device_record_details(category, record)
-            suffix = f" · {' · '.join(details)}" if details else ""
-            lines.append(f"- {name} — {status}{suffix}")
-        if len(records) > len(visible_records):
-            lines.append(f"- … {len(records) - len(visible_records)} more; use /devices {category} to focus")
-    if isinstance(limitations, list) and limitations:
-        lines.extend(["", "Limitations"])
-        lines.extend(f"- {item}" for item in limitations if isinstance(item, str))
-    return "\n".join(lines)
-
-
-def _device_record_name(record: dict[str, Any]) -> str:
-    for key in ("product", "device_name", "model", "name", "id"):
-        value = record.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return "Unnamed device"
-
-
-def _device_record_details(category: str, record: dict[str, Any]) -> list[str]:
-    details: list[str] = []
-    if category == "network":
-        interface_type = record.get("interface_type")
-        ssid = record.get("ssid")
-        addresses = record.get("addresses")
-        if interface_type:
-            details.append(str(interface_type))
-        if ssid:
-            details.append(f"SSID {ssid}")
-        if isinstance(addresses, list) and addresses:
-            details.append(", ".join(str(value) for value in addresses[:3]))
-    elif category == "storage":
-        size = record.get("size_bytes")
-        mounts = record.get("mount_points")
-        if isinstance(size, int) and size > 0:
-            details.append(_format_device_bytes(size))
-        if isinstance(mounts, list) and mounts:
-            details.append("mounted at " + ", ".join(str(value) for value in mounts[:3]))
-        if record.get("removable") is True:
-            details.append("removable")
-    elif category == "bluetooth":
-        battery = record.get("battery_percent")
-        if isinstance(battery, (int, float)):
-            details.append(f"battery {battery:g}%")
-    elif category == "display":
-        mode = record.get("active_mode")
-        if mode:
-            details.append(str(mode))
-    elif category == "power":
-        capacity = record.get("capacity_percent")
-        if isinstance(capacity, (int, float)):
-            details.append(f"{capacity:g}%")
-    if record.get("source_runtime") == "windows_host":
-        details.append("Windows host")
-    native_class = record.get("native_class")
-    if category == "other" and isinstance(native_class, str) and native_class:
-        details.append(f"class {native_class}")
-    return details
-
-
-def _format_device_bytes(value: int) -> str:
-    amount = float(value)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if amount < 1000 or unit == "TB":
-            return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} {unit}"
-        amount /= 1000
-    return f"{value} B"
 
 
 def _status_context_lines(ctx: Any) -> list[str]:
@@ -3870,7 +3864,7 @@ def _palette_selected_index(prompt: str, entries: list[PaletteEntry]) -> int:
         return 0
     if _normalized_command_prompt(prompt).startswith("/model"):
         for index, entry in enumerate(entries):
-            if entry.execute:
+            if _palette_entry_selectable(entry):
                 return index
     return 0
 
@@ -4441,7 +4435,7 @@ def _slash_command_lines(prompt: str, width: int, *, selected_index: int = 0) ->
     title = _slash_palette_title(prompt)
     lines = [_clip_line(title, width)]
     visible_count = 8
-    selected_index = min(max(0, selected_index), len(entries) - 1)
+    selected_index = _selectable_palette_index(entries, selected_index)
     start = min(
         max(0, selected_index - visible_count + 1),
         max(0, len(entries) - visible_count),
@@ -4713,7 +4707,24 @@ def _selected_palette_entry(prompt: str, selected_index: int) -> PaletteEntry | 
     entries = _slash_palette_entries(prompt)
     if not entries:
         return None
-    return entries[min(max(0, selected_index), len(entries) - 1)]
+    return entries[_selectable_palette_index(entries, selected_index)]
+
+
+def _selectable_palette_index(entries: list[PaletteEntry], selected_index: int) -> int:
+    selected_index = min(max(0, selected_index), len(entries) - 1)
+    if _palette_entry_selectable(entries[selected_index]):
+        return selected_index
+    for index in range(selected_index + 1, len(entries)):
+        if _palette_entry_selectable(entries[index]):
+            return index
+    for index in range(selected_index - 1, -1, -1):
+        if _palette_entry_selectable(entries[index]):
+            return index
+    return selected_index
+
+
+def _palette_entry_selectable(entry: PaletteEntry) -> bool:
+    return not entry.value.startswith("section:")
 
 
 def _complete_slash_command(prompt: str) -> str | None:
@@ -4851,7 +4862,7 @@ def _approval_panel_lines(approvals: dict[str, Any], width: int) -> list[str]:
     lines = [_clip_line("Approvals", width), ""]
     for index, item in enumerate(pending_items[:6], start=1):
         tool = _approval_text(item.get("tool"))
-        path = _approval_text(item.get("translated_path") or item.get("resolved_path") or item.get("requested_path"))
+        path = _approval_display_text(item)
         reason = _approval_text(item.get("reason"))
         prefix = ">" if index - 1 == selected_index else " "
         lines.append(_clip_line(f"{prefix} {index}. {tool}", width))
@@ -4871,6 +4882,34 @@ def _approval_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return ""
+
+
+def _approval_display_text(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    raw = _approval_text(
+        item.get("display_path")
+        or item.get("translated_path")
+        or item.get("resolved_path")
+        or item.get("requested_path")
+    ).strip()
+    if not raw:
+        return ""
+    parts = raw.split()
+    if len(parts) >= 3 and parts[0] == "desktop":
+        action = parts[1]
+        target = parts[2]
+        if target.startswith(("windows-app:", "windows-shortcut:")):
+            label = parts[-1] if ":" not in parts[-1] else "selected app"
+            return f"desktop {action} {label}"
+        if action in {"focus_window", "close_window", "minimize_window", "maximize_window", "restore_window"}:
+            try:
+                int(target[2:] if target.lower().startswith("0x") else target, 16 if target.lower().startswith("0x") else 10)
+            except ValueError:
+                pass
+            else:
+                return f"desktop {action} selected window"
+    return raw
 
 
 def _compact_usage_text(session: SessionInfo, model: str, provider: str = "openai") -> str:

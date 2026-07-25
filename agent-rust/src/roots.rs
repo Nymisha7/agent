@@ -122,7 +122,11 @@ fn locator_config_path() -> Option<PathBuf> {
     }
 
     if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(config_home).join("agent").join("locator_roots"));
+        return Some(
+            PathBuf::from(config_home)
+                .join("agent")
+                .join("locator_roots"),
+        );
     }
 
     env::var_os("HOME").map(|home| {

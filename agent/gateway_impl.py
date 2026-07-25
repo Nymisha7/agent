@@ -33,6 +33,7 @@ from .system_events import (
     resolve_main_system_event_session_key,
 )
 from .system_presence import list_system_presence, update_system_presence
+from .tool_groups import TOOL_GROUPS, tool_group_for
 
 
 DEFAULT_ACCOUNT_ID = "default"
@@ -899,14 +900,7 @@ class AgentGateway:
         return {
             "agentId": agent_id,
             "tools": tools,
-            "groups": [
-                {
-                    "id": "core",
-                    "label": "Core",
-                    "source": "core",
-                    "tools": [tool["name"] for tool in tools if tool["source"] == "core"],
-                }
-            ],
+            "groups": _tools_catalog_groups(tools),
         }
 
     def _tools_effective_method(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -3163,15 +3157,9 @@ def _agent_command_inventory() -> list[dict[str, Any]]:
             ],
         },
         {
-            "name": "devices",
-            "description": descriptions.get("/devices", "Show devices visible to this runtime"),
-            "textAliases": ["/devices"],
-            "args": [{"name": "category", "type": "string", "required": False}],
-        },
-        {
-            "name": "capabilities",
-            "description": descriptions.get("/capabilities", "Show agent tools, safety, and current model features"),
-            "textAliases": ["/capabilities"],
+            "name": "tools",
+            "description": descriptions.get("/tools", "Show enabled tools grouped by purpose and approval policy"),
+            "textAliases": ["/tools"],
             "args": [],
         },
         {
@@ -3284,15 +3272,47 @@ def _tools_catalog_rows(config: AgentConfig, agent_id: str) -> list[dict[str, An
         name = str(schema.get("name") or "")
         if not name:
             continue
+        group = tool_group_for(name)
         rows.append({
             "name": name,
             "description": str(schema.get("description") or ""),
             "source": "core",
+            "group": group.id if group is not None else "other",
             "optional": False,
             "enabled": allowed is None or name in allowed,
             "schema": dict(schema),
         })
     return rows
+
+
+def _tools_catalog_groups(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    remaining = {str(tool.get("name")) for tool in tools if tool.get("name")}
+    groups: list[dict[str, Any]] = []
+    for group in TOOL_GROUPS:
+        names = [
+            str(tool.get("name"))
+            for tool in tools
+            if tool.get("name") in group.tools
+        ]
+        if not names:
+            continue
+        remaining.difference_update(names)
+        groups.append({
+            "id": group.id,
+            "label": group.label,
+            "source": "core",
+            "description": group.summary,
+            "tools": names,
+        })
+    if remaining:
+        groups.append({
+            "id": "other",
+            "label": "Other",
+            "source": "core",
+            "description": "Tools that are not assigned to a product area yet.",
+            "tools": sorted(remaining),
+        })
+    return groups
 
 
 def _tools_effective_session_key(payload: Mapping[str, Any]) -> str:

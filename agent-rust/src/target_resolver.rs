@@ -293,7 +293,7 @@ fn search_scope_staged(
         .map(|stage| stage.strategy)
         .collect::<Vec<_>>();
     let staged_results = search_files_staged(options, &strategies)?;
-    for (stage, mut staged) in stages.iter().zip(staged_results.into_iter()) {
+    for (stage, mut staged) in stages.iter().zip(staged_results) {
         rank_matches_by_hint(&mut staged.matches, hint);
 
         attempts.push(ResolveAttempt {
@@ -312,7 +312,8 @@ fn search_scope_staged(
             continue;
         }
 
-        if staged.matches.len() == 1 {
+        if staged.matches.len() == 1 && !matches!(stage.confidence, ResolveConfidence::FuzzySearch)
+        {
             let item = &staged.matches[0];
 
             return Ok(Some(ResolveTargetResult::Resolved {
@@ -326,13 +327,18 @@ fn search_scope_staged(
             }));
         }
 
+        let reason = if staged.matches.len() == 1 {
+            "single low-confidence fuzzy target found"
+        } else {
+            "multiple matching targets found"
+        };
         return Ok(Some(ResolveTargetResult::Candidates {
             query: query.to_string(),
             candidates: staged.matches,
             source: stage.source.clone(),
             confidence: stage.confidence.clone(),
             attempts: attempts.clone(),
-            reason: "multiple matching targets found".to_string(),
+            reason: reason.to_string(),
         }));
     }
 
@@ -580,4 +586,50 @@ fn path_hint_score(path: &Path, hint: &SearchHint) -> usize {
         .iter()
         .filter(|token| path_text.contains(token.as_str()))
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn single_fuzzy_match_stays_a_candidate() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agent-target-resolver-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("calculator")).expect("create test root");
+        fs::write(root.join("calculator/make_projected.h"), "").expect("create fuzzy candidate");
+
+        let result = resolve_target(ResolveTargetOptions {
+            raw_target: "calculator_project".to_string(),
+            workspace_root: root.clone(),
+            focus_path: None,
+            kind: TargetKind::Any,
+            limit: 10,
+            allow_system_fallback: false,
+            allow_contains_fallback: true,
+            allow_fuzzy_fallback: true,
+        })
+        .expect("resolve target");
+
+        fs::remove_dir_all(root).expect("remove test root");
+        match result {
+            ResolveTargetResult::Candidates {
+                confidence,
+                candidates,
+                ..
+            } => {
+                assert!(matches!(confidence, ResolveConfidence::FuzzySearch));
+                assert_eq!(candidates.len(), 1);
+            }
+            other => panic!("expected a low-confidence candidate, got {other:?}"),
+        }
+    }
 }

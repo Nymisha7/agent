@@ -1,10 +1,12 @@
 from pathlib import Path
 import json
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
 from agent.language_servers import default_language_servers, language_server_context_text
-from agent.planner import run_agent
+from agent.planner import AgentSession, _bounded_recent_history, run_agent
 
 
 def test_planner_has_no_commented_out_or_rule_router_functions() -> None:
@@ -19,9 +21,33 @@ def test_planner_has_no_commented_out_or_rule_router_functions() -> None:
         "_should_offer_tools",
         "_preclassified_local_route",
         "_obvious_local_chat_prompt",
+        "_local_gate_messages",
+        "_local_tools_for_route",
+        "LOCAL_GATE_PROMPT",
     ):
         assert removed_name not in source
     assert "what applications are open" not in source
+
+
+def test_bounded_history_preserves_each_recent_turn() -> None:
+    history = [
+        {"role": "user", "content": "first request"},
+        {"role": "assistant", "content": "a" * 4_000},
+        {"role": "user", "content": "open my spark"},
+        {"role": "assistant", "content": "b" * 4_000},
+    ]
+
+    bounded = _bounded_recent_history(history, max_messages=4, max_chars=2_000)
+
+    assert [item["role"] for item in bounded] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert bounded[0]["content"] == "first request"
+    assert bounded[2]["content"] == "open my spark"
+    assert sum(len(item["content"]) for item in bounded) <= 2_000
 
 
 class RecordingLLM:
@@ -36,19 +62,7 @@ class RecordingLLM:
         self.tool_choices.append(kwargs.get("tool_choice"))
         self.tool_counts.append(len(kwargs.get("tools", [])))
         self.messages.append(list(kwargs.get("messages", [])))
-        if self.calls == 1:
-            if not kwargs.get("tools"):
-                return SimpleNamespace(output=[], output_text="How can I help?")
-            return SimpleNamespace(
-                output=[{
-                    "type": "function_call",
-                    "name": "finish_task",
-                    "call_id": "finish-1",
-                    "arguments": '{"answer":"ok"}',
-                }],
-                output_text="",
-            )
-        return SimpleNamespace(output=[], output_text="")
+        return SimpleNamespace(output=[], output_text="ok")
 
 
 class FakeRust:
@@ -121,10 +135,10 @@ def test_conversational_prompt_still_leaves_tool_choice_to_model() -> None:
     assert llm.tool_choices == [None]
 
 
-class LocalGateLLM:
+class LocalLLM:
     mode = "local"
 
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(self, responses: list[Any]) -> None:
         self.responses = responses
         self.requests: list[dict[str, Any]] = []
 
@@ -132,7 +146,18 @@ class LocalGateLLM:
         self.requests.append(kwargs)
         response_index = len(self.requests) - 1
         if response_index < len(self.responses):
-            return SimpleNamespace(output=[], output_text=self.responses[response_index])
+            response = self.responses[response_index]
+            if isinstance(response, tuple):
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "finish_task",
+                        "call_id": f"finish-{response_index}",
+                        "arguments": json.dumps({"answer": response[1]}),
+                    }],
+                    output_text="",
+                )
+            return SimpleNamespace(output=[], output_text=response)
         return SimpleNamespace(
             output=[{
                 "type": "function_call",
@@ -144,8 +169,8 @@ class LocalGateLLM:
         )
 
 
-def test_local_conversation_gate_keeps_simple_chat_tool_free() -> None:
-    llm = LocalGateLLM(["CHAT", "Hello!"])
+def test_local_conversation_uses_one_agent_call() -> None:
+    llm = LocalLLM(["Hello!"])
 
     answer = run_agent(
         llm=llm,
@@ -155,36 +180,304 @@ def test_local_conversation_gate_keeps_simple_chat_tool_free() -> None:
     )
 
     assert answer == "Hello!"
-    assert len(llm.requests) == 2
-    assert llm.requests[0]["tools"] == []
-    assert llm.requests[1]["tools"] == []
+    assert len(llm.requests) == 1
+    assert llm.requests[0]["tools"]
+    assert llm.requests[0]["tool_choice"] is None
 
 
-def test_local_chat_retries_fenced_tool_json_as_normal_text() -> None:
-    llm = LocalGateLLM([
-        "CHAT",
-        (
-            "```json\n"
-            '{"name":"secret_scan","arguments":{"path":"/workspace"}}\n'
-            "```"
-        ),
-        "I cannot retrieve live weather without a weather source.",
-    ])
+def test_local_router_artifact_does_not_leak_to_user() -> None:
+    llm = LocalLLM(["<|im_start|>"])
 
     answer = run_agent(
         llm=llm,
         rust=object(),
         workspace_root=".",
-        user_prompt="what is the weather today?",
+        user_prompt="hi",
     )
 
-    assert answer == "I cannot retrieve live weather without a weather source."
+    assert answer == "I could not produce a final answer."
+    assert len(llm.requests) == 1
+    assert "<|im_start|>" not in answer
+
+
+def test_model_template_artifacts_are_removed_from_history() -> None:
+    llm = LocalLLM(["Clean turn."])
+
+    answer = run_agent(
+        llm=llm,
+        rust=object(),
+        workspace_root=".",
+        user_prompt="hi again",
+        conversation_history=[
+            {"role": "user", "content": "can you open my file named calculator..?"},
+            {"role": "assistant", "content": "<|im_start|>"},
+        ],
+    )
+
+    assert answer == "Clean turn."
+    assert "<|im_start|>" not in str(llm.requests[-1]["messages"])
+
+
+def test_local_agent_retries_fenced_tool_json_as_tool_call() -> None:
+    class JsonThenToolLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def respond(self, **kwargs: Any) -> Any:
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return SimpleNamespace(
+                    output=[],
+                    output_text=(
+                        "```json\n"
+                        '{"name":"inspect_tree","arguments":{"path":"/workspace"}}\n'
+                        "```"
+                    ),
+                )
+            if len(self.requests) == 2:
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "inspect_tree",
+                        "call_id": "inspect-after-fence",
+                        "arguments": '{"path":"/workspace","max_files":20}',
+                    }],
+                    output_text="",
+                )
+            return SimpleNamespace(output=[], output_text="inspected")
+
+    llm = JsonThenToolLLM()
+
+    answer = run_agent(
+        llm=llm,
+        rust=FakeRust(),
+        workspace_root="/workspace",
+        user_prompt="inspect my project",
+    )
+
+    assert answer == "inspected"
     assert len(llm.requests) == 3
-    assert all(request["tools"] == [] for request in llm.requests)
-    assert "Do not print JSON" in llm.requests[-1]["instructions"]
+    assert all(request["tools"] for request in llm.requests)
+    assert any(
+        "not an executed action" in str(message.get("content", ""))
+        for message in llm.requests[1]["messages"]
+    )
 
 
-def test_local_gate_escalates_tool_work_with_compact_schemas() -> None:
+def test_local_agent_accepts_unstructured_completion() -> None:
+    class ProseThenToolLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def respond(self, **kwargs: Any) -> Any:
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return SimpleNamespace(output=[], output_text="workspace")
+            if len(self.requests) == 2:
+                return SimpleNamespace(output=[], output_text="You can run the requested action yourself.")
+            if len(self.requests) == 3:
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "inspect_tree",
+                        "call_id": "inspect-after-prose",
+                        "arguments": '{"path":"/workspace","max_files":20}',
+                    }],
+                    output_text="",
+                )
+            return SimpleNamespace(
+                output=[{
+                    "type": "function_call",
+                    "name": "finish_task",
+                    "call_id": "finish-after-prose",
+                    "arguments": '{"answer":"tool path completed"}',
+                }],
+                output_text="",
+            )
+
+    llm = ProseThenToolLLM()
+
+    answer = run_agent(
+        llm=llm,
+        rust=FakeRust(),
+        workspace_root="/workspace",
+        user_prompt="do the requested work",
+    )
+
+    assert answer == "workspace"
+    assert len(llm.requests) == 1
+
+
+def test_local_agent_does_not_route_prose_with_keyword_rules() -> None:
+    class ProseThenToolLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def respond(self, **kwargs: Any) -> Any:
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return SimpleNamespace(output=[], output_text="workspace")
+            if len(self.requests) == 2:
+                return SimpleNamespace(
+                    output=[],
+                    output_text="The workspace probably needs checking before I can answer.",
+                )
+            if len(self.requests) == 3:
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "inspect_tree",
+                        "call_id": "inspect-after-plan",
+                        "arguments": '{"path":"/workspace","max_files":20}',
+                    }],
+                    output_text="",
+                )
+            return SimpleNamespace(
+                output=[{
+                    "type": "function_call",
+                    "name": "finish_task",
+                    "call_id": "finish-after-plan",
+                    "arguments": '{"answer":"inspected"}',
+                }],
+                output_text="",
+            )
+
+    llm = ProseThenToolLLM()
+
+    answer = run_agent(
+        llm=llm,
+        rust=FakeRust(),
+        workspace_root="/workspace",
+        user_prompt="tell me about my project",
+    )
+
+    assert answer == "workspace"
+    assert len(llm.requests) == 1
+
+
+def test_unadvertised_finish_task_is_not_special_cased() -> None:
+    class FinishThenToolLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def respond(self, **kwargs: Any) -> Any:
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return SimpleNamespace(output=[], output_text="workspace")
+            if len(self.requests) == 2:
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "finish_task",
+                        "call_id": "finish-too-early",
+                        "arguments": '{"answer":"I will inspect it."}',
+                    }],
+                    output_text="",
+                )
+            if len(self.requests) == 3:
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "inspect_tree",
+                        "call_id": "inspect-after-reject",
+                        "arguments": '{"path":"/workspace","max_files":20}',
+                    }],
+                    output_text="",
+                )
+            return SimpleNamespace(
+                output=[{
+                    "type": "function_call",
+                    "name": "finish_task",
+                    "call_id": "finish-after-reject",
+                    "arguments": '{"answer":"inspected"}',
+                }],
+                output_text="",
+            )
+
+    llm = FinishThenToolLLM()
+
+    answer = run_agent(
+        llm=llm,
+        rust=FakeRust(),
+        workspace_root="/workspace",
+        user_prompt="tell me about my project",
+    )
+
+    assert answer == "workspace"
+    assert len(llm.requests) == 1
+
+
+def test_parallel_read_tools_overlap_before_returning_to_model() -> None:
+    class TwoReadsThenFinishLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    output=[
+                        {
+                            "type": "function_call",
+                            "name": "system_info",
+                            "call_id": "system-info",
+                            "arguments": '{}',
+                        },
+                        {
+                            "type": "function_call",
+                            "name": "connected_devices",
+                            "call_id": "connected-devices",
+                            "arguments": '{"scope":"all"}',
+                        },
+                    ],
+                    output_text="",
+                )
+            return SimpleNamespace(output=[], output_text="done")
+
+    class SlowRust:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def _observe(self) -> None:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.05)
+            with self.lock:
+                self.active -= 1
+
+        def system_info(self) -> dict[str, Any]:
+            self._observe()
+            return {"ok": True, "tool": "system_info"}
+
+        def connected_devices(self, **kwargs: Any) -> dict[str, Any]:
+            self._observe()
+            return {"ok": True, "tool": "connected_devices", "scope": kwargs["scope"]}
+
+    rust = SlowRust()
+
+    answer = run_agent(
+        llm=TwoReadsThenFinishLLM(),
+        rust=rust,
+        workspace_root="/workspace",
+        user_prompt="inspect both projects",
+    )
+
+    assert answer == "done"
+    assert rust.max_active == 2
+
+
+def test_local_agent_routes_to_compact_tools_with_top_level_descriptions() -> None:
     class InspectThenFinishLLM:
         mode = "local"
 
@@ -194,8 +487,6 @@ def test_local_gate_escalates_tool_work_with_compact_schemas() -> None:
         def respond(self, **kwargs: Any) -> Any:
             self.requests.append(kwargs)
             if len(self.requests) == 1:
-                return SimpleNamespace(output=[], output_text="WORKSPACE")
-            if len(self.requests) == 2:
                 return SimpleNamespace(
                     output=[{
                         "type": "function_call",
@@ -205,15 +496,7 @@ def test_local_gate_escalates_tool_work_with_compact_schemas() -> None:
                     }],
                     output_text="",
                 )
-            return SimpleNamespace(
-                output=[{
-                    "type": "function_call",
-                    "name": "finish_task",
-                    "call_id": "finish-local-tools",
-                    "arguments": '{"answer":"tool path completed"}',
-                }],
-                output_text="",
-            )
+            return SimpleNamespace(output=[], output_text="tool path completed")
 
     llm = InspectThenFinishLLM()
 
@@ -225,14 +508,218 @@ def test_local_gate_escalates_tool_work_with_compact_schemas() -> None:
     )
 
     assert answer == "tool path completed"
-    assert len(llm.requests) == 3
-    assert llm.requests[0]["tools"] == []
-    assert len(llm.requests[1]["tools"]) > 0
-    assert len(json.dumps(llm.requests[1]["tools"])) < 7_000
-    assert "description" not in json.dumps(llm.requests[1]["tools"])
-    tool_names = {tool["name"] for tool in llm.requests[1]["tools"]}
+    assert len(llm.requests) == 2
+    assert len(llm.requests[0]["tools"]) > 0
+    assert llm.requests[0]["tool_choice"] is None
+    assert all(tool.get("description") for tool in llm.requests[0]["tools"])
+    tool_names = {tool["name"] for tool in llm.requests[0]["tools"]}
     assert "inspect_target" in tool_names
-    assert "connected_devices" not in tool_names
+    assert "connected_devices" in tool_names
+    followup_tool_names = {tool["name"] for tool in llm.requests[1]["tools"]}
+    assert "inspect_target" in followup_tool_names
+    assert "connected_devices" in followup_tool_names
+    assert all(tool.get("description") for tool in llm.requests[1]["tools"])
+
+
+def test_explicit_desktop_open_requests_approval_without_model_roundtrip() -> None:
+    class NoLLM:
+        mode = "local"
+
+        def respond(self, **_kwargs: Any) -> Any:
+            raise AssertionError("desktop open fast path should not ask the model")
+
+    class FakeRust:
+        def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "tool": "desktop_resolve",
+                "query": query,
+                "kind": kind,
+                "ambiguous": False,
+                "candidates": [{
+                    "kind": "application",
+                    "id": "spark.desktop",
+                    "target": "spark.desktop",
+                    "name": "Spark",
+                }],
+            }
+
+        def desktop_action(self, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("desktop action must wait for approval")
+
+    session = AgentSession()
+    answer = run_agent(
+        llm=NoLLM(),
+        rust=FakeRust(),
+        workspace_root=".",
+        user_prompt="can you open my spark app",
+        session=session,
+    )
+
+    assert "Approval required" in answer
+    assert session.pending_approvals
+    request = session.pending_approvals[0]
+    assert request["tool"] == "desktop_action"
+    assert request["args"]["action"] == "launch_application"
+    assert request["args"]["target"] == "spark.desktop"
+
+
+def test_file_open_request_does_not_use_desktop_fast_path() -> None:
+    class ChatLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **_kwargs: Any) -> Any:
+            self.calls += 1
+            return SimpleNamespace(output=[], output_text="Need a file path.")
+
+    llm = ChatLLM()
+    answer = run_agent(
+        llm=llm,
+        rust=object(),
+        workspace_root=".",
+        user_prompt="open my file named calculator",
+    )
+
+    assert answer == "Need a file path."
+    assert llm.calls == 1
+
+
+def test_keep_it_open_clarification_does_not_use_desktop_open_fast_path() -> None:
+    class ChatLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **_kwargs: Any) -> Any:
+            self.calls += 1
+            return SimpleNamespace(output=[], output_text="Continuing previous close request.")
+
+    llm = ChatLLM()
+    answer = run_agent(
+        llm=llm,
+        rust=object(),
+        workspace_root=".",
+        user_prompt="cli keep it open and vscode",
+    )
+
+    assert answer == "Continuing previous close request."
+    assert llm.calls == 1
+
+
+def test_denied_desktop_approval_is_not_requested_again_in_same_prompt() -> None:
+    class RepeatCloseLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **_kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls <= 2:
+                return SimpleNamespace(output=[{
+                    "type": "function_call",
+                    "name": "desktop_action",
+                    "call_id": f"call-{self.calls}",
+                    "arguments": json.dumps({
+                        "action": "close_window",
+                        "target": "0xb0b2e",
+                    }),
+                }], output_text="")
+            return SimpleNamespace(output=[], output_text="stopped")
+
+    session = AgentSession(desktop_targets=[{
+        "kind": "window",
+        "id": "0xb0b2e",
+        "target": "0xb0b2e",
+        "title": "Notepad",
+    }])
+    requests: list[dict[str, Any]] = []
+
+    def deny(request: dict[str, Any]) -> str:
+        requests.append(dict(request))
+        return "denied"
+
+    answer = run_agent(
+        llm=RepeatCloseLLM(),
+        rust=object(),
+        workspace_root=".",
+        user_prompt="close all apps except vscode and cli",
+        session=session,
+        approval_requester=deny,
+    )
+
+    assert answer == "stopped"
+    assert len(requests) == 1
+    assert requests[0]["display_path"] == "desktop close_window Notepad"
+    assert len(session.pending_approvals) == 1
+    assert session.pending_approvals[0]["status"] == "denied"
+
+
+def test_approved_desktop_approval_is_not_requested_again_in_same_prompt() -> None:
+    class RepeatCloseLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **_kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls <= 2:
+                return SimpleNamespace(output=[{
+                    "type": "function_call",
+                    "name": "desktop_action",
+                    "call_id": f"call-{self.calls}",
+                    "arguments": json.dumps({
+                        "action": "close_window",
+                        "target": "0xb0b2e",
+                    }),
+                }], output_text="")
+            return SimpleNamespace(output=[], output_text="done")
+
+    class FakeRust:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def desktop_action(self, **_kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            return {
+                "ok": False,
+                "tool": "desktop_action",
+                "action": "close_window",
+                "target": "0xb0b2e",
+                "verification": "not_confirmed",
+            }
+
+    rust = FakeRust()
+    session = AgentSession(desktop_targets=[{
+        "kind": "window",
+        "id": "0xb0b2e",
+        "target": "0xb0b2e",
+        "title": "Notepad",
+    }])
+    requests: list[dict[str, Any]] = []
+
+    def approve(request: dict[str, Any]) -> str:
+        requests.append(dict(request))
+        return "approved"
+
+    answer = run_agent(
+        llm=RepeatCloseLLM(),
+        rust=rust,
+        workspace_root=".",
+        user_prompt="close all apps except vscode and cli",
+        session=session,
+        approval_requester=approve,
+    )
+
+    assert answer == "done"
+    assert len(requests) == 1
+    assert rust.calls == 2
+    assert session.pending_approvals[0]["status"] == "approved"
 
 
 def test_local_agent_retries_printed_command_json_without_executing_it() -> None:
@@ -245,13 +732,11 @@ def test_local_agent_retries_printed_command_json_without_executing_it() -> None
         def respond(self, **kwargs: Any) -> Any:
             self.requests.append(kwargs)
             if len(self.requests) == 1:
-                return SimpleNamespace(output=[], output_text="WORKSPACE")
-            if len(self.requests) == 2:
                 return SimpleNamespace(
                     output=[],
                     output_text='{"command":"read_directory","directory_path":"/workspace"}',
                 )
-            if len(self.requests) == 3:
+            if len(self.requests) == 2:
                 return SimpleNamespace(
                     output=[{
                         "type": "function_call",
@@ -261,15 +746,7 @@ def test_local_agent_retries_printed_command_json_without_executing_it() -> None
                     }],
                     output_text="",
                 )
-            return SimpleNamespace(
-                output=[{
-                    "type": "function_call",
-                    "name": "finish_task",
-                    "call_id": "finish-after-tool",
-                    "arguments": '{"answer":"tool path completed"}',
-                }],
-                output_text="",
-            )
+            return SimpleNamespace(output=[], output_text="tool path completed")
 
     llm = JsonThenToolLLM()
     answer = run_agent(
@@ -280,10 +757,10 @@ def test_local_agent_retries_printed_command_json_without_executing_it() -> None
     )
 
     assert answer == "tool path completed"
-    assert len(llm.requests) == 4
+    assert len(llm.requests) == 3
     assert any(
         "not an executed action" in str(message.get("content", ""))
-        for message in llm.requests[2]["messages"]
+        for message in llm.requests[1]["messages"]
         if isinstance(message, dict)
     )
 

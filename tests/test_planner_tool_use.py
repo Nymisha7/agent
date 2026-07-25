@@ -3,6 +3,7 @@ import hashlib
 import os
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,12 +14,16 @@ from unittest.mock import patch
 from agent.main import default_workspace_root, resolve_rust_bin
 from agent.planner import (
     AgentSession,
+    LOCAL_AGENT_PROMPT,
     ModelToolCall,
+    _attach_approval_display_path,
     _approval_request_from_observation,
     _build_initial_messages,
+    _summarize_approval_request,
     _prepare_tool_output,
     _preflight_tool_call,
     _is_explicit_delete_request,
+    _looks_like_unexecuted_action,
     _verify_mutation_observation,
     _update_session_from_tool_result,
     agent_session_from_dict,
@@ -49,7 +54,13 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("generated, dependency, cache, and build output", prompt)
         self.assertIn("Failed path operations only prove that the attempted path failed", prompt)
         self.assertIn("recent file operations", prompt)
-        self.assertIn("finish_task", prompt)
+        self.assertIn("usable entry point", prompt)
+        self.assertIn("internal tool-enum mistake", prompt)
+        self.assertIn("Do not invent a UI", prompt)
+        self.assertIn("Do not invent a UI", LOCAL_AGENT_PROMPT)
+        self.assertNotIn("call `write_file` directly", prompt)
+        self.assertNotIn("does not need discovery", LOCAL_AGENT_PROMPT)
+        self.assertIn("When no tool is needed, answer directly", prompt)
         self.assertIn("A partial inspection", prompt)
 
     def test_build_initial_messages_appends_current_prompt_after_history(self) -> None:
@@ -88,6 +99,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("process_list", tool_names)
         self.assertIn("run_system_command", tool_names)
         self.assertIn("desktop_action", tool_names)
+        self.assertIn("desktop_send_message", tool_names)
         self.assertIn("desktop_clipboard_files", tool_names)
         desktop_action = next(schema for schema in registry.schemas() if schema["name"] == "desktop_action")
         actions = desktop_action["parameters"]["properties"]["action"]["enum"]
@@ -333,6 +345,29 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(result["reason"], "desktop_action_requires_approval")
         self.assertEqual(result["requested_path"], "desktop set_volume 0")
 
+    def test_target_only_desktop_action_ignores_stray_value_in_approval_key(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("desktop action must not run before approval")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {
+                "action": "launch_application",
+                "target": "windows-app:abcdef",
+                "value": "Vitelglobal",
+            },
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_requires_approval")
+        self.assertEqual(result["requested_path"], "desktop launch_application windows-app:abcdef")
+
     def test_window_action_requires_target_before_approval(self) -> None:
         class FakeRust:
             def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
@@ -518,6 +553,157 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         self.assertEqual(result["action"], "set_volume")
 
+    def test_desktop_send_message_requires_exact_redacted_approval(self) -> None:
+        class FakeRust:
+            def desktop_capabilities(self) -> dict[str, object]:
+                return {
+                    "actions": [
+                        {"action": "focus_window", "available": True},
+                        {"action": "type_text", "available": True},
+                        {"action": "send_key", "available": True},
+                    ],
+                }
+
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("desktop_send_message must not run before approval")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_send_message",
+            {"target": "0x3a00007", "message": "private hello", "submit": "enter"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_requires_approval")
+        self.assertIn("desktop send_message 0x3a00007", result["requested_path"])
+        self.assertIn("sha256:", result["requested_path"])
+        self.assertIn("bytes:", result["requested_path"])
+        self.assertNotIn("private hello", result["requested_path"])
+
+    def test_desktop_send_message_blocks_before_approval_when_runtime_cannot_type(self) -> None:
+        class FakeRust:
+            def desktop_capabilities(self) -> dict[str, object]:
+                return {
+                    "runtime": "win32",
+                    "actions": [
+                        {"action": "focus_window", "available": False},
+                        {"action": "type_text", "available": False},
+                        {"action": "send_key", "available": False},
+                    ],
+                }
+
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("desktop_send_message must not run without capabilities")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_send_message",
+            {"target": "0x3a00007", "message": "private hello", "submit": "enter"},
+            ctx,
+        )
+
+        self.assertEqual(result["reason"], "desktop_action_dependency_unavailable")
+        self.assertIn("focus_window", result["unavailable_actions"])
+        self.assertNotIn("requested_path", result)
+
+    def test_desktop_send_message_runs_after_exact_approval(self) -> None:
+        class FakeRust:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def desktop_capabilities(self) -> dict[str, object]:
+                return {
+                    "actions": [
+                        {"action": "focus_window", "available": True},
+                        {"action": "type_text", "available": True},
+                        {"action": "send_key", "available": True},
+                    ],
+                }
+
+            def desktop_action(self, **kwargs: Any) -> dict[str, object]:
+                self.calls.append(dict(kwargs))
+                return {
+                    "ok": True,
+                    "verified": True,
+                    "verification": "confirmed",
+                    **kwargs,
+                }
+
+        initial_rust = FakeRust()
+        initial = ToolContext(
+            rust=initial_rust,  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        blocked = build_tool_registry(initial).execute(
+            "desktop_send_message",
+            {"target": "0x3a00007", "message": " private hello ", "submit": "ctrl+enter"},
+            initial,
+        )
+
+        rust = FakeRust()
+        approved = ToolContext(
+            rust=rust,  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+            approved_system_commands=[blocked["requested_path"]],
+        )
+        result = build_tool_registry(approved).execute(
+            "desktop_send_message",
+            {"target": "0x3a00007", "message": " private hello ", "submit": "ctrl+enter"},
+            approved,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertFalse(result["message_receipt"]["content_returned"])
+        self.assertNotIn("private hello", str(result))
+        self.assertEqual(
+            rust.calls,
+            [
+                {"action": "focus_window", "target": "0x3a00007"},
+                {"action": "type_text", "value": " private hello "},
+                {"action": "send_key", "value": "ctrl+Return"},
+            ],
+        )
+
+    def test_desktop_send_message_approval_request_redacts_message_args(self) -> None:
+        request = _approval_request_from_observation(
+            ModelToolCall(
+                name="desktop_send_message",
+                call_id="call-message",
+                arguments={"target": "0x3a00007", "message": "private hello", "submit": "enter"},
+            ),
+            {
+                "ok": False,
+                "blocked": True,
+                "recoverable": True,
+                "reason": "desktop_action_requires_approval",
+                "operation": "desktop",
+                "requested_path": (
+                    "desktop send_message 0x3a00007 "
+                    "sha256:2751898260829ac7810207f6fca047df4f320d7ab9f79247ecafcaeea13237ca "
+                    "bytes:13 submit:enter"
+                ),
+            },
+            user_prompt="send this message",
+            workspace_root=Path("/workspace"),
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertNotIn("private hello", str(request))
+        self.assertEqual(request["args"]["message"]["bytes"], 13)
+        self.assertFalse(request["args"]["message"]["content_returned"])
+
     def test_desktop_action_observation_creates_approval_request(self) -> None:
         request = _approval_request_from_observation(
             ModelToolCall(
@@ -538,6 +724,68 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(request)
+
+    def test_desktop_approval_display_uses_observed_window_title(self) -> None:
+        request = _approval_request_from_observation(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="call-desktop",
+                arguments={"action": "close_window", "target": "0x40b94"},
+            ),
+            {
+                "ok": False,
+                "blocked": True,
+                "recoverable": True,
+                "reason": "desktop_action_requires_approval",
+                "operation": "desktop",
+                "requested_path": "desktop close_window 0x40b94",
+            },
+            user_prompt="close vitelglobal",
+            workspace_root=Path("/workspace"),
+        )
+        self.assertIsNotNone(request)
+        session = AgentSession(desktop_targets=[{
+            "kind": "window",
+            "id": "0x40b94",
+            "target": "0x40b94",
+            "title": "Vitelglobal",
+        }])
+
+        _attach_approval_display_path(session, request)
+
+        self.assertEqual(request["requested_path"], "desktop close_window 0x40b94")
+        self.assertEqual(request["display_path"], "desktop close_window Vitelglobal")
+        self.assertIn("Vitelglobal", _summarize_approval_request(request))
+        self.assertNotIn("0x40b94", _summarize_approval_request(request))
+
+    def test_desktop_launch_approval_ignores_stray_value_in_key(self) -> None:
+        request = _approval_request_from_observation(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="call-desktop",
+                arguments={
+                    "action": "launch_application",
+                    "target": "windows-app:abcdef",
+                    "value": "Vitelglobal",
+                },
+            ),
+            {
+                "ok": False,
+                "blocked": True,
+                "recoverable": True,
+                "reason": "desktop_action_requires_approval",
+                "operation": "desktop",
+                "requested_path": "desktop launch_application windows-app:abcdef",
+            },
+            user_prompt="open vitelglobal",
+            workspace_root=Path("/workspace"),
+        )
+        self.assertIsNotNone(request)
+
+        _attach_approval_display_path(AgentSession(), request)
+
+        self.assertEqual(request["requested_path"], "desktop launch_application windows-app:abcdef")
+        self.assertEqual(request["display_path"], "desktop launch_application Vitelglobal")
         assert request is not None
         self.assertEqual(request["operation"], "desktop")
         self.assertEqual(request["tool"], "desktop_action")
@@ -692,7 +940,12 @@ class PlannerToolUseTests(unittest.TestCase):
                 "scope": "windows",
                 "windows": {
                     "items": [
-                        {"id": "0x3a00007", "title": "Editor"},
+                        {
+                            "id": "0x3a00007",
+                            "title": "Editor",
+                            "pid": 4242,
+                            "process": "Code",
+                        },
                     ],
                 },
             },
@@ -702,6 +955,30 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(session.last_desktop_snapshot["snapshot_id"], "desktop-123")
         self.assertEqual(session.desktop_targets[0]["kind"], "window")
         self.assertEqual(session.desktop_targets[0]["target"], "0x3a00007")
+        targets = {item["kind"]: item for item in session.desktop_targets}
+        self.assertEqual(targets["process"]["target"], "4242")
+        self.assertEqual(targets["process"]["title"], "Editor")
+
+        request = _approval_request_from_observation(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="call-desktop",
+                arguments={"action": "terminate_process", "target": "4242"},
+            ),
+            {
+                "ok": False,
+                "blocked": True,
+                "recoverable": True,
+                "reason": "desktop_action_requires_approval",
+                "operation": "desktop",
+                "requested_path": "desktop terminate_process 4242",
+            },
+            user_prompt="close everything except vscode",
+            workspace_root=Path("/workspace"),
+        )
+        self.assertIsNotNone(request)
+        _attach_approval_display_path(session, request)
+        self.assertEqual(request["display_path"], "desktop terminate_process Editor")
 
     def test_session_remembers_snapshot_bound_ui_elements(self) -> None:
         session = AgentSession()
@@ -864,6 +1141,184 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertTrue(observation["blocked"])
         self.assertEqual(observation["reason"], "desktop_target_not_observed")
 
+    def test_preflight_blocks_process_termination_for_close_app_request(self) -> None:
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="kill-1",
+                arguments={"action": "terminate_process", "target": "17424"},
+            ),
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=AgentSession(),
+            user_prompt="close all apps except cli and vscode",
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertTrue(observation["blocked"])
+        self.assertFalse(observation["recoverable"])
+        self.assertEqual(observation["reason"], "desktop_process_termination_not_requested")
+
+    def test_preflight_allows_explicit_process_termination_request(self) -> None:
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="kill-1",
+                arguments={"action": "terminate_process", "target": "17424"},
+            ),
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=AgentSession(),
+            user_prompt="kill process 17424",
+        )
+
+        self.assertIsNone(observation)
+
+    def test_preflight_rejects_non_pid_process_termination_target(self) -> None:
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="kill-1",
+                arguments={
+                    "action": "terminate_process",
+                    "target": r"C:\Program Files\App\App.exe",
+                },
+            ),
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=AgentSession(),
+            user_prompt="kill that process",
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertTrue(observation["blocked"])
+        self.assertFalse(observation["recoverable"])
+        self.assertEqual(observation["reason"], "desktop_process_target_invalid")
+
+    def test_preflight_resolves_launch_phrase_before_rust(self) -> None:
+        class FakeRust:
+            def __init__(self) -> None:
+                self.queries: list[dict[str, object]] = []
+
+            def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, object]:
+                self.queries.append({"query": query, "kind": kind, "limit": limit})
+                return {
+                    "ok": True,
+                    "tool": "desktop_resolve",
+                    "query": query,
+                    "kind": kind,
+                    "ambiguous": False,
+                    "candidates": [{
+                        "kind": "application",
+                        "id": "spark.desktop",
+                        "target": "spark.desktop",
+                        "name": "Spark",
+                    }],
+                }
+
+        rust = FakeRust()
+        call = ModelToolCall(
+            name="desktop_action",
+            call_id="launch-1",
+            arguments={"action": "launch_application", "target": "my spark"},
+        )
+        observation = _preflight_tool_call(
+            call,
+            tool_ctx=ToolContext(
+                rust=rust,  # type: ignore[arg-type]
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=AgentSession(),
+            user_prompt="open my spark",
+        )
+
+        self.assertIsNone(observation)
+        self.assertEqual(rust.queries, [{"query": "spark", "kind": "application", "limit": 5}])
+        self.assertEqual(call.arguments["target"], "spark.desktop")
+
+    def test_preflight_blocks_ambiguous_launch_resolution(self) -> None:
+        class FakeRust:
+            def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, object]:
+                return {
+                    "ok": True,
+                    "tool": "desktop_resolve",
+                    "query": query,
+                    "kind": kind,
+                    "ambiguous": True,
+                    "candidates": [
+                        {"kind": "application", "target": "spark-personal.desktop", "name": "Spark Personal"},
+                        {"kind": "application", "target": "spark-work.desktop", "name": "Spark Work"},
+                    ],
+                }
+
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="launch-1",
+                arguments={"action": "launch_application", "target": "spark"},
+            ),
+            tool_ctx=ToolContext(
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=AgentSession(),
+            user_prompt="open spark",
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation["reason"], "desktop_application_target_not_resolved")
+        self.assertIn("multiple candidates", observation["guidance"])
+
+    def test_preflight_chooses_clear_exact_app_over_related_entries(self) -> None:
+        class FakeRust:
+            def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, object]:
+                return {
+                    "ok": True,
+                    "tool": "desktop_resolve",
+                    "query": query,
+                    "kind": kind,
+                    "ambiguous": True,
+                    "candidates": [
+                        {"kind": "application", "target": "windows-shortcut:spark", "name": "Spark", "score": 100},
+                        {"kind": "application", "target": "windows-app:spark", "name": "Spark", "score": 100},
+                        {"kind": "application", "target": "windows-shortcut:uninstall", "name": "Spark Uninstaller", "score": 80},
+                        {"kind": "application", "target": "windows-shortcut:starter", "name": "starter", "score": 60},
+                    ],
+                }
+
+        call = ModelToolCall(
+            name="desktop_action",
+            call_id="launch-1",
+            arguments={"action": "launch_application", "target": "spark"},
+        )
+        observation = _preflight_tool_call(
+            call,
+            tool_ctx=ToolContext(
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=AgentSession(),
+            user_prompt="open spark",
+        )
+
+        self.assertIsNone(observation)
+        self.assertEqual(call.arguments["target"], "windows-shortcut:spark")
+
+    def test_raw_tool_json_text_counts_as_unexecuted_action(self) -> None:
+        self.assertTrue(_looks_like_unexecuted_action('inspect_target {"path": "/tmp/spark", "kind": "directory"}'))
+
     def test_preflight_allows_observed_window_action(self) -> None:
         ctx = ToolContext(
             rust=RustTools(Path("/tmp/agent-rust")),
@@ -893,6 +1348,50 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertIsNone(observation)
+
+    def test_preflight_blocks_unobserved_desktop_send_message(self) -> None:
+        result = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_send_message",
+                call_id="send-1",
+                arguments={"target": "0x3a00007", "message": "hello"},
+            ),
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=AgentSession(),
+            user_prompt="send hello",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["reason"], "desktop_target_not_observed")
+
+    def test_preflight_allows_observed_desktop_send_message(self) -> None:
+        result = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_send_message",
+                call_id="send-1",
+                arguments={"target": "0x3a00007", "message": "hello"},
+            ),
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=AgentSession(
+                desktop_targets=[{
+                    "kind": "window",
+                    "id": "0x3a00007",
+                    "target": "0x3a00007",
+                    "action": "focus_window",
+                }]
+            ),
+            user_prompt="send hello",
+        )
+
+        self.assertIsNone(result)
 
     def test_language_server_status_tool_reports_configured_servers(self) -> None:
         manager = LanguageServerManager(
@@ -1054,6 +1553,31 @@ class PlannerToolUseTests(unittest.TestCase):
 
             with self.assertRaises(TimeoutError):
                 RustTools(script).run_json([], timeout=0.05)
+
+    def test_rust_worker_demuxes_concurrent_out_of_order_responses(self) -> None:
+        with TemporaryDirectory() as tmp:
+            script = Path(tmp) / "fake-rust-tool"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "if len(sys.argv) > 1 and sys.argv[1] == 'serve':\n"
+                "    first = sys.stdin.readline()\n"
+                "    second = sys.stdin.readline()\n"
+                "    for raw in (second, first):\n"
+                "        req = json.loads(raw)\n"
+                "        print(json.dumps({'id': req['id'], 'ok': True, 'result': req['args']}), flush=True)\n"
+                "else:\n"
+                "    print(json.dumps(sys.argv[1:]))\n"
+            )
+            os.chmod(script, 0o755)
+            rust = RustTools(script)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(rust.run_json, ["first"], timeout=1)
+                second = executor.submit(rust.run_json, ["second"], timeout=1)
+
+            self.assertEqual(first.result(), ["first"])
+            self.assertEqual(second.result(), ["second"])
 
     def test_tool_registry_returns_structured_timeout_observation(self) -> None:
         class FakeRust:
@@ -1255,7 +1779,7 @@ class PlannerToolUseTests(unittest.TestCase):
             self.assertEqual(len(rust.calls), 1)
             self.assertIsNone(rust.calls[0]["expected_sha256"])
 
-    def test_glob_retries_with_singular_pattern_when_plural_misses(self) -> None:
+    def test_glob_does_not_guess_a_singular_pattern(self) -> None:
         class FakeRust:
             def __init__(self) -> None:
                 self.patterns: list[str] = []
@@ -1263,15 +1787,7 @@ class PlannerToolUseTests(unittest.TestCase):
             def glob_files(self, **kwargs: object) -> dict[str, object]:
                 pattern = str(kwargs["pattern"])
                 self.patterns.append(pattern)
-                if pattern == "*apps*":
-                    return {"matches": [], "truncated": False, "backend": "fake"}
-                if pattern == "*app*":
-                    return {
-                        "matches": [{"path": "/tmp/app1", "kind": "directory"}],
-                        "truncated": False,
-                        "backend": "fake",
-                    }
-                raise AssertionError(pattern)
+                return {"matches": [], "truncated": False, "backend": "fake"}
 
         rust = FakeRust()
         ctx = ToolContext(
@@ -1287,11 +1803,10 @@ class PlannerToolUseTests(unittest.TestCase):
             ctx,
         )
 
-        self.assertEqual(rust.patterns, ["*apps*", "*app*"])
-        self.assertEqual(result["fallback_pattern"], "*app*")
-        self.assertEqual(result["matches"][0]["path"], "/tmp/app1")
+        self.assertEqual(rust.patterns, ["*apps*"])
+        self.assertEqual(result["matches"], [])
 
-    def test_file_glob_retries_recursively_for_bare_filename_pattern(self) -> None:
+    def test_file_glob_preserves_bare_filename_pattern(self) -> None:
         class FakeRust:
             def __init__(self) -> None:
                 self.patterns: list[str] = []
@@ -1299,15 +1814,7 @@ class PlannerToolUseTests(unittest.TestCase):
             def glob_files(self, **kwargs: object) -> dict[str, object]:
                 pattern = str(kwargs["pattern"])
                 self.patterns.append(pattern)
-                if pattern == "README*":
-                    return {"matches": [], "truncated": False, "backend": "fake"}
-                if pattern == "**/README*":
-                    return {
-                        "matches": [{"path": "/tmp/sample_project/web_ui/README.md", "kind": "file"}],
-                        "truncated": False,
-                        "backend": "fake",
-                    }
-                raise AssertionError(pattern)
+                return {"matches": [], "truncated": False, "backend": "fake"}
 
         rust = FakeRust()
         ctx = ToolContext(
@@ -1323,11 +1830,10 @@ class PlannerToolUseTests(unittest.TestCase):
             ctx,
         )
 
-        self.assertEqual(rust.patterns, ["README*", "**/README*"])
-        self.assertEqual(result["fallback_pattern"], "**/README*")
-        self.assertEqual(result["matches"][0]["path"], "/tmp/sample_project/web_ui/README.md")
+        self.assertEqual(rust.patterns, ["README*"])
+        self.assertEqual(result["matches"], [])
 
-    def test_file_glob_retries_literal_segment_case_variant(self) -> None:
+    def test_file_glob_does_not_guess_literal_segment_case(self) -> None:
         class FakeRust:
             def __init__(self) -> None:
                 self.patterns: list[str] = []
@@ -1335,14 +1841,6 @@ class PlannerToolUseTests(unittest.TestCase):
             def glob_files(self, **kwargs: object) -> dict[str, object]:
                 pattern = str(kwargs["pattern"])
                 self.patterns.append(pattern)
-                if pattern == "**/sample_project/**/readme*":
-                    return {"matches": [], "truncated": False, "backend": "fake"}
-                if pattern == "**/sample_project/**/README*":
-                    return {
-                        "matches": [{"path": "/tmp/sample_project/web_ui/README.md", "kind": "file"}],
-                        "truncated": False,
-                        "backend": "fake",
-                    }
                 return {"matches": [], "truncated": False, "backend": "fake"}
 
         ctx = ToolContext(
@@ -1358,8 +1856,8 @@ class PlannerToolUseTests(unittest.TestCase):
             ctx,
         )
 
-        self.assertIn("**/sample_project/**/README*", ctx.rust.patterns)  # type: ignore[attr-defined]
-        self.assertEqual(result["fallback_pattern"], "**/sample_project/**/README*")
+        self.assertEqual(ctx.rust.patterns, ["**/sample_project/**/readme*"])  # type: ignore[attr-defined]
+        self.assertEqual(result["matches"], [])
 
     def test_glob_with_ambiguous_relative_root_returns_candidates(self) -> None:
         class FakeRust:
@@ -1605,13 +2103,12 @@ class PlannerToolUseTests(unittest.TestCase):
 
     def test_glob_omits_generated_dependency_matches_by_default(self) -> None:
         class FakeRust:
+            include_generated: object = None
+
             def glob_files(self, **kwargs: object) -> dict[str, object]:
+                self.include_generated = kwargs["include_generated"]
                 return {
                     "matches": [
-                        {
-                            "path": "/tmp/sample_project/web_ui/node_modules/@babel/core/README.md",
-                            "kind": "file",
-                        },
                         {
                             "path": "/tmp/sample_project/web_ui/src/README.md",
                             "kind": "file",
@@ -1638,11 +2135,14 @@ class PlannerToolUseTests(unittest.TestCase):
             result["matches"],
             [{"path": "/tmp/sample_project/web_ui/src/README.md", "kind": "file"}],
         )
-        self.assertEqual(result["omitted_generated"], 1)
+        self.assertFalse(ctx.rust.include_generated)  # type: ignore[attr-defined]
 
     def test_glob_can_include_generated_dependency_matches_when_requested(self) -> None:
         class FakeRust:
+            include_generated: object = None
+
             def glob_files(self, **kwargs: object) -> dict[str, object]:
+                self.include_generated = kwargs["include_generated"]
                 return {
                     "matches": [
                         {
@@ -1676,6 +2176,7 @@ class PlannerToolUseTests(unittest.TestCase):
             result["matches"],
             [{"path": "/tmp/sample_project/web_ui/node_modules/@babel/core/README.md", "kind": "file"}],
         )
+        self.assertTrue(ctx.rust.include_generated)  # type: ignore[attr-defined]
 
     def test_inspect_tree_output_preserves_direct_children_when_compacted(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2425,13 +2926,6 @@ class PlannerToolUseTests(unittest.TestCase):
                     if isinstance(tool, dict)
                 })
                 if self.calls == 1:
-                    return SimpleNamespace(output=[], output_text="HOST")
-                if self.calls == 2:
-                    return SimpleNamespace(
-                        output=[],
-                        output_text="Likely processes include systemd and bash.",
-                    )
-                if self.calls == 3:
                     return SimpleNamespace(
                         output=[{
                             "type": "function_call",
@@ -2441,15 +2935,7 @@ class PlannerToolUseTests(unittest.TestCase):
                         }],
                         output_text="",
                     )
-                return SimpleNamespace(
-                    output=[{
-                        "type": "function_call",
-                        "name": "finish_task",
-                        "call_id": "finish-1",
-                        "arguments": '{"answer":"Open applications: Terminal."}',
-                    }],
-                    output_text="",
-                )
+                return SimpleNamespace(output=[], output_text="Open applications: Terminal.")
 
         class FakeRust:
             def __init__(self) -> None:
@@ -2477,9 +2963,9 @@ class PlannerToolUseTests(unittest.TestCase):
 
         self.assertEqual(answer, "Open applications: Terminal.")
         self.assertEqual(rust.observed, [{"scope": "applications", "limit": 20}])
-        self.assertEqual(llm.tool_names[0], set())
-        self.assertIn("desktop_observe", llm.tool_names[1])
-        self.assertNotIn("glob", llm.tool_names[1])
+        self.assertIn("desktop_observe", llm.tool_names[0])
+        self.assertIn("desktop_action", llm.tool_names[1])
+        self.assertIn("glob", llm.tool_names[1])
 
     def test_run_agent_accepts_model_finish_task_without_prompt_classification(self) -> None:
         class FakeLLM:
@@ -2554,6 +3040,65 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(answer, "Created proof.txt.")
         self.assertIn("mutation_verification_failed", json.dumps(llm.messages[1]))
 
+    def test_local_agent_creates_new_file_through_normal_tool_loop(self) -> None:
+        class FakeLLM:
+            mode = "local"
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    return SimpleNamespace(
+                        output=[{
+                            "type": "function_call",
+                            "name": "write_file",
+                            "call_id": "write-1",
+                            "arguments": '{"path":"notes.txt","content":"hello"}',
+                        }],
+                        output_text="",
+                    )
+                return SimpleNamespace(output=[], output_text="Created notes.txt.")
+
+        class FakeRust:
+            def write_file(self, **kwargs: Any) -> dict[str, object]:
+                path = Path(kwargs["path"])
+                content = str(kwargs["content"])
+                path.write_text(content)
+                return {
+                    "ok": True,
+                    "tool": "write_file",
+                    "path": str(path),
+                    "created": True,
+                    "after_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                }
+
+        llm = FakeLLM()
+        with TemporaryDirectory() as tmp:
+            answer = run_agent(
+                llm=llm,  # type: ignore[arg-type]
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=tmp,
+                user_prompt="make a notes.txt file containing hello",
+            )
+
+            self.assertEqual((Path(tmp) / "notes.txt").read_text(), "hello")
+
+        self.assertEqual(answer, "Created notes.txt.")
+        selected_tools = {
+            schema["name"]
+            for schema in llm.calls[0]["tools"]
+        }
+        self.assertIn("write_file", selected_tools)
+        self.assertIn("desktop_action", selected_tools)
+        followup_tools = {
+            schema["name"]
+            for schema in llm.calls[1]["tools"]
+        }
+        self.assertIn("write_file", followup_tools)
+        self.assertIn("desktop_action", followup_tools)
+
     def test_run_agent_accepts_plain_text_clarification(self) -> None:
         class FakeLLM:
             def __init__(self) -> None:
@@ -2578,7 +3123,7 @@ class PlannerToolUseTests(unittest.TestCase):
 
         self.assertIn("multiple possible RA projects", answer)
 
-    def test_local_chat_uses_router_then_tool_free_answer(self) -> None:
+    def test_local_chat_uses_one_agent_call(self) -> None:
         class FakeLLM:
             mode = "local"
 
@@ -2587,8 +3132,6 @@ class PlannerToolUseTests(unittest.TestCase):
 
             def respond(self, **kwargs: Any) -> Any:
                 self.calls.append(kwargs)
-                if len(self.calls) == 1:
-                    return SimpleNamespace(output=[], output_text="CHAT")
                 return SimpleNamespace(output=[], output_text="Hi there.")
 
         llm = FakeLLM()
@@ -2600,9 +3143,8 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertEqual(answer, "Hi there.")
-        self.assertEqual(len(llm.calls), 2)
-        self.assertEqual(llm.calls[0]["tools"], [])
-        self.assertEqual(llm.calls[1]["tools"], [])
+        self.assertEqual(len(llm.calls), 1)
+        self.assertGreater(len(llm.calls[0]["tools"]), 0)
 
     def test_run_agent_waits_for_approval_before_external_delete(self) -> None:
         class FakeLLM:
@@ -2665,7 +3207,8 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(seen_requests[0]["requested_path"], str(external))
         self.assertIn(str(external), session.approved_external_delete_roots)
         self.assertTrue(session.pending_approvals)
-        self.assertEqual(session.pending_approvals[0]["status"], "pending")
+        self.assertEqual(session.pending_approvals[0]["status"], "approved")
+        self.assertEqual(session.pending_approvals[0]["decision"], "approved")
 
     def test_run_agent_trims_tool_names_before_dispatch(self) -> None:
         class FakeLLM:
@@ -2805,7 +3348,7 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertEqual(answer, "Stopped after loop block.")
-        self.assertEqual(rust.calls, 20)
+        self.assertEqual(rust.calls, 2)
         self.assertTrue(session.tool_loop_history)
         self.assertTrue(all(record.get("run_id") for record in session.tool_loop_history))
 
@@ -2819,7 +3362,8 @@ class PlannerToolUseTests(unittest.TestCase):
             max_steps=3,
         )
 
-        self.assertNotEqual(second_answer, "Stopped after loop block.")
+        self.assertEqual(second_answer, "Stopped after loop block.")
+        self.assertEqual(rust.calls, 4)
 
 
 if __name__ == "__main__":

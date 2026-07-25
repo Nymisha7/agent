@@ -1,12 +1,13 @@
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import json
 import sqlite3
 from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from agent.main import _selected_model
+from agent.main import _selected_model, _workspace_root_key, create_new_session
 from agent.session_store import SessionStore
 
 
@@ -754,6 +755,124 @@ class SessionStoreTests(unittest.TestCase):
 
 
 class ModelSelectionTests(unittest.TestCase):
+    def test_workspace_root_key_treats_wsl_drive_mount_as_same_windows_project(self) -> None:
+        self.assertEqual(
+            _workspace_root_key("/mnt/d/Codex/nym"),
+            _workspace_root_key("D:/Codex/nym"),
+        )
+
+    def test_new_session_inherits_last_workspace_model_when_unspecified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root / "sessions.sqlite3")
+            store.create_session(
+                workspace_root=root,
+                provider="ollama",
+                model="llama3.1",
+            )
+            args = SimpleNamespace(
+                root=str(root),
+                channel=None,
+                provider=None,
+                model=None,
+            )
+
+            session = create_new_session(args, store)
+
+        self.assertEqual(session.provider, "ollama")
+        self.assertEqual(session.model, "llama3.1")
+
+    def test_new_session_ignores_last_model_from_other_agent_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".agent"
+            config_dir.mkdir()
+            (config_dir / "config.json").write_text(
+                json.dumps({
+                    "agents": {
+                        "default": "main",
+                        "list": [{"id": "main"}, {"id": "docs"}],
+                    }
+                }),
+                encoding="utf-8",
+            )
+            store = SessionStore(root / "sessions.sqlite3")
+            store.create_session(
+                workspace_root=root,
+                provider="anthropic",
+                model="claude-sonnet-4.5",
+                agent_id="docs",
+            )
+            args = SimpleNamespace(
+                root=str(root),
+                config=None,
+                channel=None,
+                provider=None,
+                model=None,
+            )
+
+            session = create_new_session(args, store)
+
+        self.assertEqual(session.agent, "main")
+        self.assertIsNone(session.provider)
+        self.assertIsNone(session.model)
+
+    def test_new_session_uses_config_default_agent_when_remembering_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".agent"
+            config_dir.mkdir()
+            (config_dir / "config.json").write_text(
+                json.dumps({
+                    "agents": {
+                        "default": "docs",
+                        "list": [{"id": "main"}, {"id": "docs"}],
+                    }
+                }),
+                encoding="utf-8",
+            )
+            store = SessionStore(root / "sessions.sqlite3")
+            store.create_session(
+                workspace_root=root,
+                provider="anthropic",
+                model="claude-sonnet-4.5",
+                agent_id="docs",
+            )
+            args = SimpleNamespace(
+                root=str(root),
+                config=None,
+                channel=None,
+                provider=None,
+                model=None,
+            )
+
+            session = create_new_session(args, store)
+
+        self.assertEqual(session.agent, "docs")
+        self.assertEqual(session.provider, "anthropic")
+        self.assertEqual(session.model, "claude-sonnet-4.5")
+
+    def test_new_session_does_not_inherit_model_when_provider_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root / "sessions.sqlite3")
+            store.create_session(
+                workspace_root=root,
+                provider="ollama",
+                model="llama3.1",
+            )
+            args = SimpleNamespace(
+                root=str(root),
+                channel=None,
+                provider="openai",
+                model=None,
+            )
+
+            session = create_new_session(args, store)
+
+        self.assertEqual(session.provider, "openai")
+        self.assertIsNone(session.model)
+
     def test_resume_reuses_session_model_without_provider_override(self) -> None:
         args = SimpleNamespace(model=None, provider=None)
         session = SimpleNamespace(provider="ollama", model="llama3.1")

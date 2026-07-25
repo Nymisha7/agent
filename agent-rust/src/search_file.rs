@@ -1,5 +1,4 @@
-use anyhow::{bail, Context, Result};
-use ignore::WalkBuilder;
+use anyhow::{Context, Result};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use serde::Serialize;
@@ -7,10 +6,8 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
 
-const WORK_QUEUE_CAPACITY: usize = 1024;
+use crate::ripgrep::{ripgrep_paths, RipgrepFilesOptions, RipgrepPath, RipgrepPathKind};
 
 #[derive(Debug, Clone, Copy)]
 pub enum SearchMode {
@@ -97,150 +94,6 @@ impl FileSearchOptions {
 
 fn default_search_roots() -> Vec<PathBuf> {
     vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
-} // change this to fn default_search_roots() -> Vec<PathBuf> {
-  //vec![PathBuf::from("/")]
-  //} later
-fn worker_count(mode: SearchMode, root: &Path) -> usize {
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    let base = match mode {
-        SearchMode::Interactive => interactive_workers(cpus),
-        SearchMode::Balanced => balanced_workers(cpus),
-        SearchMode::Aggressive => cpus.max(1),
-        SearchMode::Background => 1,
-        SearchMode::Manual(n) => n.max(1),
-    };
-
-    if is_wsl_windows_mount(root) {
-        base.min(2).max(1)
-    } else {
-        base.max(1)
-    }
-}
-
-fn is_generated_artifact(relative_path: &Path) -> bool {
-    for component in relative_path.components() {
-        let name = component.as_os_str().to_string_lossy();
-
-        if matches!(
-            name.as_ref(),
-            "target"
-                | "__pycache__"
-                | ".pytest_cache"
-                | ".mypy_cache"
-                | ".ruff_cache"
-                | ".tox"
-                | ".venv"
-                | "venv"
-                | "env"
-                | ".env"
-                | "virtualenv"
-                | ".virtualenv"
-                | "node_modules"
-                | "site-packages"
-                | ".git"
-                | ".hg"
-                | ".svn"
-                | ".egg-info"
-                | "dist"
-                | "build"
-        ) {
-            return true;
-        }
-
-        if name.ends_with(".egg-info") {
-            return true;
-        }
-    }
-
-    matches!(
-        relative_path.extension().and_then(|ext| ext.to_str()),
-        Some("pyc" | "pyo" | "o" | "rlib" | "rmeta" | "d" | "bin")
-    )
-}
-
-fn should_prune_path(path: &Path) -> bool {
-    let text = path.to_string_lossy();
-
-    if matches!(
-        text.as_ref(),
-        "/proc"
-            | "/sys"
-            | "/dev"
-            | "/run"
-            | "/tmp"
-            | "/snap"
-            | "/lost+found"
-            | "/var/lib/docker"
-            | "/var/lib/containerd"
-            | "/mnt/wsl"
-    ) {
-        return true;
-    }
-
-    for component in path.components() {
-        let name = component.as_os_str().to_string_lossy();
-
-        if matches!(
-            name.as_ref(),
-            ".git"
-                | ".hg"
-                | ".svn"
-                | "node_modules"
-                | "venv"
-                | ".venv"
-                | "env"
-                | "rag_env"
-                | ".env"
-                | "virtualenv"
-                | ".virtualenv"
-                | "site-packages"
-                | "__pycache__"
-                | "target"
-                | "dist"
-                | "build"
-                | ".cache"
-                | ".npm"
-                | ".cargo"
-                | ".rustup"
-                | "AppData"
-                | "Windows"
-                | "Program Files"
-                | "Program Files (x86)"
-        ) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn interactive_workers(cpus: usize) -> usize {
-    match cpus {
-        0 | 1 => 1,
-        2 => 1,
-        3 | 4 => 2,
-        5..=8 => cpus / 2,
-        9..=16 => cpus / 2,
-        _ => cpus / 3,
-    }
-}
-
-fn balanced_workers(cpus: usize) -> usize {
-    match cpus {
-        0 | 1 => 1,
-        2 => 2,
-        3 | 4 => cpus - 1,
-        5..=8 => cpus - 2,
-        9..=16 => (cpus * 3) / 4,
-        _ => cpus / 2,
-    }
-}
-
-fn is_wsl_windows_mount(path: &Path) -> bool {
-    path.to_string_lossy().starts_with("/mnt/")
 }
 
 pub fn search_files(options: FileSearchOptions) -> Result<Vec<FileMatch>> {
@@ -538,16 +391,6 @@ fn expand_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-//temp stubs
-
-// fn collect_candidates(
-//     _root: &Path,
-//     _options: &FileSearchOptions,
-//     _candidates: &mut Vec<Candidate>,
-// ) -> Result<()> {
-//     Ok(())
-// }
-
 fn collect_candidates<F>(
     root: &Path,
     options: &FileSearchOptions,
@@ -556,126 +399,49 @@ fn collect_candidates<F>(
 where
     F: FnMut(Candidate),
 {
-    let workers = worker_count(options.search_mode, root);
-    let (work_tx, work_rx) = mpsc::sync_channel::<PathBuf>(WORK_QUEUE_CAPACITY);
-    let (result_tx, result_rx) = mpsc::channel::<Candidate>();
-    let work_rx = Arc::new(Mutex::new(work_rx));
-    let mut handles = Vec::with_capacity(workers);
-
-    for _ in 0..workers {
-        let work_rx = Arc::clone(&work_rx);
-        let result_tx = result_tx.clone();
-        let root = root.to_path_buf();
-        let options = options.clone();
-
-        handles.push(thread::spawn(move || loop {
-            let path = {
-                let Ok(receiver) = work_rx.lock() else {
-                    break;
-                };
-                receiver.recv()
-            };
-
-            let Ok(path) = path else {
-                break;
-            };
-
-            let Some(candidate) = candidate_from_path(&root, &options, &path) else {
-                continue;
-            };
-
-            if result_tx.send(candidate).is_err() {
-                break;
-            }
-        }));
-    }
-
-    drop(result_tx);
-
-    let include_generated = options.include_generated;
-
-    let walker = WalkBuilder::new(root)
-        .hidden(!options.include_hidden)
-        .follow_links(options.follow_links)
-        .git_ignore(true)
-        .git_exclude(true)
-        .parents(true)
-        .threads(workers)
-        .filter_entry(move |entry| {
-            if include_generated {
-                true
-            } else {
-                !should_prune_path(entry.path())
-            }
-        })
-        .build();
-
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                continue;
-            }
-        };
-
-        let path = entry.path();
-
-        if path == root {
-            continue;
-        }
-
-        if work_tx.send(path.to_path_buf()).is_err() {
-            break;
-        }
-    }
-
-    drop(work_tx);
-
-    for candidate in result_rx {
-        on_candidate(candidate);
-    }
-
-    for handle in handles {
-        if handle.join().is_err() {
-            bail!("search worker panicked");
+    for path in ripgrep_paths(
+        root,
+        RipgrepFilesOptions {
+            include_hidden: options.include_hidden,
+            follow_links: options.follow_links,
+            include_ignored: options.include_generated,
+            threads: match options.search_mode {
+                SearchMode::Background => Some(1),
+                SearchMode::Manual(threads) => Some(threads),
+                SearchMode::Interactive | SearchMode::Balanced | SearchMode::Aggressive => None,
+            },
+        },
+    )? {
+        if let Some(candidate) = candidate_from_ripgrep_path(root, options, path) {
+            on_candidate(candidate);
         }
     }
 
     Ok(())
 }
 
-fn candidate_from_path(root: &Path, options: &FileSearchOptions, path: &Path) -> Option<Candidate> {
-    let relative_path = path.strip_prefix(root).ok()?.to_path_buf();
-
-    if !options.include_generated && is_generated_artifact(&relative_path) {
-        return None;
-    }
-
-    let metadata = if options.follow_links {
-        path.metadata().ok()?
-    } else {
-        path.symlink_metadata().ok()?
-    };
-    let match_type = if metadata.is_dir() {
-        MatchType::Directory
-    } else if metadata.is_file() {
-        MatchType::File
-    } else {
-        return None;
+fn candidate_from_ripgrep_path(
+    root: &Path,
+    options: &FileSearchOptions,
+    path: RipgrepPath,
+) -> Option<Candidate> {
+    let match_type = match path.kind {
+        RipgrepPathKind::File => MatchType::File,
+        RipgrepPathKind::Directory => MatchType::Directory,
     };
 
     if !matches_kind(options.kind, match_type) {
         return None;
     }
 
-    let display_path = relative_path.to_string_lossy().replace('\\', "/");
+    let display_path = path.relative.to_string_lossy().replace('\\', "/");
     if display_path.is_empty() {
         return None;
     }
 
     Some(Candidate {
         root: root.to_path_buf(),
-        relative_path,
+        relative_path: path.relative,
         display_path,
         match_type,
     })

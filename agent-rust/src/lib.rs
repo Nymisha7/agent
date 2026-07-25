@@ -4,6 +4,7 @@ mod edit_file;
 mod glob;
 mod grep;
 mod read_path;
+mod ripgrep;
 mod target_resolver;
 mod write_file;
 

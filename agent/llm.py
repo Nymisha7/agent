@@ -50,12 +50,13 @@ class LLMClient:
         self.model = self.model or _default_model_for_provider(self.provider)
         self.reasoning_effort = _default_reasoning_effort(self.provider, self.model)
         self.reasoning_summary = _default_reasoning_summary(self.provider, self.model)
+        timeout = _llm_timeout_seconds()
         if self.provider == "openai":
             self.endpoint = "OpenAI"
             self.mode = "hosted"
             api_key = os.environ.get("OPENAI_API_KEY")
             if api_key:
-                self.client = OpenAI(api_key=api_key)
+                self.client = OpenAI(api_key=api_key, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("OpenAI", "OPENAI_API_KEY")
         elif self.provider == "openai-compatible":
@@ -66,6 +67,7 @@ class LLMClient:
                 self.client = OpenAI(
                     api_key=os.environ.get("AGENT_OPENAI_COMPAT_API_KEY") or "local",
                     base_url=base_url,
+                    timeout=timeout,
                 )
             else:
                 self.configuration_error = _provider_configuration_error(
@@ -77,6 +79,7 @@ class LLMClient:
             self.client = OpenAI(
                 api_key=os.environ.get("OLLAMA_API_KEY") or "ollama",
                 base_url=base_url,
+                timeout=timeout,
             )
             self.endpoint = base_url
             self.mode = "local"
@@ -85,6 +88,7 @@ class LLMClient:
             self.client = OpenAI(
                 api_key=os.environ.get("LMSTUDIO_API_KEY") or "lmstudio",
                 base_url=base_url,
+                timeout=timeout,
             )
             self.endpoint = base_url
             self.mode = "local"
@@ -93,6 +97,7 @@ class LLMClient:
             self.client = OpenAI(
                 api_key=os.environ.get("LLAMACPP_API_KEY") or "local",
                 base_url=base_url,
+                timeout=timeout,
             )
             self.endpoint = base_url
             self.mode = "local"
@@ -101,6 +106,7 @@ class LLMClient:
             self.client = OpenAI(
                 api_key=os.environ.get("VLLM_API_KEY") or "local",
                 base_url=base_url,
+                timeout=timeout,
             )
             self.endpoint = base_url
             self.mode = "local"
@@ -109,6 +115,7 @@ class LLMClient:
             self.client = OpenAI(
                 api_key=os.environ.get("LOCALAI_API_KEY") or "local",
                 base_url=base_url,
+                timeout=timeout,
             )
             self.endpoint = base_url
             self.mode = "local"
@@ -129,7 +136,7 @@ class LLMClient:
             self.mode = "hosted"
             api_key = os.environ.get("GROQ_API_KEY")
             if api_key:
-                self.client = OpenAI(api_key=api_key, base_url=self.endpoint)
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("Groq", "GROQ_API_KEY")
         elif self.provider == "openrouter":
@@ -137,7 +144,7 @@ class LLMClient:
             self.mode = "hosted"
             api_key = os.environ.get("OPENROUTER_API_KEY")
             if api_key:
-                self.client = OpenAI(api_key=api_key, base_url=self.endpoint)
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("OpenRouter", "OPENROUTER_API_KEY")
         elif self.provider == "azure":
@@ -170,7 +177,7 @@ class LLMClient:
             self.mode = "hosted"
             api_key = os.environ.get("DEEPSEEK_API_KEY")
             if api_key:
-                self.client = OpenAI(api_key=api_key, base_url=self.endpoint)
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("DeepSeek", "DEEPSEEK_API_KEY")
         elif self.provider == "glm":
@@ -184,7 +191,7 @@ class LLMClient:
             self.mode = "hosted"
             api_key = _first_env("GLM_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY", "BIGMODEL_API_KEY")
             if api_key:
-                self.client = OpenAI(api_key=api_key, base_url=self.endpoint)
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("GLM", "GLM_API_KEY")
         else:
@@ -990,10 +997,47 @@ def _text_content_tool_calls(
             calls.append(parsed)
         return calls, ""
 
+    plain_calls = _plain_text_tool_calls(content, allowed_names=allowed_names)
+    if plain_calls:
+        return plain_calls, ""
+
     parsed = _text_tool_call_object(content.strip(), allowed_names=allowed_names)
     if parsed is None:
         return [], content
     return [parsed], ""
+
+
+def _plain_text_tool_calls(
+    content: str,
+    *,
+    allowed_names: set[str],
+) -> list[dict[str, str]]:
+    calls: list[dict[str, str]] = []
+    decoder = json.JSONDecoder()
+    position = 0
+    while position < len(content):
+        while position < len(content) and content[position].isspace():
+            position += 1
+        name_match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", content[position:])
+        if name_match is None:
+            return []
+        name = name_match.group(0)
+        if name not in allowed_names:
+            return []
+        position += name_match.end()
+        while position < len(content) and content[position].isspace():
+            position += 1
+        try:
+            arguments, position = decoder.raw_decode(content, position)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(arguments, dict):
+            return []
+        calls.append({
+            "name": name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+        })
+    return calls
 
 
 def _text_tool_call_object(
@@ -1152,6 +1196,10 @@ def _float_env(name: str) -> float | None:
         return float(raw)
     except ValueError:
         return None
+
+
+def _llm_timeout_seconds() -> float:
+    return _float_env("AGENT_LLM_TIMEOUT_SECONDS") or 60.0
 
 
 def _int_env(name: str, *, default: int) -> int:

@@ -14,9 +14,9 @@ from agent.main import (
     _activate_local_runtime,
     _api_key_prompt_provider,
     _approval_panel_lines,
+    _approval_display_text,
     _compact_usage_text,
     _complete_slash_command,
-    _devices_text,
     _ensure_ollama_running,
     _expire_orphaned_approvals,
     _exclusive_bridge_turn,
@@ -30,6 +30,8 @@ from agent.main import (
     _run_tui_bridge,
     _slash_command_lines,
     _slash_palette_entries,
+    _selectable_palette_index,
+    _tools_text,
     _tui_bridge_completions,
     _tui_bridge_apply_approval_decision,
     _tui_bridge_snapshot,
@@ -98,53 +100,35 @@ class TuiExitTests(unittest.TestCase):
 
 
 class TuiRenderingTests(unittest.TestCase):
-    def test_device_inventory_renders_status_and_unavailable_categories(self) -> None:
-        text = _devices_text({
-            "ok": True,
-            "runtime": "linux",
-            "visibility": "current_os",
-            "availability": {
-                "usb": {"available": True},
-                "bluetooth": {"available": False},
-                "network": {"available": True},
-            },
-            "usb": [{"product": "USB Receiver", "status": "connected"}],
-            "bluetooth": [],
-            "network": [{
-                "name": "wlan0",
-                "status": "connected",
-                "interface_type": "wifi",
-                "ssid": "OfficeNet",
-                "addresses": ["192.0.2.4/24"],
-            }],
-        })
+    def test_tools_command_groups_tools_by_purpose_and_policy(self) -> None:
+        ctx = SimpleNamespace(
+            rust=SimpleNamespace(),
+            workspace_root=Path("/workspace"),
+            search_roots=[Path("/workspace")],
+            skills=None,
+            tool_allowlist={"read_path", "grep", "desktop_send_message"},
+            agent_id="main",
+        )
 
-        self.assertIn("USB Receiver — connected", text)
-        self.assertIn("Unavailable from this runtime", text)
-        self.assertIn("SSID OfficeNet", text)
-        self.assertIn("192.0.2.4/24", text)
+        text = _tools_text(ctx)
 
-    def test_device_inventory_renders_unknown_runtime_categories(self) -> None:
-        text = _devices_text({
-            "ok": True,
-            "runtime": "wsl",
-            "visibility": "wsl_visible",
-            "categories": {
-                "other": {
-                    "state": {"available": True, "source": "windows_pnp"},
-                    "records": [{
-                        "name": "Future Sensor",
-                        "status": "present",
-                        "native_class": "QuantumSensor",
-                        "source_runtime": "windows_host",
-                    }],
-                },
-            },
-        })
+        self.assertIn("Agent tools", text)
+        self.assertIn("Workspace", text)
+        self.assertIn("read_path", text)
+        self.assertIn("Desktop Control", text)
+        self.assertIn("desktop_send_message", text)
+        self.assertIn("requires approval", text)
+        self.assertIn("Disabled by profile allowlist", text)
+        self.assertNotIn("discovery_subagent", text)
 
-        self.assertIn("Other (1)", text)
-        self.assertIn("Future Sensor — present", text)
-        self.assertIn("class QuantumSensor", text)
+    def test_devices_and_capabilities_are_not_slash_commands(self) -> None:
+        ctx = SimpleNamespace()
+
+        self.assertEqual(_handle_local_command(ctx, "/devices"), "Unknown local command: /devices")
+        self.assertEqual(_handle_local_command(ctx, "/capabilities"), "Unknown local command: /capabilities")
+        self.assertNotIn("/devices", "\n".join(_slash_command_lines("/", 80)))
+        self.assertNotIn("/capabilities", "\n".join(_slash_command_lines("/", 80)))
+        self.assertFalse(any(entry.value in {"/devices", "/capabilities"} for entry in _slash_palette_entries("/")))
 
     def test_bridge_local_command_round_trip_includes_prompt_and_answer(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -630,6 +614,7 @@ class TuiRenderingTests(unittest.TestCase):
                 "status": "pending",
                 "tool": "delete_path",
                 "requested_path": "/tmp/example.txt",
+                "display_path": "Example file",
             }]),
             store=SimpleNamespace(
                 get_session=lambda _session_id: SimpleNamespace(
@@ -648,6 +633,7 @@ class TuiRenderingTests(unittest.TestCase):
 
         self.assertEqual(snapshot["approvals"][0]["id"], "req-1")
         self.assertEqual(snapshot["approvals"][0]["tool"], "delete_path")
+        self.assertEqual(snapshot["approvals"][0]["display_path"], "Example file")
         self.assertEqual(seen_limits, [TUI_TRANSCRIPT_LIMIT])
 
     def test_tui_bridge_approval_decision_persists_for_waiting_turn(self) -> None:
@@ -895,6 +881,7 @@ class TuiRenderingTests(unittest.TestCase):
                 {
                     "tool": "delete_path",
                     "requested_path": "/tmp/external.txt",
+                    "display_path": "External file",
                     "reason": "external_path_requires_approval",
                 }
             ],
@@ -906,10 +893,25 @@ class TuiRenderingTests(unittest.TestCase):
 
         self.assertIn("Approvals", text)
         self.assertIn("delete_path", text)
-        self.assertIn("/tmp/external.txt", text)
+        self.assertIn("External file", text)
+        self.assertNotIn("/tmp/external.txt", text)
         self.assertIn("external_path_requires_approval", text)
         self.assertIn("Enter/Y approve", text)
         self.assertIn("N/Esc deny", text)
+
+    def test_approval_display_hides_encoded_windows_targets(self) -> None:
+        self.assertEqual(
+            _approval_display_text({
+                "requested_path": "desktop launch_application windows-app:abcdef Vitelglobal",
+            }),
+            "desktop launch_application Vitelglobal",
+        )
+        self.assertEqual(
+            _approval_display_text({
+                "requested_path": "desktop close_window 0x800e8",
+            }),
+            "desktop close_window selected window",
+        )
 
     def test_compact_usage_handles_unknown_model_context(self) -> None:
         session = SimpleNamespace(
@@ -927,6 +929,7 @@ class TuiRenderingTests(unittest.TestCase):
         text = "\n".join(lines)
 
         self.assertIn("Commands", text)
+        self.assertIn("> /model", text)
         self.assertIn("/model", text)
         self.assertNotIn("/providers", text)
         self.assertNotIn("/provider", text)
@@ -945,6 +948,19 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual(entries[0].value, "/model")
         self.assertFalse(entries[0].execute)
         self.assertEqual(entries[0].complete_to, "/model ")
+
+    def test_palette_selection_keeps_submenus_but_skips_sections(self) -> None:
+        top_entries = _slash_palette_entries("/")
+
+        self.assertEqual(_selectable_palette_index(top_entries, 0), 0)
+        self.assertEqual(top_entries[0].value, "/model")
+
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-5.5", configuration_error=None))
+        with patch("agent.main._discover_local_provider_availability", return_value={}):
+            model_entries = _slash_palette_entries("/model ", ctx=ctx)
+        section = next(index for index, entry in enumerate(model_entries) if entry.value.startswith("section:"))
+
+        self.assertNotEqual(_selectable_palette_index(model_entries, section), section)
 
     def test_tab_completion_completes_single_slash_command(self) -> None:
         self.assertEqual(_complete_slash_command("/sta"), "/status ")

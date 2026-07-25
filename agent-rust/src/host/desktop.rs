@@ -17,6 +17,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const WINDOWS_SHORTCUT_PREFIX: &str = "windows-shortcut:";
+const WINDOWS_APP_PREFIX: &str = "windows-app:";
+
 pub(crate) fn desktop_capabilities() -> Result<Value> {
     let runtime = desktop_runtime();
     let linux_supported = cfg!(target_os = "linux");
@@ -101,7 +104,10 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
                 if linux_supported { None } else { Some("unsupported_platform") },
             ),
             "window_control": backend_status(
-                linux_supported && (command_exists("wmctrl") || command_exists("xdotool")),
+                linux_supported
+                    && (command_exists("wmctrl")
+                        || command_exists("xdotool")
+                        || (wsl && has_powershell_host)),
                 window_control_backend(),
                 if linux_supported { None } else { Some("unsupported_platform") },
             ),
@@ -141,14 +147,14 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
             action_capability("network_disconnect", linux_supported && command_exists("ip"), "ip", "approval_required", Some("target_required")),
             action_capability("eject_storage", linux_supported && command_exists("udisksctl"), "udisksctl", "approval_required", Some("target_required")),
             action_capability("terminate_process", linux_supported, "libc_signal", "approval_required", Some("target_required")),
-            action_capability("launch_application", linux_supported && (has_gtk_launch || has_xdg_open), if has_gtk_launch { "gtk-launch" } else if has_xdg_open { "xdg-open" } else { "path_lookup" }, "approval_required", Some("target_required")),
+            action_capability("launch_application", linux_supported && (has_gtk_launch || has_xdg_open || (wsl && has_powershell_host)), if has_gtk_launch { "gtk-launch" } else if has_xdg_open { "xdg-open" } else if wsl && has_powershell_host { "windows_host_powershell" } else { "path_lookup" }, "approval_required", Some("target_required")),
             action_capability("open_path", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
             action_capability("open_url", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
-            action_capability("focus_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool")), window_control_backend(), "approval_required", Some("target_required")),
+            action_capability("focus_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool") || (wsl && has_powershell_host)), window_control_backend(), "approval_required", Some("target_required")),
             action_capability("minimize_window", linux_supported && command_exists("xdotool"), "xdotool", "approval_required", Some("target_required")),
             action_capability("maximize_window", linux_supported && command_exists("wmctrl"), "wmctrl", "approval_required", Some("target_required")),
             action_capability("restore_window", linux_supported && command_exists("wmctrl"), "wmctrl", "approval_required", Some("target_required")),
-            action_capability("close_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool")), window_control_backend(), "approval_required", Some("target_required")),
+            action_capability("close_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool") || (wsl && has_powershell_host)), window_control_backend(), "approval_required", Some("target_required")),
             action_capability("clipboard_write", linux_supported && clipboard_backend() != "unavailable", clipboard_backend(), "approval_required", None),
             action_capability("clipboard_files", linux_supported && file_clipboard_backend() != "unavailable", file_clipboard_backend(), "approval_required", Some("existing_paths_required")),
             action_capability("send_key", linux_supported && command_exists("xdotool"), "xdotool", "approval_required", None),
@@ -314,7 +320,11 @@ pub(crate) fn desktop_observe(scope: &str, limit: usize) -> Result<Value> {
 }
 
 pub(crate) fn desktop_resolve(query: &str, kind: &str, limit: usize) -> Result<Value> {
-    let normalized_query = normalize_match_text(query);
+    let normalized_kind = match kind {
+        "application" | "window" | "any" => kind,
+        _ => "any",
+    };
+    let normalized_query = normalize_desktop_query(query, normalized_kind);
     if normalized_query.is_empty() {
         return Ok(json!({
             "ok": false,
@@ -323,15 +333,14 @@ pub(crate) fn desktop_resolve(query: &str, kind: &str, limit: usize) -> Result<V
             "error": "desktop_resolve requires a non-empty query.",
         }));
     }
-    let normalized_kind = match kind {
-        "application" | "window" | "any" => kind,
-        _ => "any",
-    };
     let bounded_limit = limit.clamp(1, 50);
     let mut candidates = Vec::new();
 
     if matches!(normalized_kind, "application" | "any") {
         candidates.extend(resolve_applications(&normalized_query, bounded_limit)?);
+        if !query_requests_uninstaller(&normalized_query) {
+            candidates.retain(|candidate| !candidate_is_uninstaller(candidate));
+        }
     }
     if matches!(normalized_kind, "window" | "any") {
         candidates.extend(resolve_windows(&normalized_query, bounded_limit)?);
@@ -573,6 +582,8 @@ fn window_control_backend() -> &'static str {
         "wmctrl"
     } else if command_exists("xdotool") {
         "xdotool"
+    } else if is_wsl_runtime() && windows_host_powershell_available() {
+        "windows_host_powershell"
     } else {
         "unavailable"
     }
@@ -932,6 +943,13 @@ where
 }
 
 fn launch_desktop_target(action: &str, target: &str, use_xdg_open: bool) -> Result<Value> {
+    if let Some(shortcut) = decode_windows_shortcut_target(target)? {
+        return launch_windows_host_shortcut(action, target, &shortcut);
+    }
+    if let Some(app_id) = decode_windows_app_target(target)? {
+        return launch_windows_host_app(action, target, &app_id);
+    }
+
     let (program, argument) = if use_xdg_open {
         ("xdg-open", target)
     } else if command_exists("gtk-launch") {
@@ -985,6 +1003,7 @@ fn launch_desktop_target(action: &str, target: &str, use_xdg_open: bool) -> Resu
         after = launch_observation(Some(pid))?;
         verified = launch_observation_changed(&before, &after, direct_process_verifies);
     }
+    let focus = focus_launched_window(&before, &after, Some(target))?;
 
     Ok(json!({
         "ok": true,
@@ -999,7 +1018,144 @@ fn launch_desktop_target(action: &str, target: &str, use_xdg_open: bool) -> Resu
         "verified": verified,
         "verification": if verified { "confirmed" } else { "not_confirmed" },
         "waited_ms": waited_ms,
+        "focus": focus,
     }))
+}
+
+fn launch_windows_host_shortcut(action: &str, target: &str, shortcut: &str) -> Result<Value> {
+    if !windows_host_powershell_available() {
+        return Ok(json!({
+            "ok": false,
+            "tool": "desktop_action",
+            "action": action,
+            "target": target,
+            "reason": "dependency_unavailable",
+            "error": "Launching Windows shortcuts requires reachable Windows PowerShell under WSL.",
+        }));
+    }
+    let before = launch_observation(None)?;
+    let output = windows_host_start_shortcut(shortcut)?;
+    let mut after = launch_observation(None)?;
+    let mut verified = launch_observation_changed(&before, &after, false);
+    let mut waited_ms = 0u64;
+    while !verified && waited_ms < 1500 {
+        thread::sleep(Duration::from_millis(150));
+        waited_ms += 150;
+        after = launch_observation(None)?;
+        verified = launch_observation_changed(&before, &after, false);
+    }
+    let focus = if output.status == 0 {
+        let query = windows_shortcut_focus_query(shortcut);
+        focus_launched_window(&before, &after, Some(&query))?
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "ok": output.status == 0,
+        "tool": "desktop_action",
+        "action": action,
+        "target": target,
+        "backend": "windows_host_powershell",
+        "exit_code": output.status,
+        "before": before,
+        "after": after,
+        "verified": output.status == 0 && verified,
+        "verification": if output.status != 0 { "failed" } else if verified { "confirmed" } else { "not_confirmed" },
+        "waited_ms": waited_ms,
+        "focus": focus,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+    }))
+}
+
+fn windows_host_start_shortcut(shortcut: &str) -> Result<DesktopCommandOutput> {
+    run_desktop_capture_with_stdin(
+        &[
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            windows_host_start_shortcut_script(),
+        ],
+        shortcut,
+    )
+}
+
+fn windows_host_start_shortcut_script() -> &'static str {
+    r#"
+$path = [Console]::In.ReadToEnd().Trim()
+if (-not $path.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase)) { Write-Error 'Expected a Start Menu shortcut'; exit 2 }
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Write-Error 'Shortcut not found'; exit 3 }
+Start-Process -FilePath $path
+"#
+}
+
+fn launch_windows_host_app(action: &str, target: &str, app_id: &str) -> Result<Value> {
+    if !windows_host_powershell_available() {
+        return Ok(json!({
+            "ok": false,
+            "tool": "desktop_action",
+            "action": action,
+            "target": target,
+            "reason": "dependency_unavailable",
+            "error": "Launching Windows apps requires reachable Windows PowerShell under WSL.",
+        }));
+    }
+    let before = launch_observation(None)?;
+    let output = windows_host_start_app(app_id)?;
+    let mut after = launch_observation(None)?;
+    let mut verified = launch_observation_changed(&before, &after, false);
+    let mut waited_ms = 0u64;
+    while !verified && waited_ms < 1500 {
+        thread::sleep(Duration::from_millis(150));
+        waited_ms += 150;
+        after = launch_observation(None)?;
+        verified = launch_observation_changed(&before, &after, false);
+    }
+    let focus = if output.status == 0 {
+        focus_launched_window(&before, &after, Some(app_id))?
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "ok": output.status == 0,
+        "tool": "desktop_action",
+        "action": action,
+        "target": target,
+        "backend": "windows_host_powershell",
+        "exit_code": output.status,
+        "before": before,
+        "after": after,
+        "verified": output.status == 0 && verified,
+        "verification": if output.status != 0 { "failed" } else if verified { "confirmed" } else { "not_confirmed" },
+        "waited_ms": waited_ms,
+        "focus": focus,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+    }))
+}
+
+fn windows_host_start_app(app_id: &str) -> Result<DesktopCommandOutput> {
+    run_desktop_capture_with_stdin(
+        &[
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            windows_host_start_app_script(),
+        ],
+        app_id,
+    )
+}
+
+fn windows_host_start_app_script() -> &'static str {
+    r#"
+$appId = [Console]::In.ReadToEnd().Trim()
+if ($appId.Length -eq 0 -or $appId.Length -gt 512 -or $appId -match '[\r\n]') { Write-Error 'Invalid app id'; exit 2 }
+Start-Process -FilePath ("shell:AppsFolder\" + $appId)
+"#
 }
 
 fn launch_observation(pid: Option<u32>) -> Result<Value> {
@@ -1061,6 +1217,61 @@ fn window_summary_changed(before: &Value, after: &Value) -> bool {
     before.get("count").and_then(Value::as_u64) != after.get("count").and_then(Value::as_u64)
         || before.get("ids") != after.get("ids")
         || before.get("titles") != after.get("titles")
+}
+
+fn focus_launched_window(
+    before: &Value,
+    after: &Value,
+    query: Option<&str>,
+) -> Result<Option<Value>> {
+    if let Some(id) = launched_window_id(before, after) {
+        return Ok(Some(window_control_action("focus_window", &id)?));
+    }
+    if let Some(id) = matching_window_id(query)? {
+        return Ok(Some(window_control_action("focus_window", &id)?));
+    };
+    Ok(None)
+}
+
+fn launched_window_id(before: &Value, after: &Value) -> Option<String> {
+    let before_ids: HashSet<&str> = before
+        .pointer("/windows/ids")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    after
+        .pointer("/windows/ids")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|id| !before_ids.contains(id))
+        .map(ToString::to_string)
+}
+
+fn matching_window_id(query: Option<&str>) -> Result<Option<String>> {
+    let Some(query) = query
+        .map(normalize_match_text)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(resolve_windows(&query, 1)?
+        .first()
+        .filter(|candidate| candidate_score(candidate) >= 40)
+        .and_then(|candidate| candidate.get("target"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string))
+}
+
+fn windows_shortcut_focus_query(shortcut: &str) -> String {
+    shortcut
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(shortcut)
+        .strip_suffix(".lnk")
+        .unwrap_or(shortcut)
+        .to_string()
 }
 
 fn clipboard_backend() -> &'static str {
@@ -2073,6 +2284,7 @@ fn resolve_applications(query: &str, limit: usize) -> Result<Vec<Value>> {
             let name = app.get("name").and_then(Value::as_str).unwrap_or_default();
             let id = app.get("id").and_then(Value::as_str).unwrap_or_default();
             let exec = app.get("exec").and_then(Value::as_str).unwrap_or_default();
+            let target = app.get("target").and_then(Value::as_str).unwrap_or(id);
             let score = match_score(query, &[name, id, exec]);
             if score > 0 {
                 candidates.push(json!({
@@ -2081,9 +2293,33 @@ fn resolve_applications(query: &str, limit: usize) -> Result<Vec<Value>> {
                     "id": id,
                     "name": name,
                     "exec": exec,
-                    "target": id,
+                    "target": target,
                     "action": "launch_application",
-                    "backend": apps.get("backend").cloned(),
+                    "backend": app.get("backend").cloned().or_else(|| apps.get("backend").cloned()),
+                }));
+            }
+        }
+    }
+    if candidates.len() < limit && windows_host_powershell_available() {
+        for app in windows_host_registered_application_matches(query, limit - candidates.len())? {
+            let name = app.get("name").and_then(Value::as_str).unwrap_or_default();
+            let id = app.get("id").and_then(Value::as_str).unwrap_or_default();
+            let exec = app.get("exec").and_then(Value::as_str).unwrap_or_default();
+            let score = match_score(query, &[name, id, exec]);
+            if score > 0
+                && !candidates
+                    .iter()
+                    .any(|candidate| candidate.get("target") == app.get("target"))
+            {
+                candidates.push(json!({
+                    "kind": "application",
+                    "score": score,
+                    "id": id,
+                    "name": name,
+                    "exec": exec,
+                    "target": app.get("target").and_then(Value::as_str).unwrap_or(id),
+                    "action": "launch_application",
+                    "backend": app.get("backend").cloned(),
                 }));
             }
         }
@@ -2179,6 +2415,46 @@ fn normalize_match_text(value: &str) -> String {
         .split_whitespace()
         .collect::<Vec<&str>>()
         .join(" ")
+}
+
+fn normalize_desktop_query(value: &str, kind: &str) -> String {
+    let normalized = normalize_match_text(value);
+    if kind != "application" {
+        return normalized;
+    }
+    let mut words = normalized.split_whitespace().collect::<Vec<_>>();
+    if words
+        .first()
+        .is_some_and(|word| matches!(*word, "my" | "the"))
+    {
+        words.remove(0);
+    }
+    if words
+        .last()
+        .is_some_and(|word| matches!(*word, "app" | "application"))
+    {
+        words.pop();
+    }
+    words.join(" ")
+}
+
+fn query_requests_uninstaller(query: &str) -> bool {
+    query
+        .split_whitespace()
+        .any(|word| matches!(word, "uninstall" | "uninstaller" | "remove"))
+}
+
+fn candidate_is_uninstaller(candidate: &Value) -> bool {
+    ["name", "exec", "target"].iter().any(|key| {
+        candidate
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                normalize_match_text(value)
+                    .split_whitespace()
+                    .any(|word| matches!(word, "uninstall" | "uninstaller"))
+            })
+    })
 }
 
 fn candidate_score(candidate: &Value) -> i64 {
@@ -2515,13 +2791,24 @@ fn window_control_action(action: &str, target: &str) -> Result<Value> {
                 window_control_receipt(action, target, &["wmctrl", "-ia", target], |_, after| {
                     window_state_bool(after, "active") == Some(true)
                 })
-            } else {
+            } else if command_exists("xdotool") {
                 window_control_receipt(
                     action,
                     target,
                     &["xdotool", "windowactivate", target],
                     |_, after| window_state_bool(after, "active") == Some(true),
                 )
+            } else if is_wsl_runtime() && windows_host_powershell_available() {
+                windows_host_focus_window_receipt(action, target)
+            } else {
+                Ok(json!({
+                    "ok": false,
+                    "tool": "desktop_action",
+                    "action": action,
+                    "target": target,
+                    "reason": "dependency_unavailable",
+                    "error": "Window focus requires wmctrl, xdotool, or reachable Windows PowerShell under WSL.",
+                }))
             }
         }
         "minimize_window" => window_control_receipt(
@@ -2571,7 +2858,7 @@ fn window_control_action(action: &str, target: &str) -> Result<Value> {
                             && window_state_bool(after, "visible") == Some(false)
                     },
                 )
-            } else {
+            } else if command_exists("xdotool") {
                 window_control_receipt(
                     action,
                     target,
@@ -2581,6 +2868,17 @@ fn window_control_action(action: &str, target: &str) -> Result<Value> {
                             && window_state_bool(after, "visible") == Some(false)
                     },
                 )
+            } else if is_wsl_runtime() && windows_host_powershell_available() {
+                windows_host_close_window_receipt(action, target)
+            } else {
+                Ok(json!({
+                    "ok": false,
+                    "tool": "desktop_action",
+                    "action": action,
+                    "target": target,
+                    "reason": "dependency_unavailable",
+                    "error": "Window close requires wmctrl, xdotool, or reachable Windows PowerShell under WSL.",
+                }))
             }
         }
         _ => Ok(json!({
@@ -2670,6 +2968,13 @@ fn active_window_id() -> Result<Option<String>> {
             }
         }
     }
+    if is_wsl_runtime() && windows_host_powershell_available() {
+        let active = windows_host_active_window()?;
+        return Ok(active
+            .pointer("/window/id")
+            .and_then(Value::as_str)
+            .and_then(normalize_window_id));
+    }
     Ok(None)
 }
 
@@ -2748,13 +3053,276 @@ fn installed_applications(limit: usize) -> Result<Value> {
             break;
         }
     }
+    if apps.len() < limit && windows_host_powershell_available() {
+        for app in windows_host_start_menu_applications(limit - apps.len())? {
+            let id = app
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if seen.insert(id) {
+                apps.push(app);
+            }
+            if apps.len() >= limit {
+                break;
+            }
+        }
+    }
+    if apps.len() < limit && windows_host_powershell_available() {
+        for app in windows_host_registered_applications(limit - apps.len())? {
+            let id = app
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if seen.insert(id) {
+                apps.push(app);
+            }
+            if apps.len() >= limit {
+                break;
+            }
+        }
+    }
     Ok(json!({
         "ok": true,
-        "backend": "freedesktop_desktop_entries",
+        "backend": if apps.iter().any(|app| app.get("backend").and_then(Value::as_str) == Some("windows_host_powershell")) { "mixed" } else { "freedesktop_desktop_entries" },
         "count": apps.len(),
         "items": apps,
         "truncated": apps.len() >= limit,
     }))
+}
+
+fn windows_host_registered_applications(limit: usize) -> Result<Vec<Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let script = windows_host_registered_applications_script(limit);
+    let output = run_capture_dynamic(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ])?;
+    if output.status != 0 {
+        return Ok(Vec::new());
+    }
+    let raw = serde_json::from_str::<Value>(&output.stdout).unwrap_or(Value::Null);
+    Ok(json_values(raw)
+        .into_iter()
+        .filter_map(|item| {
+            let name = item.get("Name").and_then(Value::as_str)?;
+            let app_id = item.get("AppID").and_then(Value::as_str)?;
+            let target = windows_app_target(app_id)?;
+            Some(json!({
+                "id": target,
+                "target": target,
+                "name": name,
+                "exec": app_id,
+                "path": format!("shell:AppsFolder\\{app_id}"),
+                "no_display": false,
+                "terminal": false,
+                "categories": ["Windows", "StartApps"],
+                "backend": "windows_host_powershell",
+            }))
+        })
+        .collect())
+}
+
+fn windows_host_registered_application_matches(query: &str, limit: usize) -> Result<Vec<Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let output = run_desktop_capture_with_stdin(
+        &[
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &windows_host_registered_application_matches_script(limit),
+        ],
+        query,
+    )?;
+    if output.status != 0 {
+        return Ok(Vec::new());
+    }
+    let raw = serde_json::from_str::<Value>(&output.stdout).unwrap_or(Value::Null);
+    Ok(json_values(raw)
+        .into_iter()
+        .filter_map(windows_host_registered_application_value)
+        .collect())
+}
+
+fn windows_host_registered_application_value(item: Value) -> Option<Value> {
+    let name = item.get("Name").and_then(Value::as_str)?;
+    let app_id = item.get("AppID").and_then(Value::as_str)?;
+    let target = windows_app_target(app_id)?;
+    Some(json!({
+        "id": target,
+        "target": target,
+        "name": name,
+        "exec": app_id,
+        "path": format!("shell:AppsFolder\\{app_id}"),
+        "no_display": false,
+        "terminal": false,
+        "categories": ["Windows", "StartApps"],
+        "backend": "windows_host_powershell",
+    }))
+}
+
+fn windows_host_registered_application_matches_script(limit: usize) -> String {
+    r#"
+$query = [Console]::In.ReadToEnd().Trim().ToLowerInvariant()
+if ($query.Length -eq 0) { @() | ConvertTo-Json -Compress; exit 0 }
+Get-StartApps |
+  Where-Object { $_.Name.ToLowerInvariant().Contains($query) -or $_.AppID.ToLowerInvariant().Contains($query) } |
+  Select-Object -First __LIMIT__ Name,AppID |
+  ConvertTo-Json -Compress
+"#
+    .replace("__LIMIT__", &limit.to_string())
+}
+
+fn windows_host_registered_applications_script(limit: usize) -> String {
+    "Get-StartApps | Select-Object -First __LIMIT__ Name,AppID | ConvertTo-Json -Compress"
+        .replace("__LIMIT__", &limit.to_string())
+}
+
+fn windows_host_start_menu_applications(limit: usize) -> Result<Vec<Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let script = windows_host_start_menu_applications_script(limit);
+    let output = run_capture_dynamic(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ])?;
+    if output.status != 0 {
+        return Ok(Vec::new());
+    }
+    let raw = serde_json::from_str::<Value>(&output.stdout).unwrap_or(Value::Null);
+    Ok(json_values(raw)
+        .into_iter()
+        .filter_map(|item| {
+            let name = item.get("Name").and_then(Value::as_str)?;
+            let path = item.get("Path").and_then(Value::as_str)?;
+            let target = windows_shortcut_target(path)?;
+            Some(json!({
+                "id": target,
+                "target": target,
+                "name": name,
+                "exec": path,
+                "path": path,
+                "no_display": false,
+                "terminal": false,
+                "categories": ["Windows", "StartMenu"],
+                "backend": "windows_host_powershell",
+            }))
+        })
+        .collect())
+}
+
+fn windows_host_start_menu_applications_script(limit: usize) -> String {
+    r#"
+$dirs = @(
+  "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+  "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+if (-not $dirs) { @() | ConvertTo-Json -Compress; exit 0 }
+Get-ChildItem -LiteralPath $dirs -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue |
+  Select-Object -First __LIMIT__ @{Name='Name';Expression={$_.BaseName}},@{Name='Path';Expression={$_.FullName}} |
+  ConvertTo-Json -Compress
+"#
+    .replace("__LIMIT__", &limit.to_string())
+}
+
+fn windows_shortcut_target(path: &str) -> Option<String> {
+    if !valid_windows_shortcut_path(path) {
+        return None;
+    }
+    Some(format!(
+        "{WINDOWS_SHORTCUT_PREFIX}{}",
+        hex_encode(path.as_bytes())
+    ))
+}
+
+fn windows_app_target(app_id: &str) -> Option<String> {
+    if !valid_windows_app_id(app_id) {
+        return None;
+    }
+    Some(format!(
+        "{WINDOWS_APP_PREFIX}{}",
+        hex_encode(app_id.as_bytes())
+    ))
+}
+
+fn decode_windows_app_target(target: &str) -> Result<Option<String>> {
+    let Some(encoded) = target.strip_prefix(WINDOWS_APP_PREFIX) else {
+        return Ok(None);
+    };
+    let bytes = hex_decode(encoded)?;
+    let app_id = String::from_utf8(bytes)?;
+    if !valid_windows_app_id(&app_id) {
+        return Err(anyhow::anyhow!("invalid Windows app target"));
+    }
+    Ok(Some(app_id))
+}
+
+fn valid_windows_app_id(app_id: &str) -> bool {
+    !app_id.is_empty() && app_id.len() <= 512 && !app_id.chars().any(char::is_control)
+}
+
+fn decode_windows_shortcut_target(target: &str) -> Result<Option<String>> {
+    let Some(encoded) = target.strip_prefix(WINDOWS_SHORTCUT_PREFIX) else {
+        return Ok(None);
+    };
+    let bytes = hex_decode(encoded)?;
+    let path = String::from_utf8(bytes)?;
+    if !valid_windows_shortcut_path(&path) {
+        return Err(anyhow::anyhow!("invalid Windows shortcut target"));
+    }
+    Ok(Some(path))
+}
+
+fn valid_windows_shortcut_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && path.ends_with(".lnk")
+        && !path.chars().any(char::is_control)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return Err(anyhow::anyhow!("invalid hex target"));
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let high = hex_value(chunk[0]).ok_or_else(|| anyhow::anyhow!("invalid hex target"))?;
+        let low = hex_value(chunk[1]).ok_or_else(|| anyhow::anyhow!("invalid hex target"))?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn desktop_application_dirs() -> Vec<PathBuf> {
@@ -2915,10 +3483,7 @@ fn linux_windows(limit: usize) -> Result<Value> {
 }
 
 fn windows_host_windows(limit: usize) -> Result<Value> {
-    let script = format!(
-        "Get-Process | Where-Object {{$_.MainWindowTitle}} | Select-Object -First {} Id,ProcessName,MainWindowTitle,Path | ConvertTo-Json -Compress",
-        limit
-    );
+    let script = windows_host_window_list_script(limit);
     let output = run_capture_dynamic(&[
         "powershell.exe",
         "-NoProfile",
@@ -2933,7 +3498,7 @@ fn windows_host_windows(limit: usize) -> Result<Value> {
         .map(|item| {
             json!({
                 "id": item.get("Id").cloned(),
-                "pid": item.get("Id").cloned(),
+                "pid": item.get("Pid").cloned(),
                 "process": item.get("ProcessName").cloned(),
                 "title": item.get("MainWindowTitle").cloned(),
                 "path": item.get("Path").cloned(),
@@ -2948,6 +3513,11 @@ fn windows_host_windows(limit: usize) -> Result<Value> {
         "items": items,
         "stderr": output.stderr,
     }))
+}
+
+fn windows_host_window_list_script(limit: usize) -> String {
+    r#"Get-Process | Where-Object {$_.MainWindowTitle -and $_.MainWindowHandle -ne 0} | Select-Object -First __LIMIT__ @{Name='Id';Expression={'0x{0:x}' -f $_.MainWindowHandle.ToInt64()}},@{Name='Pid';Expression={$_.Id}},ProcessName,MainWindowTitle,@{Name='Path';Expression={try {$_.Path} catch {$null}}} | ConvertTo-Json -Compress"#
+        .replace("__LIMIT__", &limit.to_string())
 }
 
 fn active_window() -> Result<Value> {
@@ -3005,7 +3575,7 @@ $builder = New-Object System.Text.StringBuilder 1024
 $pid = 0
 [void][AgentUser32]::GetWindowThreadProcessId($hwnd, [ref]$pid)
 $process = if ($pid) { Get-Process -Id $pid -ErrorAction SilentlyContinue } else { $null }
-@{ id = $hwnd.ToInt64(); pid = $pid; title = $builder.ToString(); process = $process.ProcessName; path = $process.Path } | ConvertTo-Json -Compress
+@{ id = ('0x{0:x}' -f $hwnd.ToInt64()); pid = $pid; title = $builder.ToString(); process = $process.ProcessName; path = $process.Path } | ConvertTo-Json -Compress
 "#;
     let output = run_capture_dynamic(&[
         "powershell.exe",
@@ -3021,6 +3591,134 @@ $process = if ($pid) { Get-Process -Id $pid -ErrorAction SilentlyContinue } else
         "window": item,
         "stderr": output.stderr,
     }))
+}
+
+fn windows_host_focus_window_receipt(action: &str, target: &str) -> Result<Value> {
+    let before = window_state(target)?;
+    let output = windows_host_focus_window(target)?;
+    thread::sleep(Duration::from_millis(100));
+    let after = window_state(target)?;
+    let verified = output.status == 0 && window_state_bool(&after, "active") == Some(true);
+    Ok(json!({
+        "ok": output.status == 0,
+        "tool": "desktop_action",
+        "action": action,
+        "target": target,
+        "backend": "windows_host_powershell",
+        "exit_code": output.status,
+        "before": before,
+        "after": after,
+        "verified": verified,
+        "verification": if output.status != 0 { "failed" } else if verified { "confirmed" } else { "not_confirmed" },
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+    }))
+}
+
+fn windows_host_focus_window(target: &str) -> Result<DesktopCommandOutput> {
+    let script = windows_host_focus_window_script(target)?;
+    run_desktop_capture(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ])
+}
+
+fn windows_host_focus_window_script(target: &str) -> Result<String> {
+    let normalized = normalize_window_id(target)
+        .ok_or_else(|| anyhow::anyhow!("focus_window requires a concrete window id"))?;
+    let handle = u64::from_str_radix(normalized.trim_start_matches("0x"), 16)?;
+    Ok(format!(
+        r#"
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class AgentUser32 {{
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}}
+'@
+$hwnd = [IntPtr]{handle}
+if (-not [AgentUser32]::IsWindow($hwnd)) {{ Write-Error "Invalid window handle"; exit 2 }}
+[void][AgentUser32]::ShowWindowAsync($hwnd, 9)
+Start-Sleep -Milliseconds 50
+[void][AgentUser32]::SetForegroundWindow($hwnd)
+Start-Sleep -Milliseconds 50
+$active = [AgentUser32]::GetForegroundWindow().ToInt64()
+@{{ target = {handle}; active = $active; focused = ($active -eq {handle}) }} | ConvertTo-Json -Compress
+"#
+    ))
+}
+
+fn windows_host_close_window_receipt(action: &str, target: &str) -> Result<Value> {
+    let before = window_state(target)?;
+    let output = windows_host_close_window(target)?;
+    thread::sleep(Duration::from_millis(250));
+    let after = window_state(target)?;
+    let verified = output.status == 0
+        && window_state_bool(&before, "visible") == Some(true)
+        && window_state_bool(&after, "visible") == Some(false);
+    Ok(json!({
+        "ok": output.status == 0,
+        "tool": "desktop_action",
+        "action": action,
+        "target": target,
+        "backend": "windows_host_powershell",
+        "exit_code": output.status,
+        "before": before,
+        "after": after,
+        "verified": verified,
+        "verification": if output.status != 0 { "failed" } else if verified { "confirmed" } else { "not_confirmed" },
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+    }))
+}
+
+fn windows_host_close_window(target: &str) -> Result<DesktopCommandOutput> {
+    let script = windows_host_close_window_script(target)?;
+    run_desktop_capture(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ])
+}
+
+fn windows_host_close_window_script(target: &str) -> Result<String> {
+    let normalized = normalize_window_id(target)
+        .ok_or_else(|| anyhow::anyhow!("close_window requires a concrete window id"))?;
+    let handle = u64::from_str_radix(normalized.trim_start_matches("0x"), 16)?;
+    Ok(format!(
+        r#"
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class AgentUser32 {{
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+}}
+'@
+$hwnd = [IntPtr]{handle}
+if (-not [AgentUser32]::IsWindow($hwnd)) {{ Write-Error "Invalid window handle"; exit 2 }}
+$pid = 0
+[void][AgentUser32]::GetWindowThreadProcessId($hwnd, [ref]$pid)
+$ok = [AgentUser32]::PostMessage($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 500
+$forced = $false
+if ([AgentUser32]::IsWindow($hwnd) -and $pid -gt 0) {{
+    Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+    $forced = $true
+    Start-Sleep -Milliseconds 250
+}}
+@{{ target = {handle}; pid = $pid; close_requested = $ok; forced = $forced }} | ConvertTo-Json -Compress
+"#
+    ))
 }
 
 fn json_values(value: Value) -> Vec<Value> {
@@ -3450,6 +4148,129 @@ mod tests {
         assert_eq!(super::match_score(&query, &["VS Code"]), 100);
         assert!(super::match_score(&query, &["Visual Studio Code"]) > 0);
         assert_eq!(super::match_score(&query, &["Terminal"]), 0);
+    }
+
+    #[test]
+    fn desktop_resolver_normalizes_app_phrases_and_rejects_uninstallers() {
+        assert_eq!(
+            super::normalize_desktop_query("my Spark app", "application"),
+            "spark"
+        );
+        assert!(!super::query_requests_uninstaller("spark"));
+        assert!(super::query_requests_uninstaller("spark uninstaller"));
+        assert!(super::candidate_is_uninstaller(&json!({
+            "name": "Spark Uninstaller",
+            "target": "windows-shortcut:spark"
+        })));
+    }
+
+    #[test]
+    fn windows_host_window_list_uses_real_window_handles() {
+        let script = super::windows_host_window_list_script(10);
+
+        assert!(script.contains("MainWindowHandle"));
+        assert!(script.contains("'0x{0:x}'"));
+        assert!(script.contains("Name='Pid'"));
+    }
+
+    #[test]
+    fn windows_host_focus_script_restores_and_focuses_handle() {
+        let script = super::windows_host_focus_window_script("0x3a00007").expect("focus script");
+
+        assert!(script.contains("ShowWindowAsync($hwnd, 9)"));
+        assert!(script.contains("SetForegroundWindow($hwnd)"));
+        assert!(super::windows_host_focus_window_script("0x3a00007;rm").is_err());
+    }
+
+    #[test]
+    fn launched_window_id_picks_new_window_after_launch() {
+        let before = json!({"windows": {"ids": ["0x1", "0x2"]}});
+        let after = json!({"windows": {"ids": ["0x1", "0x2", "0x3"]}});
+
+        assert_eq!(
+            super::launched_window_id(&before, &after).as_deref(),
+            Some("0x3")
+        );
+        assert_eq!(super::launched_window_id(&after, &before), None);
+    }
+
+    #[test]
+    fn windows_shortcut_focus_query_uses_shortcut_name() {
+        assert_eq!(
+            super::windows_shortcut_focus_query(
+                r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Spark.lnk"
+            ),
+            "Spark"
+        );
+    }
+
+    #[test]
+    fn windows_host_close_script_requests_normal_window_close() {
+        let script = super::windows_host_close_window_script("0x3a00007").expect("close script");
+
+        assert!(script.contains("PostMessage($hwnd, 0x0010"));
+        assert!(script.contains("IsWindow($hwnd)"));
+        assert!(script.contains("Stop-Process -Id $pid -Force"));
+        assert!(super::windows_host_close_window_script("0x3a00007;rm").is_err());
+    }
+
+    #[test]
+    fn windows_shortcut_targets_are_identifier_safe_and_roundtrip() {
+        let path = r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Spark.lnk";
+        let target = super::windows_shortcut_target(path).expect("shortcut target");
+
+        assert!(target.starts_with(super::WINDOWS_SHORTCUT_PREFIX));
+        assert!(super::valid_identifier(&target));
+        assert_eq!(
+            super::decode_windows_shortcut_target(&target)
+                .expect("decode")
+                .as_deref(),
+            Some(path)
+        );
+        assert!(super::windows_shortcut_target("C:\\Temp\\Spark.exe").is_none());
+    }
+
+    #[test]
+    fn windows_shortcut_launch_script_uses_file_path() {
+        let script = super::windows_host_start_shortcut_script();
+
+        assert!(script.contains("Test-Path -LiteralPath"));
+        assert!(script.contains("Start-Process -FilePath"));
+        assert!(script.contains(".lnk"));
+    }
+
+    #[test]
+    fn windows_registered_app_targets_are_identifier_safe_and_roundtrip() {
+        let app_id = "Vitelglobal.Vitelglobal_v1ncde5y6f3mm!com.vitelglobal.vitelgloabalapp.winx";
+        let target = super::windows_app_target(app_id).expect("app target");
+
+        assert!(target.starts_with(super::WINDOWS_APP_PREFIX));
+        assert!(super::valid_identifier(&target));
+        assert_eq!(
+            super::decode_windows_app_target(&target)
+                .expect("decode")
+                .as_deref(),
+            Some(app_id)
+        );
+        assert!(super::windows_app_target("bad\nid").is_none());
+    }
+
+    #[test]
+    fn windows_registered_app_launch_script_uses_apps_folder() {
+        let script = super::windows_host_start_app_script();
+
+        assert!(script.contains("shell:AppsFolder"));
+        assert!(script.contains("Start-Process"));
+        assert!(script.contains("Invalid app id"));
+    }
+
+    #[test]
+    fn windows_registered_app_match_script_filters_before_limit() {
+        let script = super::windows_host_registered_application_matches_script(10);
+
+        assert!(script.contains("Where-Object"));
+        assert!(script.contains("Contains($query)"));
+        assert!(script.contains("Select-Object -First 10"));
     }
 
     #[test]

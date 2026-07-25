@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::{write_file, WriteFileOptions, WriteFileResult};
 
+const NO_MATCH_PREVIEW_LINES: usize = 20;
+
 #[derive(Debug, Clone)]
 pub struct EditFileOptions {
     pub path: PathBuf,
@@ -72,21 +74,18 @@ pub fn edit_file(options: EditFileOptions) -> Result<EditFileResult> {
     let original = String::from_utf8(bytes)
         .with_context(|| format!("File is not valid UTF-8: {}", target.display()))?;
     let matches = original.matches(&options.old_text).count();
-    if matches == 0 {
-        bail!("Target text not found in {}", target.display());
-    }
-    if !options.replace_all && matches > 1 {
-        bail!(
-            "Target text appears {} times in {}; set replace_all=true or provide a more specific match",
-            matches,
-            target.display()
-        );
-    }
 
     let updated = if options.replace_all {
+        if matches == 0 {
+            return Err(anyhow::Error::msg(
+                string_replace(&original, &options.old_text, &options.new_text)
+                    .expect_err("zero matches must return an error"),
+            ));
+        }
         original.replace(&options.old_text, &options.new_text)
     } else {
-        original.replacen(&options.old_text, &options.new_text, 1)
+        string_replace(&original, &options.old_text, &options.new_text)
+            .map_err(anyhow::Error::msg)?
     };
 
     let result: WriteFileResult = write_file(WriteFileOptions {
@@ -177,4 +176,115 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{:02x}", byte);
     }
     out
+}
+
+fn string_replace(content: &str, before: &str, after: &str) -> std::result::Result<String, String> {
+    let matches = content.match_indices(before).collect::<Vec<_>>();
+
+    match matches.len() {
+        0 => {
+            let suggestion = find_similar_context(content, before);
+            let mut message = "No match found for the specified text.".to_string();
+            if let Some(hint) = suggestion {
+                message.push_str(&format!("\n\nDid you mean:\n```\n{hint}\n```"));
+            }
+            let preview = build_file_preview(content, NO_MATCH_PREVIEW_LINES);
+            message.push_str(&format!("\n\nFile preview:\n```\n{preview}\n```"));
+            Err(message)
+        }
+        1 => Ok(content.replacen(before, after, 1)),
+        count => {
+            let mut message = format!(
+                "Found {count} matches. Please provide more context to identify a unique match:\n"
+            );
+            for (index, (position, _)) in matches.iter().enumerate().take(2) {
+                let line_number = count_lines_before(content, *position);
+                let context = get_line_context(content, line_number, 1);
+                message.push_str(&format!(
+                    "\nMatch {} (line {}):\n```\n{}\n```",
+                    index + 1,
+                    line_number,
+                    context
+                ));
+            }
+            if count > 2 {
+                message.push_str(&format!("\n\n...and {} more", count - 2));
+            }
+            Err(message)
+        }
+    }
+}
+
+fn count_lines_before(content: &str, byte_position: usize) -> usize {
+    content
+        .char_indices()
+        .take_while(|(index, _)| *index < byte_position)
+        .filter(|(_, character)| *character == '\n')
+        .count()
+        + 1
+}
+
+fn get_line_context(content: &str, target_line: usize, context: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let start = target_line.saturating_sub(context + 1);
+    let end = (target_line + context).min(lines.len());
+    lines[start..end].join("\n")
+}
+
+fn find_similar_context(content: &str, search: &str) -> Option<String> {
+    let first_line = search.lines().next()?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+
+    for (index, line) in content.lines().enumerate() {
+        if line.contains(first_line) || first_line.contains(line.trim()) {
+            return Some(get_line_context(content, index + 1, 2));
+        }
+    }
+    None
+}
+
+fn build_file_preview(content: &str, max_lines: usize) -> String {
+    if content.is_empty() {
+        return "(file is empty)".to_string();
+    }
+
+    let lines = content.lines().collect::<Vec<_>>();
+    let preview_end = lines.len().min(max_lines);
+    let mut preview = lines[..preview_end]
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("{:>4}: {}", index + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.len() > preview_end {
+        preview.push_str(&format!("\n... ({} more lines)", lines.len() - preview_end));
+    }
+    preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::string_replace;
+
+    #[test]
+    fn edit_diagnostics_show_context_for_ambiguous_matches() {
+        let error =
+            string_replace("foo\nbar\nfoo\n", "foo", "baz").expect_err("ambiguous edit must fail");
+
+        assert!(error.contains("Found 2 matches"));
+        assert!(error.contains("Match 1 (line 1)"));
+        assert!(error.contains("Match 2 (line 3)"));
+    }
+
+    #[test]
+    fn edit_diagnostics_preview_file_when_text_is_missing() {
+        let error =
+            string_replace("alpha\nbeta\n", "gamma", "delta").expect_err("missing edit must fail");
+
+        assert!(error.contains("No match found"));
+        assert!(error.contains("File preview:"));
+        assert!(error.contains("1: alpha"));
+    }
 }

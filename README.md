@@ -6,7 +6,17 @@ Agent is a terminal coding agent with a Python agent core and a Rust/Ratatui int
 
 ## Run
 
-agent --tui / agent
+Portable local run:
+
+```bash
+./bootstrap.sh
+./run-agent.sh --tui
+```
+
+`run-agent.sh` resolves the project directory relative to itself, so the checkout
+can be moved to another drive/path and still run after `./bootstrap.sh`.
+
+Editable install:
 
 ```bash
 python -m pip install -e .
@@ -14,19 +24,22 @@ cd agent-rust && cargo build && cd ..
 agent --tui
 ```
 
-Release wheels are self-contained: the Python package includes the gateway, agent
-core, plugin SDK, LLM layer, built-in channel plugins, bundled skills, and a compiled
-`agent-rust` backend in `agent/bin/`. Building a wheel runs `cargo build --release`
-and copies the executable into the package. Source-only development builds can set
-`AGENT_SKIP_RUST_BUILD=1`, but distributed wheels should not use that flag.
+File discovery and content search require `rg` (ripgrep) on `PATH`, matching
+Goose's Developer-extension search backend.
+
+Release wheels bundle the gateway, agent core, plugin SDK, LLM layer, built-in
+channel plugins, skills, and a compiled `agent-rust` backend in `agent/bin/`.
+Building a wheel runs `cargo build --release` and copies the executable into the
+package. Source-only development builds can set `AGENT_SKIP_RUST_BUILD=1`, but
+distributed wheels should not use that flag.
 
 Type `/` inside the TUI to open the command menu. The main commands are `/model`,
-`/install`, `/reasoning`, `/devices`, `/capabilities`, `/status`, `/setup`, `/help`,
-and `/exit`.
+`/install`, `/reasoning`, `/tools`, `/skills`, `/gateway`, `/status`, `/setup`,
+`/help`, and `/exit`.
 
 ## Desktop and system capabilities
 
-Ask natural questions such as `What devices are connected here?` or use `/devices`.
+Ask natural questions such as `What devices are connected here?`.
 Agent reports live USB, Bluetooth, storage, network, input, audio, display, camera,
 printer, and power records visible to its runtime. Every category has a separate
 availability state, so an unavailable host service is not reported as an empty device

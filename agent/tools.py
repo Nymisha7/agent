@@ -278,8 +278,9 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 name="glob",
                 description=(
                     "Discover files and directories by glob pattern. Use *, **, and ? "
-                    "for explicit path matching. If no path is given, the workspace root "
-                    "is used as the search root."
+                    "for exact, case-sensitive path matching; use **/ for recursive "
+                    "matching. If no path is given, the workspace root is used as the "
+                    "search root."
                 ),
                 properties={
                     "pattern": {
@@ -822,6 +823,38 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
 
     registry.register(
         ToolSpec(
+            name="desktop_send_message",
+            handler=_desktop_send_message,
+            schema=_function_schema(
+                name="desktop_send_message",
+                description=(
+                    "Focus an observed desktop window, type an exact user-provided message, "
+                    "and optionally submit it with Enter or Ctrl+Enter after explicit approval. "
+                    "Use this only when the user asked to send text through an already open app."
+                ),
+                properties={
+                    "target": {
+                        "type": "string",
+                        "description": "Observed window id from desktop_observe or desktop_resolve.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Exact message text to type. The receipt redacts content.",
+                    },
+                    "submit": {
+                        "type": "string",
+                        "enum": ["enter", "ctrl+enter", "none"],
+                        "default": "enter",
+                        "description": "Whether to press a submit key after typing.",
+                    },
+                },
+                required=["target", "message"],
+            ),
+        )
+    )
+
+    registry.register(
+        ToolSpec(
             name="desktop_clipboard_files",
             handler=_desktop_clipboard_files,
             schema=_function_schema(
@@ -849,7 +882,8 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 name="write_file",
                 description=(
                     "Create or overwrite a text file inside the workspace. Use this when "
-                    "the user asks to save, create, or update a file."
+                    "the user asks to save, create, make, build, generate, or update a "
+                    "file, script, app, project, or software."
                 ),
                 properties={
                     "path": {
@@ -1333,46 +1367,14 @@ def _glob(args: dict[str, Any], ctx: ToolContext) -> Any:
     )
     include_hidden = _bool_arg(args.get("include_hidden"), default=False)
     include_generated = _bool_arg(args.get("include_generated"), default=False)
-    search_limit = limit if include_generated else max(limit, 200)
-
-    result = _filter_glob_result(
-        ctx.rust.glob_files(
-            pattern=pattern,
-            root=root,
-            limit=search_limit,
-            include_hidden=include_hidden,
-            kind=kind,
-        ),
-        root=root,
+    return ctx.rust.glob_files(
         pattern=pattern,
+        root=root,
         limit=limit,
+        include_hidden=include_hidden,
         include_generated=include_generated,
+        kind=kind,
     )
-
-    if _glob_has_matches(result):
-        return result
-
-    for fallback_pattern in _glob_fallback_patterns(pattern, kind=kind):
-        fallback_result = _filter_glob_result(
-            ctx.rust.glob_files(
-                pattern=fallback_pattern,
-                root=root,
-                limit=search_limit,
-                include_hidden=include_hidden,
-                kind=kind,
-            ),
-            root=root,
-            pattern=fallback_pattern,
-            limit=limit,
-            include_generated=include_generated,
-        )
-        if _glob_has_matches(fallback_result):
-            if isinstance(fallback_result, dict):
-                fallback_result = dict(fallback_result)
-                fallback_result["fallback_pattern"] = fallback_pattern
-            return fallback_result
-
-    return result
 
 
 def _resolve_glob_root(root_value: Any, ctx: ToolContext) -> Path | dict[str, Any]:
@@ -2066,6 +2068,174 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
     return ctx.rust.desktop_action(**rust_args)
 
 
+def _desktop_send_message(args: dict[str, Any], ctx: ToolContext) -> Any:
+    target = _optional_desktop_arg(args.get("target"), "target")
+    message = _desktop_message_arg(args.get("message"))
+    if target is None:
+        return {
+            "ok": False,
+            "tool": "desktop_send_message",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "desktop_action_target_required",
+            "operation": "desktop",
+            "guidance": "desktop_send_message requires an observed window id.",
+        }
+    if message is None:
+        return {
+            "ok": False,
+            "tool": "desktop_send_message",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "desktop_action_value_required",
+            "operation": "desktop",
+            "guidance": "desktop_send_message requires the exact message text to type.",
+        }
+    message_bytes = message.encode("utf-8")
+    if not message.strip():
+        raise ValueError("desktop_send_message message must not be empty.")
+    if len(message_bytes) > 4000:
+        raise ValueError("desktop_send_message message must be 4000 UTF-8 bytes or fewer.")
+
+    submit = _enum_arg(
+        args.get("submit"),
+        default="enter",
+        allowed={"enter", "ctrl+enter", "none"},
+    )
+    capability_block = _desktop_send_message_capability_block(ctx, submit)
+    if capability_block is not None:
+        return capability_block
+
+    approval_key = _desktop_send_message_approval_key(target, message, submit)
+    if approval_key not in ctx.approved_system_commands:
+        return {
+            "ok": False,
+            "tool": "desktop_send_message",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "desktop_action_requires_approval",
+            "operation": "desktop",
+            "requested_path": approval_key,
+            "guidance": (
+                "Ask the user to approve sending this exact redacted message to the "
+                "observed window before retrying."
+            ),
+        }
+
+    steps: list[dict[str, Any]] = []
+    focus = ctx.rust.desktop_action(action="focus_window", target=target)
+    steps.append(_desktop_message_step("focus_window", focus))
+    if not _desktop_step_ok(focus):
+        return _desktop_message_result(target, message, submit, steps, ok=False)
+
+    typed = ctx.rust.desktop_action(action="type_text", value=message)
+    steps.append(_desktop_message_step("type_text", typed))
+    if not _desktop_step_ok(typed):
+        return _desktop_message_result(target, message, submit, steps, ok=False)
+
+    if submit != "none":
+        key = "Return" if submit == "enter" else "ctrl+Return"
+        sent = ctx.rust.desktop_action(action="send_key", value=key)
+        steps.append(_desktop_message_step("send_key", sent))
+        if not _desktop_step_ok(sent):
+            return _desktop_message_result(target, message, submit, steps, ok=False)
+
+    return _desktop_message_result(target, message, submit, steps, ok=True)
+
+
+def _desktop_send_message_capability_block(ctx: ToolContext, submit: str) -> dict[str, Any] | None:
+    try:
+        capabilities = ctx.rust.desktop_capabilities()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "tool": "desktop_send_message",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "desktop_capability_check_failed",
+            "operation": "desktop",
+            "guidance": f"Could not confirm desktop messaging support before approval: {exc}",
+        }
+    actions = capabilities.get("actions") if isinstance(capabilities, dict) else None
+    if not isinstance(actions, list):
+        return {
+            "ok": False,
+            "tool": "desktop_send_message",
+            "blocked": True,
+            "recoverable": True,
+            "reason": "desktop_capability_check_failed",
+            "operation": "desktop",
+            "guidance": "Could not read desktop action capabilities before approval.",
+        }
+    available = {
+        item.get("action")
+        for item in actions
+        if isinstance(item, dict) and item.get("available") is True
+    }
+    required = ["focus_window", "type_text"]
+    if submit != "none":
+        required.append("send_key")
+    missing = [action for action in required if action not in available]
+    if not missing:
+        return None
+    runtime = capabilities.get("runtime") if isinstance(capabilities, dict) else None
+    return {
+        "ok": False,
+        "tool": "desktop_send_message",
+        "blocked": True,
+        "recoverable": True,
+        "reason": "desktop_action_dependency_unavailable",
+        "operation": "desktop",
+        "runtime": runtime,
+        "unavailable_actions": missing,
+        "guidance": (
+            "desktop_send_message requires focus_window, type_text, and send_key support "
+            "before approval. Use desktop_capabilities to inspect this runtime."
+        ),
+    }
+
+
+def _desktop_message_step(action: str, result: Any) -> dict[str, Any]:
+    result_dict = result if isinstance(result, dict) else {}
+    return {
+        "action": action,
+        "ok": result_dict.get("ok") is True,
+        "verification": result_dict.get("verification") or "unknown",
+        "verified": result_dict.get("verified") is True,
+        "error": result_dict.get("error"),
+    }
+
+
+def _desktop_step_ok(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("ok") is True
+
+
+def _desktop_message_result(
+    target: str,
+    message: str,
+    submit: str,
+    steps: list[dict[str, Any]],
+    *,
+    ok: bool,
+) -> dict[str, Any]:
+    encoded = message.encode("utf-8")
+    return {
+        "ok": ok,
+        "tool": "desktop_send_message",
+        "target": target,
+        "submit": submit,
+        "message_receipt": {
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "bytes": len(encoded),
+            "chars": len(message),
+            "content_returned": False,
+        },
+        "steps": steps,
+        "verified": ok and all(step.get("ok") is True for step in steps),
+        "verification": "confirmed" if ok else "not_confirmed",
+    }
+
+
 def _desktop_clipboard_files(args: dict[str, Any], ctx: ToolContext) -> Any:
     raw_paths = args.get("paths")
     if not isinstance(raw_paths, list) or not 1 <= len(raw_paths) <= 32:
@@ -2108,6 +2278,14 @@ def _optional_desktop_arg(value: Any, name: str) -> str | None:
         raise ValueError(f"desktop_action {name} must be a string when provided.")
     normalized = value.strip()
     return normalized or None
+
+
+def _desktop_message_arg(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("desktop_send_message message must be a string when provided.")
+    return value
 
 
 def _process_list(args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -2821,7 +2999,7 @@ def _desktop_action_approval_key(
     parts = ["desktop", action]
     if target:
         parts.append(target.strip())
-    if value:
+    if value and _desktop_action_value_affects_approval(action):
         if action in {"clipboard_write", "type_text", "set_field_text"}:
             digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
             parts.append(f"sha256:{digest}")
@@ -2829,6 +3007,29 @@ def _desktop_action_approval_key(
         else:
             parts.append(value.strip())
     return " ".join(parts)
+
+
+def _desktop_action_value_affects_approval(action: str) -> bool:
+    return action in {
+        "set_volume",
+        "set_mute",
+        "set_brightness",
+        "clipboard_write",
+        "send_key",
+        "type_text",
+        "scroll",
+        "invoke_element",
+        "set_field_text",
+    }
+
+
+def _desktop_send_message_approval_key(target: str, message: str, submit: str) -> str:
+    encoded = message.encode("utf-8")
+    return (
+        f"desktop send_message {target.strip()} "
+        f"sha256:{hashlib.sha256(encoded).hexdigest()} "
+        f"bytes:{len(encoded)} submit:{submit}"
+    )
 
 
 def _desktop_clipboard_files_approval_key(operation: str, paths: list[Path]) -> str:
@@ -2849,58 +3050,6 @@ def _optional_desktop_backend_arg(value: Any, name: str) -> str | None:
     return normalized
 
 
-def _glob_has_matches(result: Any) -> bool:
-    return isinstance(result, dict) and isinstance(result.get("matches"), list) and bool(result["matches"])
-
-
-def _filter_glob_result(
-    result: Any,
-    *,
-    root: Path,
-    pattern: str,
-    limit: int,
-    include_generated: bool,
-) -> Any:
-    if not isinstance(result, dict) or not isinstance(result.get("matches"), list):
-        return result
-    if include_generated or _pattern_mentions_generated_path(pattern) or _is_generated_path(root):
-        return _limit_glob_result(result, limit)
-
-    filtered: list[Any] = []
-    omitted_generated = 0
-    for item in result["matches"]:
-        if not isinstance(item, dict):
-            filtered.append(item)
-            continue
-        raw_path = item.get("path")
-        if isinstance(raw_path, str) and _is_generated_path(Path(raw_path), root=root):
-            omitted_generated += 1
-            continue
-        filtered.append(item)
-
-    limited = dict(result)
-    limited["matches"] = filtered
-    if omitted_generated:
-        limited["omitted_generated"] = omitted_generated + int(limited.get("omitted_generated", 0) or 0)
-    return _limit_glob_result(limited, limit)
-
-
-def _limit_glob_result(result: dict[str, Any], limit: int) -> dict[str, Any]:
-    matches = result.get("matches")
-    if not isinstance(matches, list):
-        return result
-    limited = dict(result)
-    limited["matches"] = matches[:limit]
-    limited["truncated"] = bool(result.get("truncated")) or len(matches) > limit
-    return limited
-
-
-def _pattern_mentions_generated_path(pattern: str) -> bool:
-    normalized = pattern.replace("\\", "/")
-    parts = [part for part in normalized.split("/") if part not in {"", "*", "**"}]
-    return any(part in SKIP_DIR_NAMES or part.endswith(".egg-info") for part in parts)
-
-
 def _is_generated_path(path: Path, *, root: Path | None = None) -> bool:
     try:
         candidate = path.resolve(strict=False)
@@ -2913,85 +3062,3 @@ def _is_generated_path(path: Path, *, root: Path | None = None) -> bool:
         component in SKIP_DIR_NAMES or component.endswith(".egg-info")
         for component in candidate.parts
     )
-
-
-def _glob_fallback_patterns(pattern: str, *, kind: str = "any") -> list[str]:
-    variants: list[str] = []
-    if kind == "file" and "/" not in pattern and not pattern.startswith("**/"):
-        variants.append(f"**/{pattern}")
-
-    for candidate in _case_fallback_patterns(pattern):
-        if candidate != pattern and candidate not in variants:
-            variants.append(candidate)
-
-    for match in re.finditer(r"[A-Za-z]{3,}", pattern):
-        token = match.group(0)
-        singular = _singularize_token(token)
-        if singular == token:
-            continue
-        candidate = f"{pattern[:match.start()]}{singular}{pattern[match.end():]}"
-        if candidate != pattern and candidate not in variants:
-            variants.append(candidate)
-    return variants
-
-
-def _case_fallback_patterns(pattern: str) -> list[str]:
-    segments = pattern.replace("\\", "/").split("/")
-    variants: list[str] = []
-    for index, segment in enumerate(segments):
-        literal_prefix = _literal_case_prefix(segment)
-        if not literal_prefix or not any(char.isalpha() for char in literal_prefix):
-            continue
-        suffix = segment[len(literal_prefix):]
-        for replacement in _case_variants(literal_prefix):
-            replacement_segment = f"{replacement}{suffix}"
-            if replacement_segment == segment:
-                continue
-            candidate_segments = list(segments)
-            candidate_segments[index] = replacement_segment
-            candidate = "/".join(candidate_segments)
-            if candidate != pattern and candidate not in variants:
-                variants.append(candidate)
-    return variants
-
-
-def _literal_case_prefix(segment: str) -> str:
-    if segment in {"", "*", "**"} or "?" in segment or "[" in segment or "]" in segment:
-        return ""
-    if "*" not in segment:
-        return segment
-    if segment.endswith("*") and segment.count("*") == 1:
-        return segment[:-1]
-    return ""
-
-
-def _case_variants(segment: str) -> list[str]:
-    variants = [
-        segment.upper(),
-        segment.lower(),
-    ]
-    if segment:
-        variants.append(segment[:1].upper() + segment[1:].lower())
-    result: list[str] = []
-    for variant in variants:
-        if variant not in result:
-            result.append(variant)
-    return result
-
-
-def _singularize_token(token: str) -> str:
-    lower = token.lower()
-    replacement = token
-    if lower.endswith("ies") and len(token) > 3:
-        replacement = token[:-3] + "y"
-    elif lower.endswith("s") and not lower.endswith("ss"):
-        replacement = token[:-1]
-    return _match_token_case(token, replacement)
-
-
-def _match_token_case(original: str, replacement: str) -> str:
-    if original.isupper():
-        return replacement.upper()
-    if original[:1].isupper():
-        return replacement[:1].upper() + replacement[1:]
-    return replacement

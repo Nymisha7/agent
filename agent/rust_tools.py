@@ -1,19 +1,35 @@
 from __future__ import annotations
 
+import atexit
 import json
+import queue
+import time
+from copy import deepcopy
 import subprocess
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+DESKTOP_CAPABILITIES_CACHE_SECONDS = 300
+DESKTOP_APPLICATION_RESOLVE_CACHE_SECONDS = 60
+
 
 @dataclass
 class RustTools:
     rust_bin: Path
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _worker_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _active_process: subprocess.Popen[str] | None = field(default=None, init=False, repr=False)
+    _worker_process: subprocess.Popen[str] | None = field(default=None, init=False, repr=False)
+    _worker_reader: threading.Thread | None = field(default=None, init=False, repr=False)
+    _pending_worker: dict[int, queue.Queue[dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
+    _next_request_id: int = field(default=0, init=False, repr=False)
     _cancel_requested: bool = field(default=False, init=False, repr=False)
+    _cache: dict[tuple[Any, ...], tuple[float, Any]] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        atexit.register(self._stop_worker)
 
     def cancel_active(self) -> bool:
         with self._lock:
@@ -25,6 +41,13 @@ class RustTools:
             return True
 
     def run_json(self, args: list[str], *, timeout: float | None = None) -> Any:
+        try:
+            return self._run_worker_json(args, timeout=timeout)
+        except (OSError, BrokenPipeError):
+            self._stop_worker()
+            return self._run_oneshot_json(args, timeout=timeout)
+
+    def _run_oneshot_json(self, args: list[str], *, timeout: float | None = None) -> Any:
         command = [str(self.rust_bin), *args]
         process = subprocess.Popen(
             command,
@@ -75,6 +98,122 @@ class RustTools:
         lines = output.splitlines()
         return [json.loads(line) for line in lines]
 
+    def _ensure_worker(self) -> subprocess.Popen[str]:
+        process = self._worker_process
+        if process is not None and process.poll() is None:
+            return process
+        process = subprocess.Popen(
+            [str(self.rust_bin), "serve"],
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=1,
+        )
+        self._worker_process = process
+        self._worker_reader = threading.Thread(
+            target=self._read_worker_responses,
+            args=(process,),
+            daemon=True,
+        )
+        self._worker_reader.start()
+        return process
+
+    def _read_worker_responses(self, process: subprocess.Popen[str]) -> None:
+        try:
+            if process.stdout is None:
+                return
+            for line in process.stdout:
+                try:
+                    response = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    response = {"id": None, "ok": False, "error": str(exc)}
+                request_id = response.get("id")
+                with self._worker_lock:
+                    waiter = self._pending_worker.get(request_id)
+                if waiter is not None:
+                    waiter.put(response)
+        finally:
+            with self._worker_lock:
+                pending = list(self._pending_worker.values())
+                self._pending_worker.clear()
+            for waiter in pending:
+                waiter.put({"ok": False, "error": "Rust worker exited without a response."})
+
+    def _stop_worker(self) -> None:
+        with self._lock:
+            process = self._worker_process
+            self._worker_process = None
+            self._worker_reader = None
+            if self._active_process is process:
+                self._active_process = None
+                self._cancel_requested = False
+        with self._worker_lock:
+            pending = list(self._pending_worker.values())
+            self._pending_worker.clear()
+        for waiter in pending:
+            waiter.put({"ok": False, "error": "Rust worker stopped."})
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    def _run_worker_json(self, args: list[str], *, timeout: float | None = None) -> Any:
+        with self._worker_lock:
+            process = self._ensure_worker()
+            if process.stdin is None or process.stdout is None:
+                raise OSError("Rust worker pipes are unavailable.")
+            with self._lock:
+                self._next_request_id += 1
+                request_id = self._next_request_id
+                self._active_process = process
+                self._cancel_requested = False
+            waiter: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+            self._pending_worker[request_id] = waiter
+            try:
+                process.stdin.write(json.dumps({"id": request_id, "args": args}) + "\n")
+                process.stdin.flush()
+            except Exception:
+                self._pending_worker.pop(request_id, None)
+                raise
+        try:
+            try:
+                response = waiter.get(timeout=timeout)
+            except queue.Empty as exc:
+                with self._worker_lock:
+                    self._pending_worker.pop(request_id, None)
+                self._stop_worker()
+                raise TimeoutError(
+                    f"Rust worker timed out after {timeout:g}s: {' '.join(args)}"
+                ) from exc
+            with self._lock:
+                canceled = self._cancel_requested
+            if canceled:
+                raise RuntimeError("Rust tool canceled.")
+            if not response.get("ok"):
+                raise RuntimeError(f"Rust tool failed:\n{response.get('error', '')}")
+            return response.get("result")
+        finally:
+            with self._worker_lock:
+                self._pending_worker.pop(request_id, None)
+            with self._lock:
+                if self._active_process is process:
+                    self._active_process = None
+                    self._cancel_requested = False
+
+    def _cached_json(self, key: tuple[Any, ...], ttl_seconds: float, run: Any) -> Any:
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None and now - cached[0] < ttl_seconds:
+                return deepcopy(cached[1])
+        value = run()
+        with self._lock:
+            self._cache[key] = (now, deepcopy(value))
+        return value
+
     def glob_files(
         self,
         *,
@@ -82,6 +221,7 @@ class RustTools:
         root: Path | None = None,
         limit: int,
         include_hidden: bool = False,
+        include_generated: bool = False,
         kind: str = "any",
     ) -> Any:
         args = [
@@ -94,6 +234,8 @@ class RustTools:
         ]
         if include_hidden:
             args.append("--hidden")
+        if include_generated:
+            args.append("--include-generated")
         if root is not None:
             args.extend(["--root", str(root)])
         return self.run_json(args, timeout=30)
@@ -256,7 +398,11 @@ class RustTools:
         )
 
     def desktop_capabilities(self) -> Any:
-        return self.run_json(["desktop-capabilities"], timeout=15)
+        return self._cached_json(
+            ("desktop-capabilities",),
+            DESKTOP_CAPABILITIES_CACHE_SECONDS,
+            lambda: self.run_json(["desktop-capabilities"], timeout=15),
+        )
 
     def desktop_observe(self, *, scope: str = "all", limit: int = 50) -> Any:
         return self.run_json(
@@ -271,17 +417,26 @@ class RustTools:
         )
 
     def desktop_resolve(self, *, query: str, kind: str = "any", limit: int = 10) -> Any:
-        return self.run_json(
-            [
-                "desktop-resolve",
-                query,
-                "--kind",
-                kind,
-                "--limit",
-                str(limit),
-            ],
-            timeout=20,
-        )
+        def run() -> Any:
+            return self.run_json(
+                [
+                    "desktop-resolve",
+                    query,
+                    "--kind",
+                    kind,
+                    "--limit",
+                    str(limit),
+                ],
+                timeout=20,
+            )
+
+        if kind == "application":
+            return self._cached_json(
+                ("desktop-resolve", query.strip().casefold(), kind, limit),
+                DESKTOP_APPLICATION_RESOLVE_CACHE_SECONDS,
+                run,
+            )
+        return run()
 
     def desktop_action(
         self,

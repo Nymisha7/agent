@@ -283,6 +283,29 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(response.output, [])
         self.assertIn("not_registered", response.output_text)
 
+    def test_local_provider_executes_plain_text_tool_calls(self) -> None:
+        completion = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=(
+                    'inspect_target {"path":"/workspace/app","kind":"directory"}'
+                    'inspect_target {"path":"/workspace/app/src","kind":"directory"}'
+                ),
+                tool_calls=[],
+            ))],
+            usage=None,
+        )
+
+        response = _chat_completion_to_response(
+            completion,
+            text_tool_names={"inspect_target"},
+        )
+
+        self.assertEqual(
+            [item["name"] for item in response.output],
+            ["inspect_target", "inspect_target"],
+        )
+        self.assertEqual(response.output_text, "")
+
     def test_local_provider_hides_unexecuted_command_envelope_from_stream(self) -> None:
         client = LLMClient(provider="ollama", model="qwen2.5-coder:7b")
         chunks = iter([
@@ -347,6 +370,19 @@ class LLMProviderTests(unittest.TestCase):
             "low",
         )
         self.assertIsNone(_chat_reasoning_effort("deepseek", "deepseek-chat", "low"))
+
+    def test_openai_compatible_clients_have_default_timeout(self) -> None:
+        with patch("agent.llm.OpenAI") as openai:
+            LLMClient(provider="ollama", model="qwen2.5-coder:7b")
+
+        self.assertEqual(openai.call_args.kwargs["timeout"], 60.0)
+
+    def test_llm_timeout_env_overrides_default(self) -> None:
+        with patch.dict("os.environ", {"AGENT_LLM_TIMEOUT_SECONDS": "7"}, clear=True):
+            with patch("agent.llm.OpenAI") as openai:
+                LLMClient(provider="ollama", model="qwen2.5-coder:7b")
+
+        self.assertEqual(openai.call_args.kwargs["timeout"], 7.0)
 
     def test_missing_deepseek_key_is_deferred_until_request(self) -> None:
         with patch.dict("os.environ", {}, clear=True):

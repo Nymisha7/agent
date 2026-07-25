@@ -307,7 +307,7 @@ class SkillsTests(unittest.TestCase):
             )
 
         self.assertEqual(answer, "done")
-        self.assertEqual(llm.tool_names, ["grep", "finish_task"])
+        self.assertEqual(llm.tool_names, ["grep"])
         self.assertNotIn("Available Agent skills", llm.first_message)
 
 
@@ -1306,6 +1306,10 @@ class GatewayRoutingTests(unittest.TestCase):
             ],
         )
         self.assertEqual(commands["install"]["textAliases"], ["/install"])
+        self.assertEqual(commands["tools"]["textAliases"], ["/tools"])
+        self.assertIn("approval policy", commands["tools"]["description"])
+        self.assertNotIn("devices", commands)
+        self.assertNotIn("capabilities", commands)
         self.assertEqual(commands["apikey"]["textAliases"], ["/apikey", "/key"])
         self.assertTrue(commands["apikey"]["args"][1]["secret"])
         self.assertEqual(commands["exit"]["textAliases"], ["/exit", "/quit", "/q"])
@@ -1348,13 +1352,18 @@ class GatewayRoutingTests(unittest.TestCase):
         tools = {row["name"]: row for row in result["tools"]}
         self.assertIn("read_path", tools)
         self.assertIn("write_file", tools)
+        self.assertNotIn("discovery_subagent", tools)
         self.assertEqual(tools["read_path"]["source"], "core")
         self.assertFalse(tools["read_path"]["optional"])
         self.assertTrue(tools["read_path"]["enabled"])
+        self.assertEqual(tools["read_path"]["group"], "workspace")
         self.assertEqual(tools["read_path"]["schema"]["name"], "read_path")
         self.assertIn("description", tools["read_path"]["schema"])
-        self.assertEqual(result["groups"][0]["id"], "core")
-        self.assertIn("read_path", result["groups"][0]["tools"])
+        groups = {row["id"]: row for row in result["groups"]}
+        self.assertIn("workspace", groups)
+        self.assertIn("host_inspection", groups)
+        self.assertIn("desktop_control", groups)
+        self.assertIn("read_path", groups["workspace"]["tools"])
 
     def test_tools_catalog_marks_agent_allowlist_without_hiding_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

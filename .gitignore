@@ -8,3 +8,4 @@ target/
 .agents/
 .codex/
 .agent-session.sqlite3*
+ubuntu-shell-config-backup/

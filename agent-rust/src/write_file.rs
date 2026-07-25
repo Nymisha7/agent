@@ -102,9 +102,7 @@ pub fn write_file(options: WriteFileOptions) -> Result<WriteFileResult> {
         .unwrap_or(false);
     let input_has_bom = normalized_content.starts_with('\u{feff}');
     let content_without_bom = strip_utf8_bom(&normalized_content);
-    let line_ending = if options.preserve_line_endings && existing_has_bom {
-        detect_line_ending(existing.as_deref().unwrap_or_default())
-    } else if options.preserve_line_endings {
+    let line_ending = if options.preserve_line_endings {
         detect_line_ending(existing.as_deref().unwrap_or_default())
     } else {
         "\n"
@@ -382,7 +380,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbfalpha\r\nbeta\r\n");
-        assert!(result.created == false);
+        assert!(!result.created);
         assert_eq!(result.line_ending, "\r\n");
         cleanup(&dir);
     }

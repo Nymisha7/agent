@@ -29,9 +29,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Terminal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
-use serde_json::{json, Value};
+use serde_json::json;
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read};
 use std::num::NonZeroUsize;
@@ -43,6 +44,8 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::sync::{mpsc as async_mpsc, Semaphore};
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-rust")]
@@ -54,6 +57,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Serve(ServeArgs),
     Search(SearchArgs),
     Glob(GlobArgs),
     Grep(GrepArgs),
@@ -73,6 +77,25 @@ enum Command {
     DesktopAction(DesktopActionArgs),
     DesktopClipboardFiles(DesktopClipboardFilesArgs),
     Tui(TuiArgs),
+}
+
+#[derive(Debug, Parser)]
+struct ServeArgs {}
+
+#[derive(Debug, Deserialize)]
+struct WorkerRequest {
+    id: Option<Value>,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerResponse {
+    id: Option<Value>,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -225,6 +248,10 @@ struct GlobArgs {
     /// Include hidden files and directories.
     #[arg(long)]
     hidden: bool,
+
+    /// Include ignored artifacts and dependency folders.
+    #[arg(long)]
+    include_generated: bool,
 
     /// Resource kind: any, file, directory.
     #[arg(long, default_value = "any")]
@@ -584,6 +611,8 @@ struct BridgeApproval {
     #[serde(default)]
     requested_path: Option<String>,
     #[serde(default)]
+    display_path: Option<String>,
+    #[serde(default)]
     translated_path: Option<String>,
     #[serde(default)]
     resolved_path: Option<String>,
@@ -709,69 +738,173 @@ fn parse_glob_kind(raw: &str) -> GlobKind {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Serve(_args) => run_worker().await?,
         Command::Tui(args) => run_tui(args)?,
-        Command::SystemInfo(_args) => {
-            println!("{}", serde_json::to_string(&system_info()?)?);
+        command => {
+            println!("{}", serde_json::to_string(&run_command(command)?)?);
         }
+    }
+
+    Ok(())
+}
+
+async fn run_worker() -> Result<()> {
+    let mut lines = AsyncBufReader::new(tokio::io::stdin()).lines();
+    let concurrency = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    let permits = Arc::new(Semaphore::new(concurrency));
+    let (response_tx, mut response_rx) = async_mpsc::channel::<WorkerResponse>(concurrency * 2);
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(response) = response_rx.recv().await {
+            let mut line = serde_json::to_vec(&response)?;
+            line.push(b'\n');
+            stdout.write_all(&line).await?;
+            stdout.flush().await?;
+        }
+        Result::<()>::Ok(())
+    });
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = match serde_json::from_str::<WorkerRequest>(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                response_tx
+                    .send(WorkerResponse {
+                        id: None,
+                        ok: false,
+                        result: None,
+                        error: Some(error.to_string()),
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("worker response channel closed"))?;
+                continue;
+            }
+        };
+        let response_tx = response_tx.clone();
+        let permit = Arc::clone(&permits).acquire_owned().await?;
+        tokio::spawn(async move {
+            let request_id = request.id.clone();
+            let response =
+                match tokio::task::spawn_blocking(move || run_worker_request(request)).await {
+                    Ok(response) => response,
+                    Err(error) => WorkerResponse {
+                        id: request_id,
+                        ok: false,
+                        result: None,
+                        error: Some(error.to_string()),
+                    },
+                };
+            let _permit = permit;
+            let _ = response_tx.send(response).await;
+        });
+    }
+
+    drop(response_tx);
+    writer.await??;
+    Ok(())
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_request_runs_on_tokio_blocking_pool() {
+        let response = tokio::task::spawn_blocking(|| {
+            run_worker_request(WorkerRequest {
+                id: Some(json!(7)),
+                args: vec![String::from("system-info")],
+            })
+        })
+        .await
+        .expect("blocking worker task");
+
+        assert!(response.ok);
+        assert_eq!(response.id, Some(json!(7)));
+        assert!(response.result.is_some());
+        assert!(response.error.is_none());
+    }
+}
+
+fn run_worker_request(request: WorkerRequest) -> WorkerResponse {
+    let mut argv = Vec::with_capacity(request.args.len() + 1);
+    argv.push("agent-rust".to_string());
+    argv.extend(request.args);
+
+    let result = Cli::try_parse_from(argv)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .and_then(|cli| match cli.command {
+            Command::Serve(_) | Command::Tui(_) => Err(anyhow::anyhow!(
+                "command is not supported by the JSON worker"
+            )),
+            command => run_command(command),
+        });
+
+    match result {
+        Ok(value) => WorkerResponse {
+            id: request.id,
+            ok: true,
+            result: Some(value),
+            error: None,
+        },
+        Err(error) => WorkerResponse {
+            id: request.id,
+            ok: false,
+            result: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn run_command(command: Command) -> Result<Value> {
+    match command {
+        Command::Serve(_) | Command::Tui(_) => Err(anyhow::anyhow!(
+            "command is not supported by JSON command dispatch"
+        )),
+        Command::SystemInfo(_args) => Ok(serde_json::to_value(system_info()?)?),
         Command::ConnectedDevices(args) => {
-            println!(
-                "{}",
-                serde_json::to_string(&connected_devices(&args.scope)?)?
-            );
+            Ok(serde_json::to_value(connected_devices(&args.scope)?)?)
         }
-        Command::DesktopCapabilities(_args) => {
-            println!("{}", serde_json::to_string(&desktop_capabilities()?)?);
-        }
-        Command::DesktopObserve(args) => {
-            println!(
-                "{}",
-                serde_json::to_string(&desktop_observe(&args.scope, args.limit)?)?
-            );
-        }
-        Command::DesktopResolve(args) => {
-            println!(
-                "{}",
-                serde_json::to_string(&desktop_resolve(&args.query, &args.kind, args.limit)?)?
-            );
-        }
-        Command::ProcessList(args) => {
-            println!(
-                "{}",
-                serde_json::to_string(&process_list(args.limit, &args.sort_by)?)?
-            );
-        }
-        Command::RunSystemCommand(args) => {
-            println!(
-                "{}",
-                serde_json::to_string(&run_system_command(
-                    &args.command,
-                    args.target.as_deref(),
-                    args.limit,
-                )?)?
-            );
-        }
-        Command::DesktopAction(args) => {
-            println!(
-                "{}",
-                serde_json::to_string(&desktop_action(
-                    &args.action,
-                    args.target.as_deref(),
-                    args.value.as_deref(),
-                    args.backend_bus.as_deref(),
-                    args.backend_path.as_deref(),
-                )?)?
-            );
-        }
-        Command::DesktopClipboardFiles(args) => {
-            println!(
-                "{}",
-                serde_json::to_string(&desktop_clipboard_files(&args.paths, &args.operation)?)?
-            );
-        }
+        Command::DesktopCapabilities(_args) => Ok(serde_json::to_value(desktop_capabilities()?)?),
+        Command::DesktopObserve(args) => Ok(serde_json::to_value(desktop_observe(
+            &args.scope,
+            args.limit,
+        )?)?),
+        Command::DesktopResolve(args) => Ok(serde_json::to_value(desktop_resolve(
+            &args.query,
+            &args.kind,
+            args.limit,
+        )?)?),
+        Command::ProcessList(args) => Ok(serde_json::to_value(process_list(
+            args.limit,
+            &args.sort_by,
+        )?)?),
+        Command::RunSystemCommand(args) => Ok(serde_json::to_value(run_system_command(
+            &args.command,
+            args.target.as_deref(),
+            args.limit,
+        )?)?),
+        Command::DesktopAction(args) => Ok(serde_json::to_value(desktop_action(
+            &args.action,
+            args.target.as_deref(),
+            args.value.as_deref(),
+            args.backend_bus.as_deref(),
+            args.backend_path.as_deref(),
+        )?)?),
+        Command::DesktopClipboardFiles(args) => Ok(serde_json::to_value(desktop_clipboard_files(
+            &args.paths,
+            &args.operation,
+        )?)?),
         Command::Search(args) => {
             let mut options = FileSearchOptions::new(args.query);
 
@@ -784,8 +917,7 @@ fn main() -> Result<()> {
             options.kind = parse_kind(&args.kind);
             options.include_generated = args.include_generated;
 
-            let matches = search_files(options)?;
-            println!("{}", serde_json::to_string(&matches)?);
+            Ok(serde_json::to_value(search_files(options)?)?)
         }
 
         Command::Glob(args) => {
@@ -798,10 +930,11 @@ fn main() -> Result<()> {
                 root,
                 limit: args.limit,
                 include_hidden: args.hidden,
+                include_generated: args.include_generated,
                 kind: parse_glob_kind(&args.kind),
             })?;
 
-            println!("{}", serde_json::to_string(&result)?);
+            Ok(serde_json::to_value(result)?)
         }
 
         Command::Grep(args) => {
@@ -818,7 +951,7 @@ fn main() -> Result<()> {
                 include_hidden: args.hidden,
             })?;
 
-            println!("{}", serde_json::to_string(&result)?);
+            Ok(serde_json::to_value(result)?)
         }
 
         Command::Read(args) => {
@@ -829,8 +962,7 @@ fn main() -> Result<()> {
                 limits: ReadLimits::default(),
             };
 
-            let result = read_path(options)?;
-            println!("{}", serde_json::to_string(&result)?);
+            Ok(serde_json::to_value(read_path(options)?)?)
         }
 
         Command::WriteFile(args) => {
@@ -843,7 +975,7 @@ fn main() -> Result<()> {
                 preserve_line_endings: args.preserve_line_endings,
                 expected_sha256: args.expected_sha256,
             })?;
-            println!("{}", serde_json::to_string(&result)?);
+            Ok(serde_json::to_value(result)?)
         }
 
         Command::EditFile(args) => {
@@ -855,7 +987,7 @@ fn main() -> Result<()> {
                 replace_all: args.replace_all,
                 expected_sha256: args.expected_sha256,
             })?;
-            println!("{}", serde_json::to_string(&result)?);
+            Ok(serde_json::to_value(result)?)
         }
 
         Command::DeletePath(args) => {
@@ -864,7 +996,7 @@ fn main() -> Result<()> {
                 workspace_root: args.workspace_root,
                 recursive: args.recursive,
             })?;
-            println!("{}", serde_json::to_string(&result)?);
+            Ok(serde_json::to_value(result)?)
         }
 
         Command::Locate(args) => {
@@ -879,8 +1011,7 @@ fn main() -> Result<()> {
             options.kind = parse_kind(&args.kind);
             options.include_generated = false;
 
-            let matches = search_files(options)?;
-            println!("{}", serde_json::to_string(&matches)?);
+            Ok(serde_json::to_value(search_files(options)?)?)
         }
 
         Command::InspectTarget(args) => {
@@ -900,11 +1031,9 @@ fn main() -> Result<()> {
                 allow_fuzzy_fallback: args.fuzzy_fallback,
             })?;
 
-            println!("{}", serde_json::to_string(&resolved)?);
+            Ok(serde_json::to_value(resolved)?)
         }
     }
-
-    Ok(())
 }
 
 fn run_tui(args: TuiArgs) -> Result<()> {
@@ -1190,6 +1319,9 @@ fn run_tui_loop(
                     continue;
                 }
                 if !app.palette.entries.is_empty() && app.input.starts_with('/') {
+                    app.palette_selected =
+                        closest_selectable_palette_index(&app.palette, app.palette_selected)
+                            .unwrap_or(0);
                     let selected = app.palette.entries.get(app.palette_selected).cloned();
                     if let Some(entry) = selected {
                         if entry.execute {
@@ -1227,7 +1359,8 @@ fn run_tui_loop(
             }
             KeyCode::Up => {
                 if palette_is_open(&app) {
-                    app.palette_selected = app.palette_selected.saturating_sub(1);
+                    app.palette_selected =
+                        previous_palette_index(&app.palette, app.palette_selected);
                 } else {
                     app.auto_follow = false;
                     app.scroll = app.scroll.saturating_sub(1);
@@ -1235,15 +1368,18 @@ fn run_tui_loop(
             }
             KeyCode::Down => {
                 if palette_is_open(&app) {
-                    let max_index = app.palette.entries.len().saturating_sub(1);
-                    app.palette_selected = (app.palette_selected + 1).min(max_index);
+                    app.palette_selected = next_palette_index(&app.palette, app.palette_selected);
                 } else {
                     app.scroll = app.scroll.saturating_add(1);
                 }
             }
             KeyCode::PageUp => {
                 if palette_is_open(&app) {
-                    app.palette_selected = app.palette_selected.saturating_sub(PALETTE_PAGE_SIZE);
+                    app.palette_selected = move_palette_index(
+                        &app.palette,
+                        app.palette_selected,
+                        -(PALETTE_PAGE_SIZE as isize),
+                    );
                 } else {
                     app.auto_follow = false;
                     app.scroll = app.scroll.saturating_sub(10);
@@ -1251,16 +1387,19 @@ fn run_tui_loop(
             }
             KeyCode::PageDown => {
                 if palette_is_open(&app) {
-                    let max_index = app.palette.entries.len().saturating_sub(1);
-                    app.palette_selected =
-                        (app.palette_selected + PALETTE_PAGE_SIZE).min(max_index);
+                    app.palette_selected = move_palette_index(
+                        &app.palette,
+                        app.palette_selected,
+                        PALETTE_PAGE_SIZE as isize,
+                    );
                 } else {
                     app.scroll = app.scroll.saturating_add(10);
                 }
             }
             KeyCode::Home => {
                 if palette_is_open(&app) {
-                    app.palette_selected = 0;
+                    app.palette_selected =
+                        first_selectable_palette_index(&app.palette).unwrap_or(0);
                 } else {
                     app.scroll = 0;
                     app.auto_follow = false;
@@ -1268,7 +1407,7 @@ fn run_tui_loop(
             }
             KeyCode::End => {
                 if palette_is_open(&app) {
-                    app.palette_selected = app.palette.entries.len().saturating_sub(1);
+                    app.palette_selected = last_selectable_palette_index(&app.palette).unwrap_or(0);
                 } else {
                     app.auto_follow = true;
                 }
@@ -1277,6 +1416,9 @@ fn run_tui_loop(
                 if app.secret_provider.is_some() {
                     continue;
                 }
+                app.palette_selected =
+                    closest_selectable_palette_index(&app.palette, app.palette_selected)
+                        .unwrap_or(0);
                 if let Some(entry) = app.palette.entries.get(app.palette_selected) {
                     app.input = entry.complete_to.clone();
                     refresh_palette(&args, &mut app);
@@ -1656,12 +1798,7 @@ fn draw_approval_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp
         width,
         height,
     };
-    let target = approval
-        .translated_path
-        .as_deref()
-        .or(approval.resolved_path.as_deref())
-        .or(approval.requested_path.as_deref())
-        .unwrap_or("requested action");
+    let target = approval_target_text(approval, "requested action");
     let lines = vec![
         Line::from(vec![
             Span::styled("Tool    ", Style::default().fg(Color::DarkGray)),
@@ -2212,12 +2349,7 @@ fn approval_panel_text(app: &TuiApp) -> Text<'static> {
     let mut lines = Vec::new();
     for (index, approval) in app.snapshot.approvals.iter().enumerate().take(3) {
         let selected = index == app.approval_selected;
-        let path = approval
-            .translated_path
-            .as_deref()
-            .or(approval.resolved_path.as_deref())
-            .or(approval.requested_path.as_deref())
-            .unwrap_or("target");
+        let path = approval_target_text(approval, "target");
         let marker_style = if selected {
             Style::default()
                 .fg(Color::Black)
@@ -2237,7 +2369,7 @@ fn approval_panel_text(app: &TuiApp) -> Text<'static> {
         ]));
         lines.push(Line::from(vec![
             Span::raw("   "),
-            Span::styled(clip_status(path, 28), Style::default().fg(Color::Gray)),
+            Span::styled(clip_status(&path, 28), Style::default().fg(Color::Gray)),
         ]));
         if !approval.reason.is_empty() {
             lines.push(Line::from(vec![
@@ -2260,6 +2392,59 @@ fn approval_panel_text(app: &TuiApp) -> Text<'static> {
         )]));
     }
     Text::from(lines)
+}
+
+fn approval_target_text(approval: &BridgeApproval, fallback: &str) -> String {
+    let raw = approval
+        .display_path
+        .as_deref()
+        .or(approval.translated_path.as_deref())
+        .or(approval.resolved_path.as_deref())
+        .or(approval.requested_path.as_deref())
+        .unwrap_or(fallback);
+    sanitize_approval_target(raw).unwrap_or_else(|| fallback.to_string())
+}
+
+fn sanitize_approval_target(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() >= 3 && parts[0] == "desktop" {
+        let action = parts[1];
+        let target = parts[2];
+        if target.starts_with("windows-app:") || target.starts_with("windows-shortcut:") {
+            if let Some(label) = parts.last().copied().filter(|label| !label.contains(':')) {
+                return Some(format!("desktop {action} {label}"));
+            }
+            return Some(format!("desktop {action} selected app"));
+        }
+        if matches!(
+            action,
+            "focus_window"
+                | "close_window"
+                | "minimize_window"
+                | "maximize_window"
+                | "restore_window"
+        ) && normalize_window_id_for_display(target).is_some()
+        {
+            return Some(format!("desktop {action} selected window"));
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+fn normalize_window_id_for_display(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
 }
 
 fn activity_panel_text(app: &TuiApp) -> Text<'static> {
@@ -2490,6 +2675,77 @@ fn palette_visible_start(total: usize, selected: usize, visible_count: usize) ->
         .min(max_start)
 }
 
+fn first_selectable_palette_index(palette: &BridgeCompletions) -> Option<usize> {
+    palette.entries.iter().position(palette_entry_selectable)
+}
+
+fn last_selectable_palette_index(palette: &BridgeCompletions) -> Option<usize> {
+    palette.entries.iter().rposition(palette_entry_selectable)
+}
+
+fn closest_selectable_palette_index(palette: &BridgeCompletions, selected: usize) -> Option<usize> {
+    if palette.entries.is_empty() {
+        return None;
+    }
+    let selected = selected.min(palette.entries.len().saturating_sub(1));
+    if palette
+        .entries
+        .get(selected)
+        .is_some_and(palette_entry_selectable)
+    {
+        return Some(selected);
+    }
+    (selected + 1..palette.entries.len())
+        .find(|index| palette_entry_selectable(&palette.entries[*index]))
+        .or_else(|| {
+            (0..selected)
+                .rev()
+                .find(|index| palette_entry_selectable(&palette.entries[*index]))
+        })
+}
+
+fn next_palette_index(palette: &BridgeCompletions, selected: usize) -> usize {
+    if palette.entries.is_empty() {
+        return 0;
+    }
+    let selected = selected.min(palette.entries.len().saturating_sub(1));
+    (selected + 1..palette.entries.len())
+        .find(|index| palette_entry_selectable(&palette.entries[*index]))
+        .unwrap_or(selected)
+}
+
+fn previous_palette_index(palette: &BridgeCompletions, selected: usize) -> usize {
+    if palette.entries.is_empty() {
+        return 0;
+    }
+    let selected = selected.min(palette.entries.len().saturating_sub(1));
+    (0..selected)
+        .rev()
+        .find(|index| palette_entry_selectable(&palette.entries[*index]))
+        .unwrap_or(selected)
+}
+
+fn move_palette_index(palette: &BridgeCompletions, selected: usize, delta: isize) -> usize {
+    let mut index = closest_selectable_palette_index(palette, selected).unwrap_or(0);
+    let steps = delta.unsigned_abs();
+    for _ in 0..steps {
+        let next = if delta >= 0 {
+            next_palette_index(palette, index)
+        } else {
+            previous_palette_index(palette, index)
+        };
+        if next == index {
+            break;
+        }
+        index = next;
+    }
+    index
+}
+
+fn palette_entry_selectable(entry: &BridgeCompletionEntry) -> bool {
+    !entry.value.starts_with("section:")
+}
+
 fn palette_title(palette: &BridgeCompletions, selected: usize, visible_count: usize) -> String {
     let total = palette.entries.len();
     if total == 0 {
@@ -2517,11 +2773,10 @@ fn scroll_active_view(app: &mut TuiApp, down: bool) {
         return;
     }
     if palette_is_open(app) {
-        let max_index = app.palette.entries.len().saturating_sub(1);
         app.palette_selected = if down {
-            (app.palette_selected + 3).min(max_index)
+            move_palette_index(&app.palette, app.palette_selected, 3)
         } else {
-            app.palette_selected.saturating_sub(3)
+            move_palette_index(&app.palette, app.palette_selected, -3)
         };
         return;
     }
@@ -2548,7 +2803,7 @@ fn palette_text(
     let end = (start + visible_count).min(total);
     for (index, entry) in palette.entries[start..end].iter().enumerate() {
         let index = start + index;
-        if !entry.execute {
+        if !palette_entry_selectable(entry) {
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 Span::styled(
@@ -2692,12 +2947,13 @@ fn refresh_palette(args: &TuiArgs, app: &mut TuiApp) {
     match call_bridge(args, "complete", Some(&app.input)) {
         Ok(response) => {
             app.palette = response.completions.unwrap_or_default();
-            let max_index = app.palette.entries.len().saturating_sub(1);
             app.palette_selected = app
                 .palette
                 .selected_index
                 .unwrap_or(app.palette_selected)
-                .min(max_index);
+                .min(app.palette.entries.len().saturating_sub(1));
+            app.palette_selected =
+                closest_selectable_palette_index(&app.palette, app.palette_selected).unwrap_or(0);
         }
         Err(err) => {
             app.status = format!("Error: {}", clip_status(&err.to_string(), 96));
@@ -3605,6 +3861,16 @@ mod tui_tests {
         }
     }
 
+    fn test_palette_entry(label: &str, execute: bool) -> BridgeCompletionEntry {
+        BridgeCompletionEntry {
+            value: label.to_string(),
+            label: label.to_string(),
+            description: String::new(),
+            complete_to: format!("/{label}"),
+            execute,
+        }
+    }
+
     fn gateway_snapshot() -> BridgeGatewaySnapshot {
         serde_json::from_value(json!({
             "generated_at": "now",
@@ -3920,6 +4186,47 @@ mod tui_tests {
     }
 
     #[test]
+    fn palette_selection_skips_section_rows() {
+        let palette = BridgeCompletions {
+            title: String::from("Models"),
+            selected_index: Some(0),
+            entries: vec![
+                test_palette_entry("section:ready", false),
+                test_palette_entry("first", true),
+                test_palette_entry("second", true),
+                test_palette_entry("section:needs-setup", false),
+                test_palette_entry("third", true),
+            ],
+        };
+
+        assert_eq!(closest_selectable_palette_index(&palette, 0), Some(1));
+        assert_eq!(previous_palette_index(&palette, 4), 2);
+        assert_eq!(next_palette_index(&palette, 2), 4);
+        assert_eq!(move_palette_index(&palette, 0, 3), 4);
+        assert_eq!(last_selectable_palette_index(&palette), Some(4));
+    }
+
+    #[test]
+    fn palette_selection_keeps_submenu_commands_selectable() {
+        let palette = BridgeCompletions {
+            title: String::from("Commands"),
+            selected_index: Some(0),
+            entries: vec![
+                test_palette_entry("/model", false),
+                test_palette_entry("/install", false),
+                test_palette_entry("/reasoning", false),
+                test_palette_entry("/tools", true),
+            ],
+        };
+
+        assert_eq!(closest_selectable_palette_index(&palette, 0), Some(0));
+        assert_eq!(next_palette_index(&palette, 0), 1);
+        assert_eq!(next_palette_index(&palette, 1), 2);
+        assert_eq!(next_palette_index(&palette, 2), 3);
+        assert_eq!(previous_palette_index(&palette, 3), 2);
+    }
+
+    #[test]
     fn mouse_wheel_moves_model_picker_selection() {
         let mut app = test_app();
         app.input = String::from("/model ");
@@ -3945,6 +4252,27 @@ mod tui_tests {
         assert_eq!(
             footer_help_text(false, true, true),
             "Enter/Y approve  N/Esc deny  Ctrl+N/P select"
+        );
+    }
+
+    #[test]
+    fn approval_target_sanitizes_encoded_windows_app_ids() {
+        assert_eq!(
+            sanitize_approval_target("desktop launch_application windows-app:abcdef Vitelglobal")
+                .as_deref(),
+            Some("desktop launch_application Vitelglobal")
+        );
+        assert_eq!(
+            sanitize_approval_target("desktop launch_application windows-app:abcdef").as_deref(),
+            Some("desktop launch_application selected app")
+        );
+    }
+
+    #[test]
+    fn approval_target_hides_raw_window_ids() {
+        assert_eq!(
+            sanitize_approval_target("desktop close_window 0x800e8").as_deref(),
+            Some("desktop close_window selected window")
         );
     }
 
