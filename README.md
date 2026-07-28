@@ -21,7 +21,7 @@ Editable install:
 ```bash
 python -m pip install -e .
 cd agent-rust && cargo build && cd ..
-agent --tui
+nym --tui
 ```
 
 File discovery and content search require `rg` (ripgrep) on `PATH`, matching

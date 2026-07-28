@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.language_servers import default_language_servers, language_server_context_text
-from agent.planner import AgentSession, _bounded_recent_history, run_agent
+from agent.planner import AgentSession, _approval_was_approved, _bounded_recent_history, run_agent
 
 
 def test_planner_has_no_commented_out_or_rule_router_functions() -> None:
@@ -720,6 +720,75 @@ def test_approved_desktop_approval_is_not_requested_again_in_same_prompt() -> No
     assert len(requests) == 1
     assert rust.calls == 2
     assert session.pending_approvals[0]["status"] == "approved"
+
+
+def test_close_application_approval_covers_other_windows_from_same_process() -> None:
+    class CloseTwoWindowsLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **_kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls <= 2:
+                return SimpleNamespace(output=[{
+                    "type": "function_call",
+                    "name": "desktop_action",
+                    "call_id": f"call-{self.calls}",
+                    "arguments": json.dumps({
+                        "action": "close_window",
+                        "target": f"0x{self.calls}",
+                    }),
+                }], output_text="")
+            return SimpleNamespace(output=[], output_text="done")
+
+    class FakeRust:
+        def desktop_action(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"ok": True, "tool": "desktop_action", "action": "close_window"}
+
+    session = AgentSession(desktop_targets=[
+        {"kind": "window", "id": "0x1", "target": "0x1", "title": "Editor", "name": "editor"},
+        {"kind": "window", "id": "0x2", "target": "0x2", "title": "Editor Settings", "name": "editor"},
+    ])
+    requests: list[dict[str, Any]] = []
+
+    answer = run_agent(
+        llm=CloseTwoWindowsLLM(),
+        rust=FakeRust(),
+        workspace_root=".",
+        user_prompt="close the editor application",
+        session=session,
+        approval_requester=lambda request: requests.append(dict(request)) or "approved",
+    )
+
+    assert answer == "done"
+    assert len(requests) == 1
+
+
+def test_close_application_approval_does_not_cover_another_process() -> None:
+    session = AgentSession(desktop_targets=[
+        {"kind": "window", "id": "0x1", "target": "0x1", "name": "editor"},
+        {"kind": "window", "id": "0x2", "target": "0x2", "name": "browser"},
+    ])
+    approved = {
+        "tool": "desktop_action",
+        "operation": "desktop",
+        "prompt": "close the applications",
+        "status": "approved",
+        "requested_path": "desktop close_window 0x1",
+        "args": {"action": "close_window", "target": "0x1"},
+    }
+    session.pending_approvals = [approved]
+    requested = {
+        "tool": "desktop_action",
+        "operation": "desktop",
+        "prompt": "close the applications",
+        "requested_path": "desktop close_window 0x2",
+        "args": {"action": "close_window", "target": "0x2"},
+    }
+
+    assert not _approval_was_approved(session, requested)
 
 
 def test_local_agent_retries_printed_command_json_without_executing_it() -> None:

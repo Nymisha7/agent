@@ -11,6 +11,7 @@ dependencies = ["openai>=1.109.1", "cryptography>=41"]
 
 [project.scripts]
 agent = "agent.main:main"
+nym = "agent.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

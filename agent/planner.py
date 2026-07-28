@@ -896,13 +896,58 @@ def _approval_has_decision(
             continue
         if item.get("status") != decision and item.get("decision") != decision:
             continue
-        if _approval_path(item) != request_path:
-            continue
         if item.get("tool") != request.get("tool") or item.get("operation") != request.get("operation"):
             continue
-        if _optional_str(item.get("prompt")) == request_prompt:
+        if _optional_str(item.get("prompt")) != request_prompt:
+            continue
+        if _approval_path(item) == request_path:
+            return True
+        if _same_close_application_approval(session, item, request):
             return True
     return False
+
+
+def _same_close_application_approval(
+    session: AgentSession,
+    approved: dict[str, Any],
+    requested: dict[str, Any],
+) -> bool:
+    """Treat windows from one observed process as one close-app approval."""
+    approved_args = approved.get("args")
+    requested_args = requested.get("args")
+    if not isinstance(approved_args, dict) or not isinstance(requested_args, dict):
+        return False
+    if approved_args.get("action") != "close_window" or requested_args.get("action") != "close_window":
+        return False
+    approved_target = _optional_str(approved_args.get("target"))
+    requested_target = _optional_str(requested_args.get("target"))
+    if not approved_target or not requested_target:
+        return False
+    approved_app = _desktop_window_application_identity(session, approved_target)
+    requested_app = _desktop_window_application_identity(session, requested_target)
+    return approved_app is not None and approved_app == requested_app
+
+
+def _desktop_window_application_identity(
+    session: AgentSession,
+    target: str,
+) -> str | None:
+    normalized = _normalize_desktop_window_id(target)
+    if normalized is None:
+        return None
+    for item in reversed(session.desktop_targets):
+        if item.get("kind") != "window":
+            continue
+        if not any(
+            isinstance(item.get(key), str)
+            and _normalize_desktop_window_id(item[key]) == normalized
+            for key in ("target", "id")
+        ):
+            continue
+        process = _optional_str(item.get("name"))
+        if process:
+            return process.casefold()
+    return None
 
 
 def _apply_approval(session: AgentSession, tool_ctx: ToolContext, request: dict[str, Any]) -> None:
@@ -2050,6 +2095,10 @@ def _apply_desktop_resolve(session: AgentSession, observation: dict[str, Any]) -
             text = _optional_str(item.get(source_key))
             if text:
                 record[target_key] = text
+        if kind == "window":
+            process = _optional_str(item.get("process"))
+            if process:
+                record["name"] = process
         targets.append(record)
     if targets:
         _remember_desktop_targets(session, targets)

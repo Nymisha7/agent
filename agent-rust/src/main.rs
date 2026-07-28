@@ -411,8 +411,8 @@ struct TuiArgs {
     #[arg(long)]
     session_id: String,
 
-    /// API keys entered in the masked TUI prompt. They live only for this
-    /// process and are forwarded to bridge children through their environment.
+    /// API keys entered in the masked TUI prompt. They are forwarded to bridge
+    /// children, which save them in the user's private Agent credential store.
     #[arg(skip)]
     api_keys: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -3060,7 +3060,7 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     app.setup_required =
                         app.snapshot.session.configuration != "ready" || answer_needs_setup;
                     if app.snapshot.session.configuration == "ready" && !answer_needs_setup {
-                        app.notices.retain(|notice| notice.error);
+                        app.notices.clear();
                     }
                     app.status = if answer_is_error {
                         String::from("Error — local model installation failed")
@@ -3991,6 +3991,33 @@ mod tui_tests {
         assert!(rendered.contains("Here is the result."));
         assert!(!rendered.contains("read_path read"));
         assert!(!rendered.contains("draft answer"));
+    }
+
+    #[test]
+    fn successful_configured_turn_clears_stale_error_notice() {
+        let mut app = test_app();
+        push_notice(
+            &mut app,
+            "Request failed",
+            "OpenAI is not configured. Set OPENAI_API_KEY.",
+            true,
+        );
+        app.running_prompt = Some(String::from("hello"));
+
+        handle_app_event(
+            &mut app,
+            AppEvent::StreamFrame(Ok(BridgeStreamFrame {
+                kind: String::from("final"),
+                prompt: None,
+                answer: Some(String::from("Hi!")),
+                error: None,
+                event: None,
+                snapshot: None,
+            })),
+        );
+
+        assert!(app.notices.is_empty());
+        assert_eq!(app.status, "Ready");
     }
 
     #[test]

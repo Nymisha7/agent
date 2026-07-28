@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 from contextlib import nullcontext, redirect_stdout
 from tempfile import TemporaryDirectory
@@ -23,6 +24,8 @@ from agent.main import (
     _handle_local_command,
     _is_exit_command,
     _provider_api_key_needed,
+    _load_persisted_api_keys,
+    _persist_api_key,
     _queue_status,
     _record_local_command_exchange,
     _redact_local_command,
@@ -47,6 +50,22 @@ from agent.system_events import enqueue_system_event, reset_system_events_for_te
 
 
 class TuiExitTests(unittest.TestCase):
+    def test_api_key_credentials_persist_with_private_permissions(self) -> None:
+        with TemporaryDirectory() as config_home:
+            with patch.dict(
+                "os.environ",
+                {"XDG_CONFIG_HOME": config_home},
+                clear=True,
+            ):
+                _persist_api_key("OPENAI_API_KEY", "sk-persisted")
+                credential_path = Path(config_home) / "agent" / "credentials.json"
+                self.assertEqual(credential_path.stat().st_mode & 0o777, 0o600)
+                self.assertNotIn("OPENAI_API_KEY", os.environ)
+
+                _load_persisted_api_keys()
+
+                self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-persisted")
+
     def test_bridge_turn_lock_rejects_second_active_turn_for_same_session(self) -> None:
         with _exclusive_bridge_turn("single-active-session"):
             with self.assertRaisesRegex(RuntimeError, "already active"):
@@ -1402,8 +1421,13 @@ class LocalCommandTests(unittest.TestCase):
             llm=SimpleNamespace(provider="anthropic", model="claude-3-5-sonnet-latest"),
         )
 
-        with patch.dict("os.environ", {}, clear=True):
-            result = _handle_local_command(ctx, "/apikey anthropic sk-ant-test")
+        with TemporaryDirectory() as config_home:
+            with patch.dict(
+                "os.environ",
+                {"XDG_CONFIG_HOME": config_home},
+                clear=True,
+            ):
+                result = _handle_local_command(ctx, "/apikey anthropic sk-ant-test")
 
         self.assertIn("Anthropic key loaded", result)
         self.assertIn("ready", result)
@@ -1426,8 +1450,16 @@ class LocalCommandTests(unittest.TestCase):
             llm=SimpleNamespace(provider="anthropic", model="claude-sonnet-4.5"),
         )
 
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True):
-            result = _handle_local_command(ctx, "/apikey anthropic")
+        with TemporaryDirectory() as config_home:
+            with patch.dict(
+                "os.environ",
+                {
+                    "ANTHROPIC_API_KEY": "sk-ant-test",
+                    "XDG_CONFIG_HOME": config_home,
+                },
+                clear=True,
+            ):
+                result = _handle_local_command(ctx, "/apikey anthropic")
 
         self.assertIn("Anthropic key loaded", result)
         self.assertEqual(ctx.llm.provider, "anthropic")

@@ -9,4 +9,4 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e .
 cargo build --release --manifest-path agent-rust/Cargo.toml
 
-printf 'Ready. Run: %s/run-agent.sh --tui\n' "$ROOT"
+printf 'Ready. Run: %s/.venv/bin/nym --tui\n' "$ROOT"

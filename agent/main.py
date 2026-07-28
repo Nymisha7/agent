@@ -130,6 +130,69 @@ PROVIDER_API_KEY_ENVS = {
     "glm": "GLM_API_KEY",
     "openai-compatible": "AGENT_OPENAI_COMPAT_API_KEY",
 }
+_CREDENTIAL_ENV_NAMES = frozenset(PROVIDER_API_KEY_ENVS.values())
+
+
+def _credentials_path() -> Path:
+    config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+    ).expanduser()
+    return config_home / "agent" / "credentials.json"
+
+
+def _load_persisted_api_keys() -> None:
+    path = _credentials_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    for env_name, api_key in payload.items():
+        if (
+            env_name in _CREDENTIAL_ENV_NAMES
+            and isinstance(api_key, str)
+            and api_key
+            and not os.environ.get(env_name)
+        ):
+            os.environ[env_name] = api_key
+
+
+def _persist_api_key(env_name: str, api_key: str) -> None:
+    if env_name not in _CREDENTIAL_ENV_NAMES:
+        raise ValueError(f"Unsupported credential environment variable: {env_name}")
+    path = _credentials_path()
+    credentials: dict[str, str] = {}
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            credentials = {
+                key: value
+                for key, value in existing.items()
+                if key in _CREDENTIAL_ENV_NAMES
+                and isinstance(value, str)
+                and value
+            }
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        pass
+    credentials[env_name] = api_key
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temp_path = path.with_suffix(".tmp")
+    descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(credentials, handle)
+            handle.write("\n")
+    except Exception:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+    os.chmod(temp_path, 0o600)
+    temp_path.replace(path)
+    os.chmod(path, 0o600)
 
 PROVIDER_LOGIN_URLS = {
     "copilot": "https://github.com/login/device",
@@ -3294,7 +3357,7 @@ def _connect_text() -> str:
         "GLM hosted: /login glm, then /apikey glm (GLM_API_KEY)",
         "",
         "Local models live in their runtime, not in this workspace; Agent never asks them to log in.",
-        "Persistent keys: export the model source environment variable before starting agent.",
+        "Keys entered with /apikey are saved in the private user credential store.",
     ])
 
 
@@ -3336,6 +3399,10 @@ def _set_provider_api_key(ctx: Any, provider: str, api_key: str) -> str:
         return f"{_model_source_label(normalized)} does not use an API key."
 
     os.environ[env_name] = api_key
+    try:
+        _persist_api_key(env_name, api_key)
+    except OSError as exc:
+        return f"{_model_source_label(normalized)} key could not be saved: {exc}"
     active_provider = _active_provider(ctx)
     pending_provider = getattr(ctx, "pending_provider", None)
     pending_model = getattr(ctx, "pending_model", None)
@@ -3520,6 +3587,7 @@ def truncate(value: str | None, limit: int) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _load_persisted_api_keys()
     try:
         store = SessionStore.default()
     except Exception as exc:
