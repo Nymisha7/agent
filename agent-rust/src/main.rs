@@ -430,6 +430,40 @@ struct BridgeResponse {
     completions: Option<BridgeCompletions>,
     #[serde(default)]
     gateway: Option<BridgeGatewaySnapshot>,
+    #[serde(default)]
+    command_result: Option<BridgeCommandResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BridgeCommandResult {
+    code: BridgeCommandCode,
+    #[serde(default)]
+    setup_required: bool,
+    #[serde(default)]
+    error: bool,
+    #[serde(default)]
+    secret_provider: Option<String>,
+    #[serde(default)]
+    next_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BridgeCommandCode {
+    Ok,
+    ApiKeyRequired,
+    CredentialsRequired,
+    ModelNotInstalled,
+    RuntimeUnavailable,
+    RuntimeNotInstalled,
+    InstallConfirmationRequired,
+    InstallFailed,
+    InstallUnverified,
+    InstallNotReady,
+    ManualSetupRequired,
+    Unavailable,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -577,12 +611,18 @@ struct BridgeSession {
     #[serde(default = "provider_controlled_reasoning")]
     reasoning_effort: String,
     configuration: String,
+    #[serde(default = "ready_configuration_state")]
+    configuration_state: String,
     cost_usd: f64,
     tokens: BridgeTokens,
 }
 
 fn provider_controlled_reasoning() -> String {
     String::from("provider controlled")
+}
+
+fn ready_configuration_state() -> String {
+    String::from("ready")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -648,9 +688,11 @@ struct BridgeStreamFrame {
     event: Option<BridgeEvent>,
     #[serde(default)]
     snapshot: Option<BridgeSnapshot>,
+    #[serde(default)]
+    command_result: Option<BridgeCommandResult>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 struct BridgeEvent {
     kind: String,
     #[serde(default)]
@@ -659,12 +701,61 @@ struct BridgeEvent {
     name: Option<String>,
     #[serde(default)]
     summary: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    total: Option<usize>,
+    #[serde(default)]
+    completed: Option<usize>,
+    #[serde(default)]
+    failed: Option<usize>,
+    #[serde(default)]
+    work_file: Option<String>,
+    #[serde(default)]
+    owned_paths: Vec<String>,
+    #[serde(default)]
+    changed_count: Option<usize>,
+    #[serde(default)]
+    tasks: Vec<BridgeSubagentTask>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BridgeSubagentTask {
+    id: String,
+    task: String,
+    #[serde(default)]
+    owns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ActivityLine {
     kind: String,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct SubagentTaskState {
+    id: String,
+    description: String,
+    status: String,
+    summary: String,
+    owned_paths: Vec<String>,
+    changed_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SubagentRunState {
+    run_id: String,
+    total: usize,
+    completed: usize,
+    failed: usize,
+    status: String,
+    work_file: Option<String>,
+    tasks: Vec<SubagentTaskState>,
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +782,7 @@ struct TuiApp {
     active_bridge: Arc<Mutex<Option<Child>>>,
     queued_prompts: VecDeque<String>,
     activity: Vec<ActivityLine>,
+    subagent_run: Option<SubagentRunState>,
     palette: BridgeCompletions,
     palette_selected: usize,
     approval_selected: usize,
@@ -1041,7 +1133,7 @@ fn run_tui(args: TuiArgs) -> Result<()> {
     let snapshot = initial
         .snapshot
         .ok_or_else(|| anyhow::anyhow!("Bridge did not return a snapshot."))?;
-    let initial_needs_setup = snapshot.session.configuration != "ready";
+    let initial_needs_setup = snapshot.session.configuration_state != "ready";
     let initial_status = if initial_needs_setup {
         format!(
             "{} needs setup",
@@ -1054,6 +1146,7 @@ fn run_tui(args: TuiArgs) -> Result<()> {
         vec![provider_setup_notice(
             &snapshot.session.provider,
             &snapshot.session.configuration,
+            &snapshot.session.configuration_state,
         )]
     } else {
         Vec::new()
@@ -1080,6 +1173,7 @@ fn run_tui(args: TuiArgs) -> Result<()> {
             active_bridge: Arc::new(Mutex::new(None)),
             queued_prompts: VecDeque::new(),
             activity: Vec::new(),
+            subagent_run: None,
             palette: BridgeCompletions::default(),
             palette_selected: 0,
             approval_selected: 0,
@@ -1292,6 +1386,7 @@ fn run_tui_loop(
                     app.status = format!("Configuring {}", provider_display_name(&provider));
                     app.running_prompt = None;
                     app.activity.clear();
+                    app.subagent_run = None;
                     app.reasoning_text.clear();
                     app.streaming_text.clear();
                     app.current_tool = None;
@@ -1345,7 +1440,7 @@ fn run_tui_loop(
                     app.status = format!("Queued {} prompt(s)", queued_count);
                     continue;
                 }
-                if matches!(prompt.as_str(), "exit" | "quit" | "/exit" | "/quit" | "/q") {
+                if matches!(prompt.as_str(), "/exit" | "/quit" | "/q") {
                     break;
                 }
                 if prompt == "/gateway" {
@@ -1521,6 +1616,7 @@ fn start_prompt_submission(
     app.status = format!("Running: {}", clip_status(&prompt, 72));
     app.running_prompt = Some(prompt.clone());
     app.activity.clear();
+    app.subagent_run = None;
     app.reasoning_text.clear();
     app.streaming_text.clear();
     app.current_tool = None;
@@ -2306,7 +2402,7 @@ fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn session_panel_text(app: &TuiApp) -> Text<'static> {
     let session = &app.snapshot.session;
-    let configuration_ready = session.configuration == "ready";
+    let configuration_ready = session.configuration_state == "ready";
     let lines = vec![
         metric_line("Source", &session.provider, Color::Cyan),
         metric_line("Model", &clip_status(&session.model, 20), Color::White),
@@ -2450,13 +2546,34 @@ fn normalize_window_id_for_display(value: &str) -> Option<u64> {
 fn activity_panel_text(app: &TuiApp) -> Text<'static> {
     let mut lines = Vec::new();
     if !app.submitting {
-        lines.push(Line::from(vec![Span::styled(
-            "Idle",
-            Style::default().fg(Color::DarkGray),
-        )]));
+        if app.activity.is_empty() && app.subagent_run.is_none() {
+            lines.push(Line::from(vec![Span::styled(
+                "Idle",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            return Text::from(lines);
+        }
+        if let Some(run) = app.subagent_run.as_ref() {
+            append_subagent_run_lines(&mut lines, run, false);
+        }
+        for item in app.activity.iter().rev().take(10).rev() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", bullet_for_kind(&item.kind)),
+                    activity_style(&item.kind).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    clip_status(&item.text, 28),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+        }
         return Text::from(lines);
     }
 
+    if let Some(run) = app.subagent_run.as_ref() {
+        append_subagent_run_lines(&mut lines, run, true);
+    }
     for item in app.activity.iter().rev().take(12).rev() {
         lines.push(Line::from(vec![
             Span::styled(
@@ -2496,6 +2613,77 @@ fn activity_panel_text(app: &TuiApp) -> Text<'static> {
     Text::from(lines)
 }
 
+fn append_subagent_run_lines(lines: &mut Vec<Line<'static>>, run: &SubagentRunState, live: bool) {
+    let title = if live {
+        format!("Parallel agents  {}/{} complete", run.completed, run.total)
+    } else {
+        format!(
+            "Recent parallel run  {}/{} complete",
+            run.completed, run.total
+        )
+    };
+    let title_color = if run.failed > 0 {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    lines.push(Line::from(vec![Span::styled(
+        title,
+        Style::default()
+            .fg(title_color)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    for task in run.tasks.iter().take(8) {
+        let (symbol, color) = match task.status.as_str() {
+            "complete" => ("✓", Color::Green),
+            "blocked" => ("!", Color::Yellow),
+            "failed" => ("×", Color::Red),
+            "running" => ("●", Color::Cyan),
+            _ => ("○", Color::DarkGray),
+        };
+        let detail = match task.status.as_str() {
+            "running" if !task.summary.trim().is_empty() => task.summary.clone(),
+            "queued" if !task.owned_paths.is_empty() => {
+                format!("owns {}", task.owned_paths.join(", "))
+            }
+            "complete" if task.changed_count > 0 => {
+                format!("{} file(s) changed", task.changed_count)
+            }
+            "failed" | "blocked" if !task.summary.trim().is_empty() => task.summary.clone(),
+            _ if !task.description.trim().is_empty() => task.description.clone(),
+            _ => task.summary.clone(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{symbol} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(clip_status(&task.id, 18), Style::default().fg(Color::White)),
+            Span::styled(
+                format!(" · {}", clip_status(&task.status, 10)),
+                Style::default().fg(color),
+            ),
+            Span::styled(
+                format!(" — {}", clip_status(&detail, 38)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    if run.tasks.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            clip_status(&run.run_id, 48),
+            Style::default().fg(Color::DarkGray),
+        )]));
+    }
+    if let Some(work_file) = run.work_file.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("log ", Style::default().fg(Color::DarkGray)),
+            Span::styled(clip_status(work_file, 48), Style::default().fg(Color::Blue)),
+        ]));
+    }
+}
+
 fn metric_line(label: &str, value: &str, color: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
@@ -2511,6 +2699,7 @@ fn activity_style(kind: &str) -> Style {
         "thinking" => Style::default().fg(Color::Blue),
         "install" => Style::default().fg(Color::Cyan),
         "tool" => Style::default().fg(Color::Magenta),
+        "subagent" => Style::default().fg(Color::Cyan),
         "guardrail" => Style::default().fg(Color::Red),
         "text" => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::White),
@@ -2558,10 +2747,83 @@ fn role_header(role: &str, detail: &str) -> Line<'static> {
 }
 
 fn message_body_line(text: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("  | ", Style::default().fg(Color::DarkGray)),
-        Span::raw(text.to_string()),
-    ])
+    let mut spans = vec![Span::styled("  | ", Style::default().fg(Color::DarkGray))];
+    let trimmed = text.trim_start();
+    if matches!(trimmed, "---" | "***" | "___") {
+        spans.push(Span::styled(
+            "────────────────────────",
+            Style::default().fg(Color::DarkGray),
+        ));
+        return Line::from(spans);
+    }
+
+    let heading = ["### ", "## ", "# "]
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix));
+    if let Some(content) = heading {
+        spans.extend(markdown_inline_spans(
+            content,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        return Line::from(spans);
+    }
+
+    if let Some(content) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        spans.push(Span::styled(
+            "• ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.extend(markdown_inline_spans(content, Style::default()));
+        return Line::from(spans);
+    }
+
+    spans.extend(markdown_inline_spans(text, Style::default()));
+    Line::from(spans)
+}
+
+fn markdown_inline_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let bold_at = remaining.find("**");
+        let code_at = remaining.find('`');
+        let marker = match (bold_at, code_at) {
+            (Some(bold), Some(code)) if bold <= code => Some((bold, "**")),
+            (Some(_), Some(code)) => Some((code, "`")),
+            (Some(bold), None) => Some((bold, "**")),
+            (None, Some(code)) => Some((code, "`")),
+            (None, None) => None,
+        };
+        let Some((start, delimiter)) = marker else {
+            spans.push(Span::styled(remaining.to_string(), base_style));
+            break;
+        };
+        if start > 0 {
+            spans.push(Span::styled(remaining[..start].to_string(), base_style));
+        }
+        let after_start = start + delimiter.len();
+        let after_marker = &remaining[after_start..];
+        let Some(end) = after_marker.find(delimiter) else {
+            spans.push(Span::styled(remaining[start..].to_string(), base_style));
+            break;
+        };
+        let content = &after_marker[..end];
+        let style = if delimiter == "**" {
+            base_style.add_modifier(Modifier::BOLD)
+        } else {
+            base_style.fg(Color::Cyan).bg(Color::Rgb(28, 28, 28))
+        };
+        spans.push(Span::styled(content.to_string(), style));
+        remaining = &after_marker[end + delimiter.len()..];
+    }
+    spans
 }
 
 fn transcript_text(
@@ -2854,6 +3116,7 @@ fn bullet_for_kind(kind: &str) -> &'static str {
         "thinking" => "~",
         "install" => "↓",
         "tool" => "+",
+        "subagent" => "↳",
         "guardrail" => "!",
         "text" => ":",
         _ => "-",
@@ -2881,6 +3144,7 @@ fn tool_activity_label(tool: &str) -> String {
         "desktop_resolve" => String::from("Resolving desktop target"),
         "process_list" => String::from("Checking running processes"),
         "desktop_action" => String::from("Performing a desktop action"),
+        "parallel_subagents" => String::from("Spawning independent parallel agents"),
         "load_skill" => String::from("Loading a skill"),
         "finish_task" => String::from("Preparing the response"),
         _ => format!("Running {tool}"),
@@ -3022,10 +3286,10 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             }
             "final" => {
                 let completed_prompt = app.running_prompt.clone();
-                let install_confirmation = frame
-                    .answer
-                    .as_deref()
-                    .and_then(install_confirmation_command);
+                let command_result = frame.command_result.as_ref();
+                let next_command = command_result.and_then(|result| result.next_command.clone());
+                let key_prompt_provider =
+                    command_result.and_then(|result| result.secret_provider.clone());
                 app.submitting = false;
                 if let Some(snapshot) = frame.snapshot {
                     app.snapshot = snapshot;
@@ -3045,39 +3309,22 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     return;
                 }
                 let error = frame.error.as_deref().filter(|text| !text.is_empty());
-                let key_prompt_provider = key_prompt_provider_for_result(
-                    completed_prompt.as_deref(),
-                    frame.answer.as_deref(),
-                    &app.snapshot.session,
-                );
                 if let Some(error) = error {
                     push_notice(app, "Request failed", error, true);
                     app.status = String::from("Error — details shown in conversation");
-                } else if let Some(answer) = frame.answer.as_deref() {
-                    let answer_needs_setup = local_answer_needs_setup(answer);
-                    let answer_is_error = answer.contains("Status: install failed")
-                        || answer.contains("Status: install could not be verified");
+                } else {
+                    let command_needs_setup =
+                        command_result.is_some_and(|result| result.setup_required);
                     app.setup_required =
-                        app.snapshot.session.configuration != "ready" || answer_needs_setup;
-                    if app.snapshot.session.configuration == "ready" && !answer_needs_setup {
+                        app.snapshot.session.configuration_state != "ready" || command_needs_setup;
+                    if app.snapshot.session.configuration_state == "ready" && !command_needs_setup {
                         app.notices.clear();
                     }
-                    app.status = if answer_is_error {
-                        String::from("Error — local model installation failed")
-                    } else if install_confirmation.is_some() {
-                        String::from("Review the model size above, then press Enter to install")
-                    } else if answer.contains("Status: model not installed") {
-                        String::from("Model not installed — use /install when available")
-                    } else if answer.contains("Status: runtime unavailable") {
-                        String::from("Local runtime unavailable — setup details shown above")
-                    } else {
-                        String::from("Ready")
-                    };
-                } else {
-                    app.status = String::from("Ready");
-                    app.setup_required = app.snapshot.session.configuration != "ready";
+                    app.status = command_result
+                        .map(command_result_status)
+                        .unwrap_or_else(|| String::from("Ready"));
                 }
-                if let Some(command) = install_confirmation {
+                if let Some(command) = next_command {
                     app.input = command;
                     app.palette = BridgeCompletions::default();
                     app.palette_selected = 0;
@@ -3190,6 +3437,13 @@ fn apply_bridge_event(app: &mut TuiApp, event: BridgeEvent) {
                 });
             }
         }
+        "subagent_run_started"
+        | "subagent_task_started"
+        | "subagent_task_progress"
+        | "subagent_task_completed"
+        | "subagent_run_completed" => {
+            apply_subagent_lifecycle_event(app, &event);
+        }
         "install_progress" => {
             if let Some(summary) = event.summary {
                 app.status = clip_status(&summary, 72);
@@ -3209,6 +3463,132 @@ fn apply_bridge_event(app: &mut TuiApp, event: BridgeEvent) {
         }
         "response_completed" => {}
         _ => {}
+    }
+}
+
+fn apply_subagent_lifecycle_event(app: &mut TuiApp, event: &BridgeEvent) {
+    let run_id = event
+        .run_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("parallel-current");
+    let has_different_run = app
+        .subagent_run
+        .as_ref()
+        .is_some_and(|run| run.run_id != run_id);
+    if has_different_run && event.kind != "subagent_run_started" {
+        return;
+    }
+    let needs_run = app.subagent_run.is_none() || has_different_run;
+    if needs_run {
+        app.subagent_run = Some(SubagentRunState {
+            run_id: run_id.to_string(),
+            total: event.total.unwrap_or(event.tasks.len()),
+            completed: 0,
+            failed: 0,
+            status: String::from("running"),
+            work_file: event.work_file.clone(),
+            tasks: Vec::new(),
+        });
+    }
+
+    let Some(run) = app.subagent_run.as_mut() else {
+        return;
+    };
+    if let Some(total) = event.total {
+        run.total = total;
+    }
+    if let Some(work_file) = event.work_file.as_ref() {
+        run.work_file = Some(work_file.clone());
+    }
+
+    match event.kind.as_str() {
+        "subagent_run_started" => {
+            run.status = String::from("running");
+            run.completed = 0;
+            run.failed = 0;
+            run.tasks = event
+                .tasks
+                .iter()
+                .map(|task| SubagentTaskState {
+                    id: task.id.clone(),
+                    description: task.task.clone(),
+                    status: String::from("queued"),
+                    summary: String::new(),
+                    owned_paths: task.owns.clone(),
+                    changed_count: 0,
+                })
+                .collect();
+        }
+        "subagent_task_started" | "subagent_task_progress" | "subagent_task_completed" => {
+            let Some(task_id) = event
+                .task_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return;
+            };
+            let index = run
+                .tasks
+                .iter()
+                .position(|task| task.id == task_id)
+                .unwrap_or_else(|| {
+                    run.tasks.push(SubagentTaskState {
+                        id: task_id.to_string(),
+                        description: String::new(),
+                        status: String::from("queued"),
+                        summary: String::new(),
+                        owned_paths: Vec::new(),
+                        changed_count: 0,
+                    });
+                    run.tasks.len() - 1
+                });
+            let task = &mut run.tasks[index];
+            if event.kind == "subagent_task_started" || event.kind == "subagent_task_progress" {
+                task.status = String::from("running");
+            } else {
+                task.status = event
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| String::from("complete"));
+            }
+            if let Some(summary) = event.summary.as_ref() {
+                task.summary = summary.clone();
+            }
+            if !event.owned_paths.is_empty() {
+                task.owned_paths = event.owned_paths.clone();
+            }
+            if let Some(changed_count) = event.changed_count {
+                task.changed_count = changed_count;
+            }
+            run.completed = run
+                .tasks
+                .iter()
+                .filter(|task| task.status == "complete")
+                .count();
+            run.failed = run
+                .tasks
+                .iter()
+                .filter(|task| task.status == "failed")
+                .count();
+            run.total = run.total.max(run.tasks.len());
+        }
+        "subagent_run_completed" => {
+            run.status = if event.failed.unwrap_or(0) > 0 {
+                String::from("incomplete")
+            } else {
+                String::from("complete")
+            };
+            run.completed = event.completed.unwrap_or(run.completed);
+            run.failed = event.failed.unwrap_or(run.failed);
+        }
+        _ => {}
+    }
+
+    if let Some(summary) = event.summary.as_ref() {
+        app.status = clip_status(summary, 72);
+    } else {
+        app.status = format!("Parallel agents: {}/{} complete", run.completed, run.total);
     }
 }
 
@@ -3267,14 +3647,15 @@ fn provider_setup_url(provider: &str) -> Option<&'static str> {
     }
 }
 
-fn provider_setup_notice(provider: &str, configuration: &str) -> UiNotice {
+fn provider_setup_notice(
+    provider: &str,
+    configuration: &str,
+    configuration_state: &str,
+) -> UiNotice {
     let mut text = configuration.to_string();
-    let configuration_lower = configuration.to_ascii_lowercase();
     let needs_api_key = provider != "openai-compatible"
         && provider_api_key_env(provider).is_some()
-        && (configuration_lower.contains("not configured")
-            || configuration_lower.contains("api key")
-            || configuration_lower.contains("api_key"));
+        && configuration_state == "api_key_required";
     if needs_api_key {
         text.push_str(&format!(
             "\nRun /apikey {provider} to enter it in a masked prompt."
@@ -3317,63 +3698,18 @@ fn ui_state_badge(app: &TuiApp) -> (&'static str, Color) {
     if app.status.starts_with("Error") || app.status.starts_with("Could not") {
         return ("error", Color::Red);
     }
-    if app.setup_required || app.snapshot.session.configuration != "ready" {
+    if app.setup_required || app.snapshot.session.configuration_state != "ready" {
         return ("setup", Color::Yellow);
     }
     ("ready", Color::Green)
 }
 
 fn configuration_needs_api_key(session: &BridgeSession) -> bool {
-    if session.provider == "openai-compatible" || provider_api_key_env(&session.provider).is_none()
-    {
-        return false;
-    }
-    let configuration = session.configuration.to_ascii_lowercase();
-    configuration.contains("not configured")
-        || configuration.contains("api key")
-        || configuration.contains("api_key")
-}
-
-fn api_key_command_provider(prompt: &str) -> Option<String> {
-    let mut parts = prompt.split_whitespace();
-    let command = parts.next()?;
-    if !matches!(command, "/apikey" | "/key") {
-        return None;
-    }
-    let provider = parts.next()?;
-    provider_api_key_env(provider).map(|_| provider.to_string())
-}
-
-fn model_command_api_key_provider(prompt: &str) -> Option<String> {
-    let parts = prompt.split_whitespace().collect::<Vec<_>>();
-    if parts.len() < 3 || parts[0] != "/model" {
-        return None;
-    }
-    provider_api_key_env(parts[1]).map(|_| parts[1].to_string())
-}
-
-fn key_prompt_provider_for_result(
-    completed_prompt: Option<&str>,
-    answer: Option<&str>,
-    session: &BridgeSession,
-) -> Option<String> {
-    let answer = answer.unwrap_or_default();
-    if answer.contains("Status: API key required") {
-        if let Some(provider) = completed_prompt.and_then(model_command_api_key_provider) {
-            return Some(provider);
-        }
-        if configuration_needs_api_key(session) {
-            return Some(session.provider.clone());
-        }
-    }
-    if !answer.contains("hidden TUI prompt") {
-        return None;
-    }
-    completed_prompt.and_then(api_key_command_provider)
+    session.configuration_state == "api_key_required"
 }
 
 fn configuration_summary(session: &BridgeSession) -> &'static str {
-    if session.configuration == "ready" {
+    if session.configuration_state == "ready" {
         "Ready"
     } else if configuration_needs_api_key(session) {
         "API key required"
@@ -3382,27 +3718,33 @@ fn configuration_summary(session: &BridgeSession) -> &'static str {
     }
 }
 
-fn local_answer_needs_setup(answer: &str) -> bool {
-    answer.contains("Status: runtime unavailable")
-        || answer.contains("Status: runtime not installed")
-        || answer.contains("Status: model not installed")
-        || answer.contains("Status: manual setup required")
-        || answer.contains("Status: install incomplete")
-        || answer.contains("Status: install not ready")
-        || answer.contains("Status: install could not be verified")
-        || answer.contains("Automatic installation is not available")
-        || answer.contains("runtime is not installed")
-}
-
-fn install_confirmation_command(answer: &str) -> Option<String> {
-    let command = answer
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Confirm download:"))?
-        .trim();
-    if install_command_is_confirmed(command) {
-        Some(command.to_string())
-    } else {
-        None
+fn command_result_status(result: &BridgeCommandResult) -> String {
+    match result.code {
+        BridgeCommandCode::InstallConfirmationRequired => {
+            String::from("Review the model size above, then press Enter to install")
+        }
+        BridgeCommandCode::ModelNotInstalled => {
+            String::from("Model not installed — use /install when available")
+        }
+        BridgeCommandCode::RuntimeUnavailable | BridgeCommandCode::RuntimeNotInstalled => {
+            String::from("Local runtime unavailable — setup details shown above")
+        }
+        BridgeCommandCode::InstallFailed | BridgeCommandCode::InstallUnverified => {
+            String::from("Error — local model installation failed")
+        }
+        BridgeCommandCode::InstallNotReady | BridgeCommandCode::ManualSetupRequired => {
+            String::from("Local model setup incomplete — details shown above")
+        }
+        BridgeCommandCode::ApiKeyRequired => String::from("API key required"),
+        BridgeCommandCode::CredentialsRequired => String::from("Provider credentials required"),
+        BridgeCommandCode::Unavailable => String::from("Requested model is unavailable"),
+        BridgeCommandCode::Ok | BridgeCommandCode::Unknown => {
+            if result.error {
+                String::from("Error — details shown in conversation")
+            } else {
+                String::from("Ready")
+            }
+        }
     }
 }
 
@@ -3660,6 +4002,7 @@ fn bridge_response_to_final_frame(response: BridgeResponse) -> BridgeStreamFrame
         },
         event: None,
         snapshot: response.snapshot,
+        command_result: response.command_result,
     }
 }
 
@@ -3814,6 +4157,7 @@ mod tui_tests {
             mode: String::from("hosted"),
             reasoning_effort: String::from("provider controlled"),
             configuration: String::from("Anthropic is not configured. Set ANTHROPIC_API_KEY."),
+            configuration_state: String::from("api_key_required"),
             cost_usd: 0.0,
             tokens: BridgeTokens {
                 input: 0,
@@ -3830,6 +4174,7 @@ mod tui_tests {
         session.provider = String::from("openai");
         session.model = String::from("gpt-test");
         session.configuration = String::from("ready");
+        session.configuration_state = String::from("ready");
         TuiApp {
             snapshot: BridgeSnapshot {
                 session,
@@ -3846,6 +4191,7 @@ mod tui_tests {
             active_bridge: Arc::new(Mutex::new(None)),
             queued_prompts: VecDeque::new(),
             activity: Vec::new(),
+            subagent_run: None,
             palette: BridgeCompletions::default(),
             palette_selected: 0,
             approval_selected: 0,
@@ -3946,6 +4292,257 @@ mod tui_tests {
     }
 
     #[test]
+    fn parallel_subagent_events_are_visible_in_activity_panel() {
+        let mut app = test_app();
+        app.submitting = true;
+
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("subagent_run_started"),
+                summary: Some(String::from(
+                    "Spawned 2 parallel subagents · log: .agent/parallel-work.md",
+                )),
+                run_id: Some(String::from("parallel-test")),
+                total: Some(2),
+                work_file: Some(String::from(".agent/parallel-work.md")),
+                tasks: vec![
+                    BridgeSubagentTask {
+                        id: String::from("architecture"),
+                        task: String::from("inspect architecture"),
+                        owns: vec![String::from("frontend")],
+                    },
+                    BridgeSubagentTask {
+                        id: String::from("tests"),
+                        task: String::from("inspect tests"),
+                        owns: vec![String::from("tests")],
+                    },
+                ],
+                ..BridgeEvent::default()
+            },
+        );
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("subagent_task_started"),
+                summary: Some(String::from(
+                    "architecture · running — inspect architecture",
+                )),
+                run_id: Some(String::from("parallel-test")),
+                task_id: Some(String::from("architecture")),
+                ..BridgeEvent::default()
+            },
+        );
+
+        let rendered = rendered_text(&activity_panel_text(&app));
+        assert!(rendered.contains("Parallel agents"));
+        assert!(rendered.contains("0/2 complete"));
+        assert!(rendered.contains("architecture"));
+        assert!(rendered.contains("running"));
+        assert!(rendered.contains("owns tests"));
+        assert!(rendered.contains(".agent/parallel-work.md"));
+        assert_eq!(app.status, "architecture · running — inspect architecture");
+    }
+
+    #[test]
+    fn parallel_subagent_completion_fields_update_structured_ui_state() {
+        let mut app = test_app();
+        app.submitting = true;
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("subagent_run_started"),
+                run_id: Some(String::from("parallel-test")),
+                total: Some(2),
+                tasks: vec![
+                    BridgeSubagentTask {
+                        id: String::from("python"),
+                        task: String::from("inspect Python"),
+                        owns: vec![String::from("agent")],
+                    },
+                    BridgeSubagentTask {
+                        id: String::from("rust"),
+                        task: String::from("inspect Rust"),
+                        owns: vec![String::from("agent-rust")],
+                    },
+                ],
+                ..BridgeEvent::default()
+            },
+        );
+        for (task_id, status) in [("python", "complete"), ("rust", "failed")] {
+            apply_bridge_event(
+                &mut app,
+                BridgeEvent {
+                    kind: String::from("subagent_task_completed"),
+                    run_id: Some(String::from("parallel-test")),
+                    task_id: Some(task_id.to_string()),
+                    status: Some(status.to_string()),
+                    summary: Some(format!("{task_id} · {status}")),
+                    ..BridgeEvent::default()
+                },
+            );
+        }
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("subagent_run_completed"),
+                run_id: Some(String::from("parallel-test")),
+                total: Some(2),
+                completed: Some(1),
+                failed: Some(1),
+                ..BridgeEvent::default()
+            },
+        );
+
+        let run = app.subagent_run.as_ref().expect("structured run state");
+        assert_eq!(run.completed, 1);
+        assert_eq!(run.failed, 1);
+        assert_eq!(run.status, "incomplete");
+        let rendered = rendered_text(&activity_panel_text(&app));
+        let compact = rendered.replace('\n', "");
+        assert!(rendered.contains("1/2 complete"));
+        assert!(compact.contains("python · complete"));
+        assert!(compact.contains("rust · failed"));
+    }
+
+    #[test]
+    fn parallel_subagent_progress_tracks_ownership_and_changes() {
+        let mut app = test_app();
+        app.submitting = true;
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("subagent_run_started"),
+                run_id: Some(String::from("parallel-progress")),
+                total: Some(2),
+                tasks: vec![
+                    BridgeSubagentTask {
+                        id: String::from("client"),
+                        task: String::from("implement client"),
+                        owns: vec![String::from("tasker/client")],
+                    },
+                    BridgeSubagentTask {
+                        id: String::from("server"),
+                        task: String::from("implement server"),
+                        owns: vec![String::from("tasker/server")],
+                    },
+                ],
+                ..BridgeEvent::default()
+            },
+        );
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("subagent_task_progress"),
+                run_id: Some(String::from("parallel-progress")),
+                task_id: Some(String::from("client")),
+                status: Some(String::from("running")),
+                owned_paths: vec![String::from("tasker/client")],
+                changed_count: Some(2),
+                summary: Some(String::from("write_file · observed tasker/client/app.ts")),
+                ..BridgeEvent::default()
+            },
+        );
+
+        let task = &app.subagent_run.as_ref().unwrap().tasks[0];
+        assert_eq!(task.status, "running");
+        assert_eq!(task.owned_paths, vec![String::from("tasker/client")]);
+        assert_eq!(task.changed_count, 2);
+        assert!(rendered_text(&activity_panel_text(&app)).contains("write_file"));
+    }
+
+    #[test]
+    fn stale_subagent_event_cannot_replace_the_active_run() {
+        let mut app = test_app();
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("subagent_run_started"),
+                run_id: Some(String::from("parallel-current")),
+                total: Some(2),
+                ..BridgeEvent::default()
+            },
+        );
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("subagent_task_completed"),
+                run_id: Some(String::from("parallel-stale")),
+                task_id: Some(String::from("stale-task")),
+                status: Some(String::from("complete")),
+                ..BridgeEvent::default()
+            },
+        );
+
+        let run = app.subagent_run.as_ref().unwrap();
+        assert_eq!(run.run_id, "parallel-current");
+        assert!(run.tasks.is_empty());
+    }
+
+    #[test]
+    fn conversation_markdown_markers_are_rendered_as_terminal_styles() {
+        let heading = rendered_text(&Text::from(message_body_line("### Result")));
+        let inline = rendered_text(&Text::from(message_body_line(
+            "This is **important** and `planner.py` is code.",
+        )));
+        let bullet = rendered_text(&Text::from(message_body_line("- one item")));
+        let compact_bullet = bullet.replace('\n', "");
+
+        assert!(heading.contains("Result"));
+        assert!(!heading.contains("###"));
+        assert!(inline.contains("important"));
+        assert!(inline.contains("planner.py"));
+        assert!(!inline.contains("**"));
+        assert!(!inline.contains('`'));
+        assert!(compact_bullet.contains("• one item"));
+    }
+
+    #[test]
+    fn completed_turn_retains_recent_parallel_activity() {
+        let mut app = test_app();
+        app.submitting = true;
+        app.activity.push(ActivityLine {
+            kind: String::from("tool"),
+            text: String::from("ordinary tool trace"),
+        });
+        app.subagent_run = Some(SubagentRunState {
+            run_id: String::from("parallel-test"),
+            total: 2,
+            completed: 2,
+            failed: 0,
+            status: String::from("complete"),
+            work_file: Some(String::from(".agent/parallel-work.md")),
+            tasks: vec![
+                SubagentTaskState {
+                    id: String::from("architecture"),
+                    description: String::from("inspect architecture"),
+                    status: String::from("complete"),
+                    summary: String::new(),
+                    owned_paths: vec![String::from("frontend")],
+                    changed_count: 1,
+                },
+                SubagentTaskState {
+                    id: String::from("tests"),
+                    description: String::from("inspect tests"),
+                    status: String::from("complete"),
+                    summary: String::new(),
+                    owned_paths: vec![String::from("tests")],
+                    changed_count: 2,
+                },
+            ],
+        });
+
+        clear_live_turn_display(&mut app);
+        app.submitting = false;
+
+        let rendered = rendered_text(&activity_panel_text(&app));
+        assert!(!rendered.contains("ordinary tool trace"));
+        assert!(rendered.contains("Recent parallel run"));
+        assert!(rendered.contains("2/2 complete"));
+        assert!(rendered.contains("architecture"));
+    }
+
+    #[test]
     fn completed_turn_replaces_live_tool_trace_with_persisted_messages() {
         let mut app = test_app();
         app.submitting = true;
@@ -3979,6 +4576,7 @@ mod tui_tests {
                 error: None,
                 event: None,
                 snapshot: Some(snapshot),
+                command_result: None,
             })),
         );
 
@@ -4013,6 +4611,7 @@ mod tui_tests {
                 error: None,
                 event: None,
                 snapshot: None,
+                command_result: None,
             })),
         );
 
@@ -4036,6 +4635,7 @@ mod tui_tests {
                 error: None,
                 event: None,
                 snapshot: None,
+                command_result: None,
             })),
         );
 
@@ -4113,71 +4713,26 @@ mod tui_tests {
     }
 
     #[test]
-    fn unrelated_local_commands_do_not_reopen_anthropic_key_input() {
-        let provider = key_prompt_provider_for_result(
-            Some("/install ollama llama3.3"),
-            Some("Status: runtime unavailable"),
-            &anthropic_session(),
-        );
+    fn typed_command_result_carries_exact_secret_provider() {
+        let result = BridgeCommandResult {
+            code: BridgeCommandCode::ApiKeyRequired,
+            setup_required: true,
+            error: false,
+            secret_provider: Some(String::from("openai")),
+            next_command: None,
+        };
 
-        assert_eq!(provider, None);
+        assert_eq!(result.secret_provider.as_deref(), Some("openai"));
     }
 
     #[test]
-    fn model_auth_result_opens_key_input_for_selected_provider() {
-        let provider = key_prompt_provider_for_result(
-            Some("/model anthropic claude-sonnet-4.5"),
-            Some("Status: API key required"),
-            &anthropic_session(),
-        );
-
-        assert_eq!(provider.as_deref(), Some("anthropic"));
-    }
-
-    #[test]
-    fn model_auth_prompt_prefers_selected_provider_over_stale_session() {
-        let provider = key_prompt_provider_for_result(
-            Some("/model openai gpt-5.5"),
-            Some("Status: API key required"),
-            &anthropic_session(),
-        );
-
-        assert_eq!(provider.as_deref(), Some("openai"));
-    }
-
-    #[test]
-    fn local_model_selection_never_opens_api_key_input() {
-        let provider = key_prompt_provider_for_result(
-            Some("/model ollama qwen3"),
-            Some("Status: model not installed"),
-            &anthropic_session(),
-        );
-
-        assert_eq!(provider, None);
-    }
-
-    #[test]
-    fn explicit_api_key_command_uses_its_own_provider() {
-        let provider = key_prompt_provider_for_result(
-            Some("/apikey openai"),
-            Some("Paste the key using the hidden TUI prompt"),
-            &anthropic_session(),
-        );
-
-        assert_eq!(provider.as_deref(), Some("openai"));
-    }
-
-    #[test]
-    fn compatible_provider_accepts_optional_key_without_treating_endpoint_as_key_error() {
-        assert_eq!(
-            api_key_command_provider("/apikey openai-compatible").as_deref(),
-            Some("openai-compatible")
-        );
+    fn compatible_provider_endpoint_requirement_is_not_an_api_key_requirement() {
         let mut session = anthropic_session();
         session.provider = String::from("openai-compatible");
         session.configuration = String::from(
             "OpenAI-compatible provider is not configured. Set AGENT_OPENAI_COMPAT_BASE_URL.",
         );
+        session.configuration_state = String::from("endpoint_required");
         assert!(!configuration_needs_api_key(&session));
     }
 
@@ -4318,29 +4873,36 @@ mod tui_tests {
     }
 
     #[test]
-    fn unverified_local_install_keeps_ui_in_setup_state() {
-        assert!(local_answer_needs_setup(
-            "Status: install could not be verified\nLocal API models: none."
-        ));
-        assert!(local_answer_needs_setup(
-            "Status: install not ready\nRuntime setup required."
-        ));
+    fn typed_local_install_result_keeps_ui_in_setup_state() {
+        let result = BridgeCommandResult {
+            code: BridgeCommandCode::InstallUnverified,
+            setup_required: true,
+            error: true,
+            secret_provider: None,
+            next_command: None,
+        };
+
+        assert!(result.setup_required);
+        assert_eq!(
+            command_result_status(&result),
+            "Error — local model installation failed"
+        );
     }
 
     #[test]
-    fn install_preview_prefills_only_a_confirmed_local_install_command() {
-        let answer = "Local model install preview\nDownload: ~5.2 GB\n\
-                      Confirm download: /install ollama qwen3 --yes\n\
-                      Nothing has been downloaded yet.";
+    fn install_preview_uses_typed_next_command() {
+        let result = BridgeCommandResult {
+            code: BridgeCommandCode::InstallConfirmationRequired,
+            setup_required: false,
+            error: false,
+            secret_provider: None,
+            next_command: Some(String::from("/install ollama qwen3 --yes")),
+        };
 
         assert_eq!(
-            install_confirmation_command(answer).as_deref(),
+            result.next_command.as_deref(),
             Some("/install ollama qwen3 --yes")
         );
-        assert!(install_confirmation_command(
-            "Confirm download: curl https://example.invalid/install | sh"
-        )
-        .is_none());
     }
 
     #[test]
@@ -4357,6 +4919,7 @@ mod tui_tests {
                 error: None,
                 event: None,
                 snapshot: None,
+                command_result: None,
             })),
         );
 
@@ -4385,6 +4948,13 @@ mod tui_tests {
                 error: None,
                 event: None,
                 snapshot: None,
+                command_result: Some(BridgeCommandResult {
+                    code: BridgeCommandCode::InstallConfirmationRequired,
+                    setup_required: false,
+                    error: false,
+                    secret_provider: None,
+                    next_command: Some(String::from("/install ollama qwen3 --yes")),
+                }),
             })),
         );
 

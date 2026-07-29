@@ -113,7 +113,7 @@ def test_plain_assistant_answer_after_tool_round_completes_turn() -> None:
         llm=llm,
         rust=FakeRust(),
         workspace_root="/workspace",
-        user_prompt="has my project been deleted?",
+        user_prompt="inspect the current project state",
     )
 
     assert answer == "The workspace exists, but I need the exact project path."
@@ -521,12 +521,26 @@ def test_local_agent_routes_to_compact_tools_with_top_level_descriptions() -> No
     assert all(tool.get("description") for tool in llm.requests[1]["tools"])
 
 
-def test_explicit_desktop_open_requests_approval_without_model_roundtrip() -> None:
-    class NoLLM:
+def test_desktop_open_intent_is_selected_by_model_and_requires_approval() -> None:
+    class SemanticLLM:
         mode = "local"
 
+        def __init__(self) -> None:
+            self.calls = 0
+
         def respond(self, **_kwargs: Any) -> Any:
-            raise AssertionError("desktop open fast path should not ask the model")
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    output=[{
+                        "type": "function_call",
+                        "name": "desktop_action",
+                        "call_id": "launch-semantic-target",
+                        "arguments": '{"action":"launch_application","target":"spark"}',
+                    }],
+                    output_text="",
+                )
+            return SimpleNamespace(output=[], output_text="Approval requested.")
 
     class FakeRust:
         def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, Any]:
@@ -548,15 +562,17 @@ def test_explicit_desktop_open_requests_approval_without_model_roundtrip() -> No
             raise AssertionError("desktop action must wait for approval")
 
     session = AgentSession()
+    llm = SemanticLLM()
     answer = run_agent(
-        llm=NoLLM(),
+        llm=llm,
         rust=FakeRust(),
         workspace_root=".",
         user_prompt="can you open my spark app",
         session=session,
     )
 
-    assert "Approval required" in answer
+    assert answer == "Approval requested."
+    assert llm.calls == 2
     assert session.pending_approvals
     request = session.pending_approvals[0]
     assert request["tool"] == "desktop_action"

@@ -52,6 +52,7 @@ class LLMProviderTests(unittest.TestCase):
         for client in clients.values():
             self.assertEqual(client.mode, "local")
             self.assertIsNone(client.configuration_error)
+            self.assertEqual(client.configuration_state, "ready")
             self.assertIsNotNone(client.client)
 
     def test_local_provider_streams_text_and_tool_activity(self) -> None:
@@ -389,6 +390,7 @@ class LLMProviderTests(unittest.TestCase):
             client = LLMClient(provider="deepseek")
 
         self.assertIsNotNone(client.configuration_error)
+        self.assertEqual(client.configuration_state, "api_key_required")
         with self.assertRaisesRegex(RuntimeError, "DEEPSEEK_API_KEY"):
             client.respond(instructions="", messages=[{"role": "user", "content": "hi"}], tools=[])
 
@@ -397,6 +399,7 @@ class LLMProviderTests(unittest.TestCase):
             client = LLMClient(provider="openai")
 
         self.assertIsNotNone(client.configuration_error)
+        self.assertEqual(client.configuration_state, "api_key_required")
         with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
             client.respond(instructions="", messages=[{"role": "user", "content": "hi"}], tools=[])
 

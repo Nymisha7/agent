@@ -25,12 +25,13 @@ class ToolContext:
     rust: RustTools
     workspace_root: Path
     search_roots: list[Path]
+    owned_write_roots: list[Path] | None = None
     approved_external_read_roots: list[Path] = field(default_factory=list)
     approved_external_write_roots: list[Path] = field(default_factory=list)
     approved_external_delete_roots: list[Path] = field(default_factory=list)
     approved_system_commands: list[str] = field(default_factory=list)
     language_servers: LanguageServerManager | None = None
-    discovery_runner: Callable[..., Any] | None = None
+    parallel_runner: Callable[..., Any] | None = None
     skill_catalog: SkillCatalog | None = None
 
 
@@ -143,30 +144,61 @@ def build_tool_registry(ctx: ToolContext) -> ToolRegistry:
                 ),
             )
         )
-    if ctx.discovery_runner is not None:
+    if ctx.parallel_runner is not None:
         registry.register(
             ToolSpec(
-                name="discovery_subagent",
-                handler=_discovery_subagent,
+                name="parallel_subagents",
+                handler=_parallel_subagents,
                 schema=_function_schema(
-                    name="discovery_subagent",
+                    name="parallel_subagents",
                     description=(
-                        "Run one isolated, sequential, read-only subagent to search or inspect "
-                        "the workspace. It cannot edit files, run commands, control the desktop, "
-                        "use secret-scanning tools, spawn another subagent, or continue in the background. "
-                        "Use it only for a bounded discovery task; it returns before you continue."
+                        "Delegate one concurrent batch of independent tasks during the normal agent turn. "
+                        "Each child has a fresh model/tool loop, can read the workspace, and may write or edit "
+                        "only inside its declared non-overlapping owns directories. Omit owns for a read-only "
+                        "research task. Use this when multiple substantial workstreams can proceed independently; "
+                        "do not create filler tasks or dependent phases. Children cannot delete, run arbitrary "
+                        "commands, control the desktop, send messages, request approval, or spawn agents. "
+                        "The parent integrates cross-cutting files, verifies the batch, and gives the final answer."
                     ),
                     properties={
-                        "task": {
-                            "type": "string",
-                            "description": "Specific search, inspection, or evidence-gathering task.",
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Optional workspace-relative path that scopes discovery.",
+                        "tasks": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 8,
+                            "description": (
+                                "Independent bounded tasks that can safely execute at the same time."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": "Unique stable label for this workstream.",
+                                    },
+                                    "task": {
+                                        "type": "string",
+                                        "description": (
+                                            "Specific implementation, investigation, or review task "
+                                            "that this child can finish independently."
+                                        ),
+                                    },
+                                    "owns": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "maxItems": 8,
+                                        "description": (
+                                            "Workspace-relative directories this child exclusively owns for "
+                                            "write/edit operations. Ownership must not overlap another task. "
+                                            "Omit or use an empty array for read-only work."
+                                        ),
+                                    },
+                                },
+                                "required": ["id", "task"],
+                                "additionalProperties": False,
+                            },
                         },
                     },
-                    required=["task"],
+                    required=["tasks"],
                 ),
             )
         )
@@ -187,21 +219,18 @@ def _load_skill(args: dict[str, Any], ctx: ToolContext) -> Any:
     return ctx.skill_catalog.load(name)
 
 
-def _discovery_subagent(args: dict[str, Any], ctx: ToolContext) -> Any:
-    if ctx.discovery_runner is None:
+def _parallel_subagents(args: dict[str, Any], ctx: ToolContext) -> Any:
+    if ctx.parallel_runner is None:
         return {
             "ok": False,
-            "tool": "discovery_subagent",
+            "tool": "parallel_subagents",
             "blocked": True,
-            "reason": "discovery_subagent_unavailable",
+            "reason": "parallel_subagents_unavailable",
         }
-    task = args.get("task")
-    if not isinstance(task, str) or not task.strip():
-        raise ValueError("discovery_subagent requires non-empty string arg 'task'.")
-    path = args.get("path")
-    if path is not None and (not isinstance(path, str) or not path.strip()):
-        raise ValueError("discovery_subagent arg 'path' must be a non-empty string when provided.")
-    return ctx.discovery_runner(task=task.strip(), path=path.strip() if isinstance(path, str) else None)
+    tasks = args.get("tasks")
+    if not isinstance(tasks, list):
+        raise ValueError("parallel_subagents requires array arg 'tasks'.")
+    return ctx.parallel_runner(tasks=tasks)
 
 
 def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
@@ -965,7 +994,8 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 name="delete_path",
                 description=(
                     "Delete an existing file or directory inside the workspace. Directories "
-                    "require recursive=true when not empty."
+                    "require recursive=true when not empty. The runtime requires one structured "
+                    "approval for the exact resolved target before execution."
                 ),
                 properties={
                     "path": {
@@ -1123,17 +1153,37 @@ def _resolve_tool_path(
 ) -> Path | dict[str, Any]:
     alias_path = _workspace_alias_path(raw_path, ctx.workspace_root)
     if alias_path is not None:
-        return alias_path
+        return _enforce_owned_mutation_scope(
+            alias_path,
+            ctx,
+            tool=tool,
+            operation=operation,
+            requested_path=raw_path,
+        )
     if _looks_like_windows_drive_path(raw_path):
         return _resolve_windows_tool_path(raw_path, ctx, tool=tool, operation=operation)
 
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
-        return _ensure_within_workspace(ctx.workspace_root / path, ctx.workspace_root)
+        resolved = _ensure_within_workspace(ctx.workspace_root / path, ctx.workspace_root)
+        return _enforce_owned_mutation_scope(
+            resolved,
+            ctx,
+            tool=tool,
+            operation=operation,
+            requested_path=raw_path,
+        )
 
     resolved = _resolve_without_strict(path)
     if _path_is_within_or_equal(resolved, ctx.workspace_root.expanduser().resolve()):
-        return _ensure_within_workspace(resolved, ctx.workspace_root)
+        workspace_path = _ensure_within_workspace(resolved, ctx.workspace_root)
+        return _enforce_owned_mutation_scope(
+            workspace_path,
+            ctx,
+            tool=tool,
+            operation=operation,
+            requested_path=raw_path,
+        )
 
     if _is_broad_external_path(resolved):
         return _external_path_observation(
@@ -1175,6 +1225,38 @@ def _resolve_tool_path(
             "path for the requested operation before retrying."
         ),
     )
+
+
+def _enforce_owned_mutation_scope(
+    path: Path,
+    ctx: ToolContext,
+    *,
+    tool: str,
+    operation: str,
+    requested_path: str,
+) -> Path | dict[str, Any]:
+    if operation not in {"write", "delete"} or ctx.owned_write_roots is None:
+        return path
+    resolved = _resolve_without_strict(path)
+    owned_roots = [_resolve_without_strict(root) for root in ctx.owned_write_roots]
+    if any(_path_is_within_or_equal(resolved, root) for root in owned_roots):
+        return path
+    return {
+        "ok": False,
+        "tool": tool,
+        "blocked": True,
+        "recoverable": True,
+        "reason": "subagent_write_scope_violation",
+        "operation": operation,
+        "requested_path": requested_path,
+        "resolved_path": str(resolved),
+        "owned_write_roots": [str(root) for root in owned_roots],
+        "guidance": (
+            "This independent agent may mutate only its assigned ownership scopes. "
+            "Keep the change inside one owned path or return the cross-scope requirement "
+            "to the parent coordinator."
+        ),
+    }
 
 
 def _resolve_windows_tool_path(
@@ -1271,6 +1353,11 @@ def _external_path_is_approved(path: Path, ctx: ToolContext, operation: str) -> 
 
 def _workspace_root_for_tool_path(path: Path, ctx: ToolContext, operation: str) -> Path:
     workspace_root = ctx.workspace_root.expanduser().resolve()
+    if operation in {"write", "delete"} and ctx.owned_write_roots is not None:
+        owned_roots = [_resolve_without_strict(root) for root in ctx.owned_write_roots]
+        containing = [root for root in owned_roots if _path_is_within_or_equal(path, root)]
+        if containing:
+            return max(containing, key=lambda root: len(root.parts))
     if _path_is_within_or_equal(path, workspace_root):
         return workspace_root
 
@@ -1703,27 +1790,6 @@ def _inspect_target(args: dict[str, Any], ctx: ToolContext) -> Any:
         offset=offset,
         limit=limit,
     )
-    if (
-        isinstance(result, dict)
-        and result.get("status") == "not_found"
-        and isinstance(path_arg, str)
-        and not _looks_like_explicit_path(path_arg)
-    ):
-        recovered_query = _strip_generic_target_suffix(path_arg)
-        if recovered_query and recovered_query != path_arg:
-            recovered = ctx.rust.inspect_target(
-                path=recovered_query,
-                workspace_root=ctx.workspace_root,
-                kind=kind,
-                offset=offset,
-                limit=min(limit, 100),
-            )
-            if isinstance(recovered, dict) and recovered.get("status") in {"resolved", "candidates"}:
-                recovered = dict(recovered)
-                recovered["original_query"] = path_arg
-                recovered["recovered_query"] = recovered_query
-                recovered["recovery"] = "removed_generic_target_suffix"
-                return _bound_target_candidates(recovered, recovered_query)
     return _bound_target_candidates(result, path_arg if isinstance(path_arg, str) else raw_path)
 
 
@@ -2482,6 +2548,115 @@ def _delete_path(args: dict[str, Any], ctx: ToolContext) -> Any:
     )
 
 
+def verify_mutation_observation(
+    tool: str,
+    args: dict[str, Any],
+    observation: Any,
+    *,
+    workspace_root: Path,
+    allowed_write_roots: list[Path] | None = None,
+) -> Any:
+    """Verify a successful mutation report against the filesystem."""
+    if tool not in {"write_file", "edit_file", "delete_path"}:
+        return observation
+    if not isinstance(observation, dict) or observation.get("ok") is False:
+        return observation
+
+    raw_path = observation.get("path") or args.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return _mutation_verification_failure(
+            observation,
+            tool,
+            "The tool reported success without an affected path.",
+        )
+    target = Path(raw_path).expanduser()
+    if not target.is_absolute():
+        target = workspace_root / target
+    target = target.resolve(strict=False)
+    if allowed_write_roots is not None and not any(
+        _path_is_within_or_equal(target, root.resolve(strict=False))
+        for root in allowed_write_roots
+    ):
+        return _mutation_verification_failure(
+            observation,
+            tool,
+            "The mutation result escaped the agent's assigned ownership.",
+            target,
+        )
+
+    try:
+        if tool == "delete_path":
+            if observation.get("deleted") is not True:
+                return _mutation_verification_failure(
+                    observation,
+                    tool,
+                    "The delete result did not confirm deletion.",
+                    target,
+                )
+            if target.exists() or target.is_symlink():
+                return _mutation_verification_failure(
+                    observation,
+                    tool,
+                    "The target still exists after deletion was reported.",
+                    target,
+                )
+            postcondition, digest = "path_absent", None
+        else:
+            if target.is_symlink() or not target.is_file():
+                return _mutation_verification_failure(
+                    observation,
+                    tool,
+                    "The reported output path is not a regular file.",
+                    target,
+                )
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if observation.get("after_sha256") != digest:
+                return _mutation_verification_failure(
+                    observation,
+                    tool,
+                    "The mutation output hash does not match the file on disk.",
+                    target,
+                )
+            postcondition = "file_hash_matches"
+    except OSError as exc:
+        return _mutation_verification_failure(
+            observation,
+            tool,
+            f"Could not inspect the mutation result: {exc}",
+            target,
+        )
+
+    verified = dict(observation)
+    verified["verified"] = True
+    verified["verification"] = {
+        "postcondition": postcondition,
+        "path": str(target),
+        **({"sha256": digest} if digest else {}),
+    }
+    return verified
+
+
+def _mutation_verification_failure(
+    observation: dict[str, Any],
+    tool: str,
+    detail: str,
+    target: Path | None = None,
+) -> dict[str, Any]:
+    failed = dict(observation)
+    failed.update({
+        "ok": False,
+        "verified": False,
+        "reason": "mutation_verification_failed",
+        "error": detail,
+        "recoverable": True,
+        "guidance": "Inspect the target and retry; do not claim success before verification.",
+        "tool": tool,
+    })
+    if target is not None:
+        failed["path"] = str(target)
+    return failed
+
+
 def _inspect_single_file(
     path: Path,
     *,
@@ -2883,17 +3058,6 @@ def _inspect_target_arg(value: str, workspace_root: Path) -> str:
     if path.is_absolute() or _looks_like_explicit_path(value):
         return str(_resolve_path(value, workspace_root))
     return value
-
-
-def _strip_generic_target_suffix(value: str) -> str:
-    normalized = value.strip()
-    stripped = re.sub(
-        r"(?:[\s_-]+)(?:project|repo|repository|folder|directory)$",
-        "",
-        normalized,
-        flags=re.IGNORECASE,
-    ).strip(" _-")
-    return stripped if stripped else normalized
 
 
 def _bound_target_candidates(result: Any, query: str, *, limit: int = 20) -> Any:

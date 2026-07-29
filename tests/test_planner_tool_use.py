@@ -19,10 +19,10 @@ from agent.planner import (
     _attach_approval_display_path,
     _approval_request_from_observation,
     _build_initial_messages,
+    _handle_subagent_event,
     _summarize_approval_request,
     _prepare_tool_output,
     _preflight_tool_call,
-    _is_explicit_delete_request,
     _looks_like_unexecuted_action,
     _verify_mutation_observation,
     _update_session_from_tool_result,
@@ -41,6 +41,7 @@ class PlannerToolUseTests(unittest.TestCase):
         prompt = load_system_prompt()
         self.assertIn("write_file", prompt)
         self.assertIn("Preserve user intent", prompt)
+        self.assertIn("follow-up correction as a revision", prompt)
         self.assertIn("Resolve entities before acting", prompt)
         self.assertIn("named target", prompt)
         self.assertIn("Treat credentials, secrets, API keys", prompt)
@@ -58,6 +59,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("internal tool-enum mistake", prompt)
         self.assertIn("Do not invent a UI", prompt)
         self.assertIn("Do not invent a UI", LOCAL_AGENT_PROMPT)
+        self.assertIn("follow-up correction as a revision", LOCAL_AGENT_PROMPT)
         self.assertNotIn("call `write_file` directly", prompt)
         self.assertNotIn("does not need discovery", LOCAL_AGENT_PROMPT)
         self.assertIn("When no tool is needed, answer directly", prompt)
@@ -76,6 +78,137 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertEqual(messages[-1], {"role": "user", "content": "current request"})
+
+    def test_subagent_lifecycle_event_streams_and_persists(self) -> None:
+        streamed: list[dict[str, Any]] = []
+        persisted: list[dict[str, Any]] = []
+        event = {
+            "kind": "subagent_task_started",
+            "run_id": "parallel-1",
+            "task_id": "tests",
+            "summary": "tests · running — inspect tests",
+        }
+
+        _handle_subagent_event(
+            event,
+            stream_event=streamed.append,
+            record_event=lambda **kwargs: persisted.append(kwargs),
+        )
+
+        self.assertEqual(streamed, [event])
+        self.assertEqual(persisted[0]["event_type"], "subagent_task_started")
+        self.assertEqual(persisted[0]["tool"], "parallel_subagents")
+        self.assertEqual(persisted[0]["data"], {"subagent": event})
+
+    def test_simple_prompt_does_not_run_a_delegation_classifier(self) -> None:
+        class FakeLLM:
+            provider = "openai"
+            model = "test-model"
+            reasoning_effort = None
+            reasoning_summary = None
+
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.requests.append(kwargs)
+                return SimpleNamespace(output=[], output_text="Hello.")
+
+        llm = FakeLLM()
+        events: list[dict[str, Any]] = []
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=SimpleNamespace(rust_bin=Path("/tmp/agent-rust")),  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="hello",
+            stream_event=events.append,
+        )
+
+        self.assertEqual(answer, "Hello.")
+        self.assertEqual(len(llm.requests), 1)
+        self.assertIn(
+            "parallel_subagents",
+            {tool["name"] for tool in llm.requests[0]["tools"]},
+        )
+        self.assertFalse(any(event["kind"].startswith("subagent_") for event in events))
+
+    def test_run_agent_executes_model_invoked_parallel_batch(self) -> None:
+        class FakeLLM:
+            provider = "openai"
+            model = "test-model"
+            reasoning_effort = None
+            reasoning_summary = None
+
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.requests.append(kwargs)
+                if len(self.requests) == 1:
+                    return SimpleNamespace(
+                        output=[{
+                            "type": "function_call",
+                            "name": "parallel_subagents",
+                            "call_id": "delegate-1",
+                            "arguments": json.dumps({
+                                "tasks": [
+                                    {
+                                        "id": "client",
+                                        "task": "implement the client workstream",
+                                        "owns": ["tasker/client"],
+                                    },
+                                    {
+                                        "id": "server",
+                                        "task": "implement the server workstream",
+                                        "owns": ["tasker/server"],
+                                    },
+                                ],
+                            }),
+                        }],
+                        output_text="",
+                    )
+                return SimpleNamespace(output=[], output_text="Used the parallel findings.")
+
+        class FakeRust:
+            rust_bin = Path("/tmp/agent-rust")
+
+        parallel_result = {
+            "ok": True,
+            "execution_mode": "parallel",
+            "complete": True,
+            "work_file": "/workspace/.agent/parallel-work.md",
+            "tasks": [
+                {"task_id": "client", "ok": True, "complete": True, "report": "client"},
+                {"task_id": "server", "ok": True, "complete": True, "report": "server"},
+            ],
+        }
+        llm = FakeLLM()
+        events: list[dict[str, Any]] = []
+        with patch(
+            "agent.planner.ParallelSubagentRunner.run",
+            return_value=parallel_result,
+        ) as run_parallel:
+            answer = run_agent(
+                llm=llm,  # type: ignore[arg-type]
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root="/workspace",
+                user_prompt="build a task manager with independent client and server workstreams",
+                stream_event=events.append,
+            )
+
+        self.assertEqual(answer, "Used the parallel findings.")
+        self.assertEqual(run_parallel.call_count, 1)
+        self.assertEqual(len(run_parallel.call_args.kwargs["tasks"]), 2)
+        self.assertEqual(
+            run_parallel.call_args.kwargs["tasks"][0]["owns"],
+            ["tasker/client"],
+        )
+        first_tool_names = {tool["name"] for tool in llm.requests[0]["tools"]}
+        self.assertIn("parallel_subagents", first_tool_names)
+        second_tool_names = {tool["name"] for tool in llm.requests[1]["tools"]}
+        self.assertNotIn("parallel_subagents", second_tool_names)
+        self.assertIn("parallel_subagents", json.dumps(llm.requests[1]["messages"]))
+        self.assertFalse(any(event["kind"].startswith("subagent_plan") for event in events))
 
     def test_tool_registry_exposes_edit_and_delete_tools(self) -> None:
         ctx = ToolContext(
@@ -878,31 +1011,25 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(result["tracked_deleted_count"], 1)
         self.assertEqual(result["state"], "tracked_content_deleted")
 
-    def test_delete_verification_is_not_explicit_delete_request(self) -> None:
-        self.assertFalse(_is_explicit_delete_request("has my project been deleted?"))
-        self.assertFalse(_is_explicit_delete_request("check whether project/ was removed"))
-        self.assertTrue(_is_explicit_delete_request("delete project/"))
-
-    def test_preflight_blocks_delete_for_read_only_verification(self) -> None:
-        ctx = ToolContext(
-            rust=RustTools(Path("/tmp/agent-rust")),
-            workspace_root=Path("/workspace"),
-            search_roots=[],
-        )
-
+    def test_preflight_requires_structured_approval_for_exact_delete_target(self) -> None:
         observation = _preflight_tool_call(
             ModelToolCall(
-                name="delete_path",
-                call_id="call-verify",
-                arguments={"path": "project"},
+                name="delete_path", call_id="call-delete", arguments={"path": "report.md"},
             ),
-            tool_ctx=ctx,
-            user_prompt="can you tell me if my project has been deleted or not?",
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
         )
 
         self.assertIsNotNone(observation)
         self.assertTrue(observation["blocked"])
-        self.assertEqual(observation["reason"], "delete_not_explicitly_requested")
+        self.assertTrue(observation["recoverable"])
+        self.assertEqual(observation["reason"], "delete_requires_confirmation")
+        self.assertEqual(observation["operation"], "delete")
+        self.assertEqual(observation["requested_path"], "report.md")
+        self.assertEqual(observation["resolved_path"], "/workspace/report.md")
 
     def test_preflight_blocks_active_workspace_root_deletion(self) -> None:
         ctx = ToolContext(
@@ -918,7 +1045,6 @@ class PlannerToolUseTests(unittest.TestCase):
                 arguments={"path": "/workspace", "recursive": True},
             ),
             tool_ctx=ctx,
-            user_prompt="delete this project",
         )
 
         self.assertIsNotNone(observation)
@@ -1081,7 +1207,6 @@ class PlannerToolUseTests(unittest.TestCase):
                 search_roots=[],
             ),
             session=session,
-            user_prompt="click Save",
         )
 
         self.assertIsNone(result)
@@ -1113,7 +1238,6 @@ class PlannerToolUseTests(unittest.TestCase):
                 search_roots=[],
             ),
             session=session,
-            user_prompt="focus it",
         )
 
         self.assertIsNotNone(result)
@@ -1134,14 +1258,13 @@ class PlannerToolUseTests(unittest.TestCase):
             ),
             tool_ctx=ctx,
             session=AgentSession(),
-            user_prompt="focus that window",
         )
 
         self.assertIsNotNone(observation)
         self.assertTrue(observation["blocked"])
         self.assertEqual(observation["reason"], "desktop_target_not_observed")
 
-    def test_preflight_blocks_process_termination_for_close_app_request(self) -> None:
+    def test_preflight_requires_observed_process_target(self) -> None:
         observation = _preflight_tool_call(
             ModelToolCall(
                 name="desktop_action",
@@ -1154,15 +1277,14 @@ class PlannerToolUseTests(unittest.TestCase):
                 search_roots=[],
             ),
             session=AgentSession(),
-            user_prompt="close all apps except cli and vscode",
         )
 
         self.assertIsNotNone(observation)
         self.assertTrue(observation["blocked"])
-        self.assertFalse(observation["recoverable"])
-        self.assertEqual(observation["reason"], "desktop_process_termination_not_requested")
+        self.assertTrue(observation["recoverable"])
+        self.assertEqual(observation["reason"], "desktop_process_target_not_observed")
 
-    def test_preflight_allows_explicit_process_termination_request(self) -> None:
+    def test_preflight_allows_observed_numeric_process_target(self) -> None:
         observation = _preflight_tool_call(
             ModelToolCall(
                 name="desktop_action",
@@ -1174,10 +1296,56 @@ class PlannerToolUseTests(unittest.TestCase):
                 workspace_root=Path("/workspace"),
                 search_roots=[],
             ),
-            session=AgentSession(),
-            user_prompt="kill process 17424",
+            session=AgentSession(desktop_targets=[{
+                "kind": "process",
+                "id": "17424",
+                "target": "17424",
+                "source": "process_list",
+            }]),
         )
 
+        self.assertIsNone(observation)
+
+    def test_process_list_result_structurally_authorizes_exact_pid(self) -> None:
+        session = AgentSession()
+        _update_session_from_tool_result(
+            session,
+            tool="process_list",
+            args={},
+            observation={
+                "ok": True,
+                "processes": [
+                    {"pid": 17424, "command": "example-process"},
+                    {"pid": "not-a-pid", "command": "ignored"},
+                ],
+            },
+            workspace_root=Path("/workspace"),
+        )
+
+        self.assertIn(
+            {
+                "kind": "process",
+                "id": "17424",
+                "target": "17424",
+                "action": "terminate_process",
+                "source": "process_list",
+                "name": "example-process",
+            },
+            session.desktop_targets,
+        )
+        observation = _preflight_tool_call(
+            ModelToolCall(
+                name="desktop_action",
+                call_id="kill-observed",
+                arguments={"action": "terminate_process", "target": "17424"},
+            ),
+            tool_ctx=ToolContext(
+                rust=RustTools(Path("/tmp/agent-rust")),
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=session,
+        )
         self.assertIsNone(observation)
 
     def test_preflight_rejects_non_pid_process_termination_target(self) -> None:
@@ -1196,7 +1364,6 @@ class PlannerToolUseTests(unittest.TestCase):
                 search_roots=[],
             ),
             session=AgentSession(),
-            user_prompt="kill that process",
         )
 
         self.assertIsNotNone(observation)
@@ -1204,7 +1371,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertFalse(observation["recoverable"])
         self.assertEqual(observation["reason"], "desktop_process_target_invalid")
 
-    def test_preflight_resolves_launch_phrase_before_rust(self) -> None:
+    def test_preflight_passes_model_application_query_to_resolver_unchanged(self) -> None:
         class FakeRust:
             def __init__(self) -> None:
                 self.queries: list[dict[str, object]] = []
@@ -1239,11 +1406,10 @@ class PlannerToolUseTests(unittest.TestCase):
                 search_roots=[],
             ),
             session=AgentSession(),
-            user_prompt="open my spark",
         )
 
         self.assertIsNone(observation)
-        self.assertEqual(rust.queries, [{"query": "spark", "kind": "application", "limit": 5}])
+        self.assertEqual(rust.queries, [{"query": "my spark", "kind": "application", "limit": 5}])
         self.assertEqual(call.arguments["target"], "spark.desktop")
 
     def test_preflight_blocks_ambiguous_launch_resolution(self) -> None:
@@ -1273,7 +1439,6 @@ class PlannerToolUseTests(unittest.TestCase):
                 search_roots=[],
             ),
             session=AgentSession(),
-            user_prompt="open spark",
         )
 
         self.assertIsNotNone(observation)
@@ -1310,7 +1475,6 @@ class PlannerToolUseTests(unittest.TestCase):
                 search_roots=[],
             ),
             session=AgentSession(),
-            user_prompt="open spark",
         )
 
         self.assertIsNone(observation)
@@ -1344,7 +1508,6 @@ class PlannerToolUseTests(unittest.TestCase):
             ),
             tool_ctx=ctx,
             session=session,
-            user_prompt="focus that window",
         )
 
         self.assertIsNone(observation)
@@ -1362,7 +1525,6 @@ class PlannerToolUseTests(unittest.TestCase):
                 search_roots=[],
             ),
             session=AgentSession(),
-            user_prompt="send hello",
         )
 
         self.assertIsNotNone(result)
@@ -1388,7 +1550,6 @@ class PlannerToolUseTests(unittest.TestCase):
                     "action": "focus_window",
                 }]
             ),
-            user_prompt="send hello",
         )
 
         self.assertIsNone(result)
@@ -2515,7 +2676,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(observation["reason"], "target_ambiguous")
         self.assertEqual(len(observation["candidates"]), 2)
 
-    def test_inspect_target_recovers_model_added_project_suffix(self) -> None:
+    def test_inspect_target_preserves_model_supplied_query(self) -> None:
         class FakeRust:
             def __init__(self) -> None:
                 self.queries: list[str] = []
@@ -2523,16 +2684,7 @@ class PlannerToolUseTests(unittest.TestCase):
             def inspect_target(self, **kwargs: object) -> dict[str, object]:
                 query = str(kwargs["path"])
                 self.queries.append(query)
-                if query == "ra_project":
-                    return {"status": "not_found", "query": query}
-                return {
-                    "status": "candidates",
-                    "query": query,
-                    "candidates": [
-                        {"path": "RA_clean", "kind": "directory"},
-                        {"path": "RA_publish", "kind": "directory"},
-                    ],
-                }
+                return {"status": "not_found", "query": query}
 
         with TemporaryDirectory() as tmp:
             rust = FakeRust()
@@ -2548,12 +2700,9 @@ class PlannerToolUseTests(unittest.TestCase):
                 ctx,
             )
 
-        self.assertEqual(rust.queries, ["ra_project", "ra"])
-        self.assertEqual(observation["recovered_query"], "ra")
-        self.assertEqual(
-            [item["path"] for item in observation["candidates"]],
-            ["RA_clean", "RA_publish"],
-        )
+        self.assertEqual(rust.queries, ["ra_project"])
+        self.assertEqual(observation["status"], "not_found")
+        self.assertNotIn("recovered_query", observation)
 
     def test_agent_session_round_trips_path_context(self) -> None:
         session = AgentSession(
@@ -3194,7 +3343,7 @@ class PlannerToolUseTests(unittest.TestCase):
                 llm=FakeLLM(external),  # type: ignore[arg-type]
                 rust=FakeRust(),  # type: ignore[arg-type]
                 workspace_root=str(workspace),
-                user_prompt=f"delete the file in {external}",
+                user_prompt="opaque to the structured approval boundary",
                 session=session,
                 approval_requester=approve_request,
             )
@@ -3203,12 +3352,83 @@ class PlannerToolUseTests(unittest.TestCase):
 
         self.assertEqual(answer, "done")
         self.assertEqual(len(seen_requests), 1)
-        self.assertEqual(seen_requests[0]["reason"], "external_delete_requires_confirmation")
+        self.assertEqual(seen_requests[0]["reason"], "delete_requires_confirmation")
         self.assertEqual(seen_requests[0]["requested_path"], str(external))
         self.assertIn(str(external), session.approved_external_delete_roots)
         self.assertTrue(session.pending_approvals)
         self.assertEqual(session.pending_approvals[0]["status"], "approved")
         self.assertEqual(session.pending_approvals[0]["decision"], "approved")
+
+    def test_follow_up_delete_uses_one_structured_approval_without_revalidation(self) -> None:
+        class FakeLLM:
+            def __init__(self, target: Path) -> None:
+                self.calls = 0
+                self.target = target
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(
+                        output=[{
+                            "type": "function_call",
+                            "name": "delete_path",
+                            "call_id": "delete-follow-up",
+                            "arguments": json.dumps({"path": str(self.target)}),
+                        }],
+                        output_text="",
+                    )
+                return SimpleNamespace(output=[], output_text="Deleted.")
+
+        class FakeRust:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def delete_path(self, **kwargs: object) -> dict[str, object]:
+                self.calls += 1
+                path = Path(str(kwargs["path"]))
+                path.unlink()
+                return {
+                    "ok": True,
+                    "deleted": True,
+                    "kind": "file",
+                    "path": str(path),
+                }
+
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "report.md"
+            target.write_text("report")
+            rust = FakeRust()
+            approvals: list[dict[str, Any]] = []
+
+            def approve(request: dict[str, Any]) -> str:
+                approvals.append(dict(request))
+                return "approved"
+
+            answer = run_agent(
+                llm=FakeLLM(target),  # type: ignore[arg-type]
+                rust=rust,  # type: ignore[arg-type]
+                workspace_root=str(workspace),
+                user_prompt="opaque to the structured approval boundary",
+                session=AgentSession(recent_files=[{
+                    "path": str(target),
+                    "action": "write",
+                    "status": "exists",
+                }]),
+                conversation_history=[
+                    {"role": "user", "content": "create report.md"},
+                    {"role": "assistant", "content": "Created `report.md`."},
+                ],
+                approval_requester=approve,
+            )
+
+            self.assertFalse(target.exists())
+
+        self.assertEqual(answer, "Deleted.")
+        self.assertEqual(rust.calls, 1)
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["reason"], "delete_requires_confirmation")
+        self.assertEqual(approvals[0]["resolved_path"], str(target))
 
     def test_run_agent_trims_tool_names_before_dispatch(self) -> None:
         class FakeLLM:

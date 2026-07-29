@@ -143,6 +143,7 @@ class RustTools:
     def _stop_worker(self) -> None:
         with self._lock:
             process = self._worker_process
+            reader = self._worker_reader
             self._worker_process = None
             self._worker_reader = None
             if self._active_process is process:
@@ -159,6 +160,13 @@ class RustTools:
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait()
+        if process is not None:
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    stream.close()
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=1)
 
     def _run_worker_json(self, args: list[str], *, timeout: float | None = None) -> Any:
         with self._worker_lock:

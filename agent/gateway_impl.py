@@ -2321,7 +2321,10 @@ class AgentGateway:
             "method_count": runtime["methods"],
             "lazy_services": runtime["lazy_services"],
             "config_sources": [str(path) for path in self.config.source_paths],
-            "execution_model": "one active parent turn; sequential discovery-only subagents",
+            "execution_model": (
+                "one active parent turn; parallel-only independent subagent batches "
+                "with non-overlapping scoped writes"
+            ),
         }
 
 

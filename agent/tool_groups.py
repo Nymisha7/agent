@@ -18,7 +18,7 @@ TOOL_GROUPS = (
     ToolGroup("desktop_control", "Desktop Control", "Change desktop state only after explicit approval.", ("desktop_action", "desktop_send_message", "desktop_clipboard_files")),
     ToolGroup("system_control", "System Control", "Run narrow allowlisted host commands; service mutations require approval.", ("run_system_command",)),
     ToolGroup("safety", "Safety", "Inspect secrets and credentials without returning secret values.", ("secret_scan",)),
-    ToolGroup("skills", "Skills And Subagents", "Load task-specific instructions or run one bounded read-only discovery child.", ("load_skill", "discovery_subagent")),
+    ToolGroup("skills", "Skills And Subagents", "Load task-specific instructions or fan out independent agents with non-overlapping ownership.", ("load_skill", "parallel_subagents")),
 )
 
 

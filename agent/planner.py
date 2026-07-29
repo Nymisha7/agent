@@ -14,21 +14,26 @@ from typing import TYPE_CHECKING, Any
 
 from .language_servers import LanguageServerManager
 from .llm import LLMClient
-from .discovery_agent import DiscoverySubagentRunner
+from .discovery_agent import ParallelSubagentRunner
 from .policy import PolicyEngine
 from .prompt_loader import load_system_prompt
 from .project_identity import identity_text
 from .rust_tools import RustTools
-from .tools import ToolContext, build_tool_registry
+from .tools import (
+    ToolContext,
+    build_tool_registry,
+    verify_mutation_observation as _verify_mutation_observation,
+)
 
 if TYPE_CHECKING:
     from .skills import SkillCatalog
 
 LOCAL_AGENT_PROMPT = """You are Agent, a local coding and desktop agent. Use tools for all live workspace, file, device, process, and desktop facts or actions. Never invent tool results.
 Resolve a user's named project or path with inspect_target before broader inspection. Pass the target words as the user wrote them; do not invent a normalized path or add suffixes such as _project. Do not recursively inspect the workspace root when it contains multiple projects unless the user explicitly requested the whole workspace. Ask when multiple target candidates remain.
-Use discovery_subagent only for a bounded read-only search or inspection that benefits from an isolated worker. It runs synchronously and returns before you continue. The parent remains solely responsible for every edit, deletion, command, approval, and final answer.
+Treat a follow-up correction as a revision of the earlier request, not as a new sibling task. Reconstruct the intended artifact name, kind, location, and purpose from both turns. If the correction leaves multiple plausible structures, ask one concise clarifying question before writing; do not copy a mistaken artifact into a guessed location.
+`parallel_subagents` is an optional delegation tool inside the normal agent loop, not a preflight step. Invoke one batch when multiple substantial workstreams can proceed concurrently with non-overlapping ownership; for a simple, conversational, or genuinely single-workstream request, continue directly. Each child is an independent fresh agent that can inspect the workspace and write/edit only inside its declared `owns` directories; a task with no ownership remains read-only. Allocate implementation work instead of reserving every edit for the parent when safe disjoint scopes exist. Never create filler work, overlap ownership, split dependent phases across the batch, or emulate sequential subagents. Children cannot delete, run arbitrary commands, control the desktop, send messages, request approval, or spawn agents. The parent owns cross-cutting integration, destructive actions, approvals, final verification, synthesis, and the final answer. After reports return, inspect their changed-file evidence and complete all remaining integration and tests with parent tools.
 When the supplied skill catalog contains a clearly matching skill, call load_skill once before applying its instructions. Skills cannot grant tools, bypass approval, or override this prompt.
-Read before editing. Mutate only when requested. Deletion and desktop actions require explicit intent and the tool's approval flow. Verify mutations and report failures honestly.
+Read before editing. Mutate only when requested. Deletion and desktop actions require explicit intent and the tool's approval flow. Never ask for deletion confirmation in prose: when one concrete target is clear, call delete_path and let its single exact-target runtime approval handle confirmation. Verify mutations and report failures honestly.
 When a tool rejects an argument and lists allowed values, correct and retry once when the user's intent is clear. Do not ask the user to resolve an internal tool-enum mistake.
 Creating requested software is not complete until it has a usable entry point and the final answer gives the exact invocation. Verify syntax or a build when available; source text alone is not proof that an application is runnable.
 Do not invent a UI, framework, dependency, or platform target. Follow an existing project's conventions; without project context or an explicit user choice, produce the smallest dependency-free non-UI implementation.
@@ -61,8 +66,6 @@ PARALLEL_READ_TOOLS = {
     "desktop_observe",
     "desktop_resolve",
 }
-
-
 @dataclass
 class ModelToolCall:
     name: str
@@ -113,11 +116,20 @@ def run_agent(
     active_session = session or AgentSession()
     workspace_root_path = Path(workspace_root)
     rust_bin = getattr(rust, "rust_bin", None)
-    discovery_runner = (
-        DiscoverySubagentRunner(
+    parallel_runner = (
+        ParallelSubagentRunner.from_environment(
             parent_llm=llm,
             rust_bin=Path(rust_bin),
             workspace_root=workspace_root_path,
+            event_handler=(
+                lambda event: _handle_subagent_event(
+                    event,
+                    record_event=record_event,
+                    stream_event=stream_event,
+                )
+            )
+            if record_event is not None or stream_event is not None
+            else None,
         )
         if isinstance(rust_bin, (str, Path))
         else None
@@ -131,7 +143,7 @@ def run_agent(
         approved_external_delete_roots=[Path(root) for root in active_session.approved_external_delete_roots],
         approved_system_commands=list(active_session.approved_system_commands),
         language_servers=language_servers,
-        discovery_runner=discovery_runner.run if discovery_runner is not None else None,
+        parallel_runner=parallel_runner.run if parallel_runner is not None else None,
         skill_catalog=skill_catalog,
     )
     tool_registry = build_tool_registry(tool_ctx)
@@ -164,27 +176,11 @@ def run_agent(
             else ""
         ),
     ))
-    direct_answer = _direct_desktop_open(
-        visible_prompt=visible_prompt,
-        tool_registry=tool_registry,
-        tool_ctx=tool_ctx,
-        session=active_session,
-        workspace_root=workspace_root_path,
-        user_prompt=user_prompt,
-        record_event=record_event,
-        stream_event=stream_event,
-        approval_requester=approval_requester,
-        debug=debug,
-    )
-    if direct_answer is not None:
-        persistable = policy.redact_text(direct_answer)
-        return persistable
     available_tool_names = _tool_names_from_schemas(tools)
     unknown_tool_streak = 0
     empty_response_retries = 0
     run_id = uuid.uuid4().hex
     tool_loop_history = active_session.tool_loop_history
-
     for step in range(max_steps):
         model_started = time.perf_counter()
         response = llm.respond(
@@ -279,7 +275,6 @@ def run_agent(
                             call,
                             tool_ctx=tool_ctx,
                             session=active_session,
-                            user_prompt=user_prompt,
                         )
             if observation is None:
                 try:
@@ -422,6 +417,20 @@ def run_agent(
                     ),
                 }
             )
+            if (
+                call.name == "parallel_subagents"
+                and isinstance(observation, dict)
+                and observation.get("ok") is True
+            ):
+                # Match model-invoked task tools in OpenCode/Goose/Claude:
+                # delegation is selected during the ordinary agent turn. This
+                # project intentionally permits one parallel-only batch per
+                # turn, so remove the capability after that batch completes.
+                available_tool_names.discard("parallel_subagents")
+                tool_registry = tool_registry.restricted(available_tool_names)
+                tools = tool_registry.schemas()
+                if compact_local_context:
+                    tools = [_compact_tool_schema(schema) for schema in tools]
             if unknown_tool_guard_message is not None:
                 break
 
@@ -459,169 +468,6 @@ def run_agent(
     )
     answer = _response_text(final_response)
     return policy.redact_text(answer)
-
-
-def _direct_desktop_open(
-    *,
-    visible_prompt: str,
-    tool_registry: Any,
-    tool_ctx: ToolContext,
-    session: AgentSession,
-    workspace_root: Path,
-    user_prompt: str,
-    record_event: Callable[..., None] | None,
-    stream_event: Callable[[dict[str, Any]], None] | None,
-    approval_requester: Callable[[dict[str, Any]], str] | None,
-    debug: bool,
-) -> str | None:
-    if "desktop_action" not in _tool_names_from_schemas(tool_registry.schemas()):
-        return None
-    target = _explicit_desktop_open_target(visible_prompt)
-    if target is None:
-        return None
-    call = ModelToolCall(
-        name="desktop_action",
-        call_id=f"direct_desktop_open_{uuid.uuid4().hex}",
-        arguments={"action": "launch_application", "target": target},
-    )
-    if debug:
-        _debug_event("direct-desktop-open", {"target": target})
-    observation = _preflight_tool_call(
-        call,
-        tool_ctx=tool_ctx,
-        session=session,
-        user_prompt=user_prompt,
-    )
-    if observation is None:
-        try:
-            observation = tool_registry.execute(call.name, call.arguments, tool_ctx)
-        except Exception as exc:
-            observation = {
-                "ok": False,
-                "tool": call.name,
-                "args": _redacted_tool_args(call.name, call.arguments),
-                "error": str(exc),
-            }
-
-    approval_request = _approval_request_from_observation(
-        call,
-        observation,
-        user_prompt=user_prompt,
-        workspace_root=workspace_root,
-    )
-    if approval_request is not None:
-        _attach_approval_display_path(session, approval_request)
-        if _approval_was_approved(session, approval_request):
-            _apply_approval(session, tool_ctx, approval_request)
-            observation = tool_registry.execute(call.name, call.arguments, tool_ctx)
-        elif _approval_was_denied(session, approval_request):
-            observation = _approval_denied_observation(call.name, call.arguments, approval_request)
-        else:
-            _record_pending_approval(session, approval_request)
-            if record_event:
-                record_event(
-                    event_type="approval_requested",
-                    tool=call.name,
-                    summary=_summarize_approval_request(approval_request),
-                    path=approval_request.get("requested_path") or approval_request.get("translated_path"),
-                    data={"request": approval_request},
-                )
-            if stream_event:
-                stream_event({
-                    "kind": "approval_request",
-                    "tool": call.name,
-                    "summary": _summarize_approval_request(approval_request),
-                    "request": approval_request,
-                })
-            if approval_requester is None:
-                return _summarize_approval_request(approval_request)
-            decision = approval_requester(approval_request)
-            if (decision or "").strip().casefold() != "approved":
-                _remember_approval_decision(session, approval_request, "denied")
-                observation = _approval_denied_observation(call.name, call.arguments, approval_request)
-            else:
-                _remember_approval_decision(session, approval_request, "approved")
-                _apply_approval(session, tool_ctx, approval_request)
-                if record_event:
-                    record_event(
-                        event_type="approval_decided",
-                        tool=call.name,
-                        summary=_summarize_approval_decision(approval_request, "approved"),
-                        path=approval_request.get("requested_path") or approval_request.get("translated_path"),
-                        data={"request": approval_request, "decision": "approved"},
-                    )
-                if stream_event:
-                    stream_event({
-                        "kind": "approval_decision",
-                        "tool": call.name,
-                        "approved": True,
-                        "summary": _summarize_approval_decision(approval_request, "approved"),
-                        "request": approval_request,
-                    })
-                observation = tool_registry.execute(call.name, call.arguments, tool_ctx)
-
-    sanitized = PolicyEngine().sanitize_observation(observation)
-    _update_session_from_tool_result(
-        session,
-        tool=call.name,
-        args=call.arguments,
-        observation=observation,
-        workspace_root=workspace_root,
-    )
-    if call.name in {"desktop_action", "desktop_send_message", "desktop_clipboard_files"} and not (
-        isinstance(observation, dict) and observation.get("blocked") is True
-    ):
-        _consume_desktop_approval(session, tool_ctx, call.name, call.arguments)
-    if record_event:
-        record_event(
-            event_type="tool_result",
-            tool=call.name,
-            summary=_summarize_tool_result(call.name, call.arguments, sanitized),
-            path=_extract_path(sanitized, call.arguments),
-            data={
-                "args": _redacted_tool_args(call.name, call.arguments),
-                "observation": _prepare_event_observation(sanitized),
-            },
-        )
-    if stream_event:
-        stream_event({
-            "kind": "tool_result",
-            "tool": call.name,
-            "summary": _summarize_tool_result(call.name, call.arguments, sanitized),
-            "path": _extract_path(sanitized, call.arguments),
-        })
-    if isinstance(sanitized, dict) and sanitized.get("ok") is False:
-        return _optional_str(sanitized.get("guidance")) or _optional_str(sanitized.get("error")) or "Desktop action failed."
-    return _summarize_tool_result(call.name, call.arguments, sanitized)
-
-
-_DESKTOP_OPEN_RE = re.compile(r"^(?:open|launch|start)\b\s+(?P<target>.+)", re.IGNORECASE)
-_NON_DESKTOP_OPEN_RE = re.compile(
-    r"\b(?:file|folder|directory|path|url|link|website|project|repo|repository|workspace)\b",
-    re.IGNORECASE,
-)
-
-
-def _explicit_desktop_open_target(prompt: str) -> str | None:
-    text = " ".join(prompt.split())
-    text = re.sub(
-        r"^(?:(?:can|could|would)\s+you\s+|please\s+|pls\s+|kindly\s+)+",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    match = _DESKTOP_OPEN_RE.match(text)
-    if not match:
-        return None
-    target = match.group("target").strip(" .?!'\"`")
-    if not target or _NON_DESKTOP_OPEN_RE.search(target):
-        return None
-    target = re.sub(r"^(?:my|the|a|an)\s+", "", target, flags=re.IGNORECASE)
-    target = re.sub(r"\s+(?:app|application|program|window)$", "", target, flags=re.IGNORECASE)
-    target = target.strip(" .?!'\"`")
-    if not target or target.casefold() in {"any", "something", "anything"}:
-        return None
-    return target
 
 
 def _build_initial_messages(
@@ -1121,6 +967,7 @@ def _approval_request_from_observation(
     reason = _optional_str(observation.get("reason")) or ""
     if reason not in {
         "external_path_requires_approval",
+        "delete_requires_confirmation",
         "external_delete_requires_confirmation",
         "external_windows_path_requires_approval",
         "system_command_requires_approval",
@@ -1235,7 +1082,6 @@ def _preflight_tool_call(
     *,
     tool_ctx: ToolContext,
     session: AgentSession | None = None,
-    user_prompt: str,
 ) -> Any | None:
     if call.name == "delete_path":
         delete_target = _path_from_args(call.arguments, tool_ctx.workspace_root)
@@ -1256,19 +1102,21 @@ def _preflight_tool_call(
                     "file or directory, or perform whole-workspace removal outside Agent."
                 ),
             }
-        if not _is_explicit_delete_request(user_prompt):
-            return {
-                "ok": False,
-                "tool": call.name,
-                "args": call.arguments,
-                "blocked": True,
-                "recoverable": True,
-                "reason": "delete_not_explicitly_requested",
-                "guidance": (
-                    "Deletion requires explicit authorization in the current user message. "
-                    "Use read-only tools when the user only asked whether a path exists."
-                ),
-            }
+        return {
+            "ok": False,
+            "tool": call.name,
+            "args": call.arguments,
+            "blocked": True,
+            "recoverable": True,
+            "reason": "delete_requires_confirmation",
+            "operation": "delete",
+            "requested_path": _optional_str(call.arguments.get("path")),
+            "resolved_path": str(delete_target) if delete_target is not None else None,
+            "guidance": (
+                "Use the runtime approval surface to confirm this exact resolved target once. "
+                "Do not ask the user for a separate conversational confirmation."
+            ),
+        }
 
     if call.name == "desktop_send_message":
         target = _optional_str(call.arguments.get("target"))
@@ -1292,21 +1140,6 @@ def _preflight_tool_call(
         action = _optional_str(call.arguments.get("action"))
         target = _optional_str(call.arguments.get("target"))
         if action == "terminate_process":
-            if not _is_explicit_process_termination_request(user_prompt):
-                return {
-                    "ok": False,
-                    "tool": call.name,
-                    "args": _redacted_tool_args(call.name, call.arguments),
-                    "blocked": True,
-                    "recoverable": False,
-                    "reason": "desktop_process_termination_not_requested",
-                    "operation": "desktop",
-                    "guidance": (
-                        "The user asked to close apps/windows, not kill processes. "
-                        "Do not request approval for terminate_process. Use close_window "
-                        "on observed windows, or stop and report any windows that could not be closed."
-                    ),
-                }
             if not target or not target.strip().isdigit():
                 return {
                     "ok": False,
@@ -1317,6 +1150,20 @@ def _preflight_tool_call(
                     "reason": "desktop_process_target_invalid",
                     "operation": "desktop",
                     "guidance": "terminate_process requires a numeric PID from process_list.",
+                }
+            if not session or not _desktop_process_target_observed(session, target):
+                return {
+                    "ok": False,
+                    "tool": call.name,
+                    "args": _redacted_tool_args(call.name, call.arguments),
+                    "blocked": True,
+                    "recoverable": True,
+                    "reason": "desktop_process_target_not_observed",
+                    "operation": "desktop",
+                    "guidance": (
+                        "terminate_process requires an exact PID returned by process_list or "
+                        "desktop_observe. Observe the process, then retry with that target."
+                    ),
                 }
         if action == "launch_application" and target and (
             not session or not _desktop_application_target_observed(session, target)
@@ -1377,35 +1224,6 @@ def _preflight_tool_call(
     return None
 
 
-_DELETE_VERIFICATION_RE = re.compile(
-    r"\b(?:has|have|had|is|are|was|were)\b.{0,80}\b(?:deleted|removed|erased|gone|missing)\b"
-    r"|\b(?:check|verify|tell me|find out|know)\b.{0,80}\b(?:deleted|removed|exists?|missing|gone)\b",
-    re.IGNORECASE,
-)
-
-_EXPLICIT_DELETE_RE = re.compile(
-    r"\b(?:delete|remove|erase)\b(?:\s+(?:it|this|that|the|my|from|file|folder|directory|project|path))?",
-    re.IGNORECASE,
-)
-
-
-def _is_explicit_delete_request(user_prompt: str) -> bool:
-    prompt = " ".join(user_prompt.split())
-    if not prompt or _DELETE_VERIFICATION_RE.search(prompt):
-        return False
-    return bool(_EXPLICIT_DELETE_RE.search(prompt))
-
-
-_PROCESS_TERMINATION_RE = re.compile(
-    r"\b(?:kill|terminate|end\s+(?:the\s+)?process|force[-\s]*(?:quit|close|kill))\b",
-    re.IGNORECASE,
-)
-
-
-def _is_explicit_process_termination_request(user_prompt: str) -> bool:
-    return bool(_PROCESS_TERMINATION_RE.search(" ".join(user_prompt.split())))
-
-
 def _desktop_window_target_observed(session: AgentSession, target: str) -> bool:
     normalized = _normalize_desktop_window_id(target)
     if normalized is None:
@@ -1434,6 +1252,17 @@ def _desktop_application_target_observed(session: AgentSession, target: str) -> 
     return False
 
 
+def _desktop_process_target_observed(session: AgentSession, target: str) -> bool:
+    normalized = target.strip()
+    if not normalized.isdigit():
+        return False
+    return any(
+        item.get("kind") == "process"
+        and normalized in {item.get("target"), item.get("id")}
+        for item in session.desktop_targets
+    )
+
+
 def _resolve_desktop_application_target(
     call: ModelToolCall,
     tool_ctx: ToolContext,
@@ -1442,7 +1271,7 @@ def _resolve_desktop_application_target(
     target = _optional_str(call.arguments.get("target"))
     if not target:
         return None
-    query = _desktop_application_query(target)
+    query = target.strip()
     try:
         observation = tool_ctx.rust.desktop_resolve(
             query=query,
@@ -1495,13 +1324,6 @@ def _resolve_desktop_application_target(
     }
 
 
-def _desktop_application_query(value: str) -> str:
-    query = re.sub(r"\s+", " ", value.strip())
-    query = re.sub(r"^(?:my|the)\s+", "", query, flags=re.IGNORECASE)
-    query = re.sub(r"\s+(?:app|application)$", "", query, flags=re.IGNORECASE)
-    return query or value.strip()
-
-
 def _single_clear_desktop_application_candidate(
     candidates: list[Any],
     query: str,
@@ -1512,7 +1334,6 @@ def _single_clear_desktop_application_candidate(
         if isinstance(item, dict)
         and _optional_str(item.get("kind")) == "application"
         and (_optional_str(item.get("name")) or "").strip().casefold() == normalized_query
-        and not _desktop_candidate_is_uninstaller(item)
     ]
     if not exact:
         return None
@@ -1521,20 +1342,6 @@ def _single_clear_desktop_application_candidate(
     if all((_optional_str(item.get("name")) or "").strip().casefold() == name for item in exact):
         return exact[0]
     return None
-
-
-def _desktop_candidate_is_uninstaller(candidate: dict[str, Any]) -> bool:
-    text = " ".join(
-        value
-        for value in (
-            _optional_str(candidate.get("name")),
-            _optional_str(candidate.get("target")),
-            _optional_str(candidate.get("id")),
-            _optional_str(candidate.get("exec")),
-        )
-        if value
-    ).casefold()
-    return any(token in text for token in ("uninstall", "uninstaller", "remove"))
 
 
 def _desktop_application_candidate_rank(candidate: dict[str, Any]) -> tuple[int, int, str]:
@@ -1616,126 +1423,6 @@ def _normalize_desktop_window_id(value: str) -> str | None:
     except ValueError:
         return None
     return f"0x{parsed:x}"
-
-
-def _verify_mutation_observation(
-    tool: str,
-    args: dict[str, Any],
-    observation: Any,
-    *,
-    workspace_root: Path,
-) -> Any:
-    """Independently verify successful mutation reports against the filesystem."""
-    if tool not in {"write_file", "edit_file", "delete_path"}:
-        return observation
-    if not isinstance(observation, dict) or observation.get("ok") is False:
-        return observation
-
-    verified = dict(observation)
-    raw_path = observation.get("path") or args.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return _mutation_verification_failure(
-            verified,
-            tool=tool,
-            detail="The tool reported success without identifying the affected path.",
-        )
-
-    target = Path(raw_path).expanduser()
-    if not target.is_absolute():
-        target = workspace_root / target
-    target = target.resolve(strict=False)
-
-    try:
-        if tool == "delete_path":
-            if observation.get("deleted") is not True:
-                return _mutation_verification_failure(
-                    verified,
-                    tool=tool,
-                    detail="The delete result did not confirm that deletion occurred.",
-                    path=target,
-                )
-            if target.exists() or target.is_symlink():
-                return _mutation_verification_failure(
-                    verified,
-                    tool=tool,
-                    detail="The target still exists after the delete tool reported success.",
-                    path=target,
-                )
-            verified["verified"] = True
-            verified["verification"] = {
-                "postcondition": "path_absent",
-                "path": str(target),
-            }
-            return verified
-
-        if target.is_symlink() or not target.is_file():
-            return _mutation_verification_failure(
-                verified,
-                tool=tool,
-                detail="The reported output path is not a regular file on disk.",
-                path=target,
-            )
-
-        actual_bytes = target.read_bytes()
-        actual_sha256 = hashlib.sha256(actual_bytes).hexdigest()
-        reported_sha256 = observation.get("after_sha256")
-        if not isinstance(reported_sha256, str) or not reported_sha256.strip():
-            return _mutation_verification_failure(
-                verified,
-                tool=tool,
-                detail="The mutation result did not include an output hash to verify.",
-                path=target,
-            )
-        if actual_sha256 != reported_sha256:
-            return _mutation_verification_failure(
-                verified,
-                tool=tool,
-                detail=(
-                    "The file on disk does not match the hash returned by the mutation tool "
-                    f"(reported {reported_sha256}, found {actual_sha256})."
-                ),
-                path=target,
-            )
-
-        verified["verified"] = True
-        verified["verification"] = {
-            "postcondition": "file_hash_matches",
-            "path": str(target),
-            "sha256": actual_sha256,
-        }
-        return verified
-    except OSError as exc:
-        return _mutation_verification_failure(
-            verified,
-            tool=tool,
-            detail=f"Could not inspect the mutation result on disk: {exc}",
-            path=target,
-        )
-
-
-def _mutation_verification_failure(
-    observation: dict[str, Any],
-    *,
-    tool: str,
-    detail: str,
-    path: Path | None = None,
-) -> dict[str, Any]:
-    failed = dict(observation)
-    failed.update({
-        "ok": False,
-        "verified": False,
-        "reason": "mutation_verification_failed",
-        "error": detail,
-        "recoverable": True,
-        "guidance": (
-            "Do not claim success. Inspect the target, retry the mutation if appropriate, "
-            "and only finish after its filesystem postcondition is verified."
-        ),
-        "tool": tool,
-    })
-    if path is not None:
-        failed["path"] = str(path)
-    return failed
 
 
 def _session_context_text(session: AgentSession) -> str:
@@ -1835,6 +1522,10 @@ def _update_session_from_tool_result(
         if path:
             session.focus_paths = [path]
             _remember_file_operation(session, tool, path, observation)
+        return
+
+    if tool == "process_list":
+        _apply_process_list(session, observation)
         return
 
     if tool == "desktop_observe":
@@ -2075,6 +1766,32 @@ def _apply_desktop_observe(session: AgentSession, observation: dict[str, Any]) -
         _remember_desktop_targets(session, targets)
 
 
+def _apply_process_list(session: AgentSession, observation: dict[str, Any]) -> None:
+    targets: list[dict[str, str]] = []
+    processes = observation.get("processes")
+    if not isinstance(processes, list):
+        return
+    for item in processes:
+        if not isinstance(item, dict):
+            continue
+        raw_pid = item.get("pid")
+        pid = str(raw_pid) if isinstance(raw_pid, int) and raw_pid > 0 else _optional_str(raw_pid)
+        if not pid or not pid.isdigit():
+            continue
+        record = {
+            "kind": "process",
+            "id": pid,
+            "target": pid,
+            "action": "terminate_process",
+            "source": "process_list",
+        }
+        command = _optional_str(item.get("command"))
+        if command:
+            record["name"] = command
+        targets.append(record)
+    _remember_desktop_targets(session, targets)
+
+
 def _apply_desktop_resolve(session: AgentSession, observation: dict[str, Any]) -> None:
     targets: list[dict[str, str]] = []
     for item in observation.get("candidates", []):
@@ -2288,6 +2005,18 @@ def _summarize_tool_result(tool: str, args: dict[str, Any], observation: Any) ->
     if isinstance(observation, dict):
         if observation.get("ok") is False:
             return f"{tool} failed: {observation.get('error')}"
+        if tool == "parallel_subagents" and isinstance(observation.get("tasks"), list):
+            completed = sum(
+                1
+                for task in observation["tasks"]
+                if isinstance(task, dict)
+                and task.get("ok") is True
+                and task.get("complete") is True
+            )
+            total = len(observation["tasks"])
+            work_file = observation.get("work_file")
+            suffix = f" · log: {work_file}" if isinstance(work_file, str) else ""
+            return f"parallel_subagents completed {completed}/{total} tasks{suffix}"
         if tool == "connected_devices" and isinstance(observation.get("counts"), dict):
             total = sum(
                 value for value in observation["counts"].values()
@@ -2334,6 +2063,31 @@ def _summarize_tool_result(tool: str, args: dict[str, Any], observation: Any) ->
     if isinstance(observation, list):
         return f"{tool} returned {len(observation)} items"
     return f"{tool} returned {type(observation).__name__}"
+
+
+def _handle_subagent_event(
+    event: dict[str, Any],
+    *,
+    record_event: Callable[..., None] | None,
+    stream_event: Callable[[dict[str, Any]], None] | None,
+) -> None:
+    if stream_event is not None:
+        stream_event(event)
+    if record_event is None:
+        return
+    kind = event.get("kind")
+    summary = event.get("summary")
+    if not isinstance(kind, str) or not kind.startswith("subagent_"):
+        return
+    safe_summary = summary if isinstance(summary, str) else kind.replace("_", " ")
+    work_file = event.get("work_file")
+    record_event(
+        event_type=kind,
+        tool="parallel_subagents",
+        summary=safe_summary,
+        path=work_file if isinstance(work_file, str) else None,
+        data={"subagent": event},
+    )
 
 
 def _extract_path(observation: Any, args: dict[str, Any]) -> str | None:

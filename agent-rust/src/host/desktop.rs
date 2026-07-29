@@ -324,7 +324,7 @@ pub(crate) fn desktop_resolve(query: &str, kind: &str, limit: usize) -> Result<V
         "application" | "window" | "any" => kind,
         _ => "any",
     };
-    let normalized_query = normalize_desktop_query(query, normalized_kind);
+    let normalized_query = normalize_match_text(query);
     if normalized_query.is_empty() {
         return Ok(json!({
             "ok": false,
@@ -338,9 +338,6 @@ pub(crate) fn desktop_resolve(query: &str, kind: &str, limit: usize) -> Result<V
 
     if matches!(normalized_kind, "application" | "any") {
         candidates.extend(resolve_applications(&normalized_query, bounded_limit)?);
-        if !query_requests_uninstaller(&normalized_query) {
-            candidates.retain(|candidate| !candidate_is_uninstaller(candidate));
-        }
     }
     if matches!(normalized_kind, "window" | "any") {
         candidates.extend(resolve_windows(&normalized_query, bounded_limit)?);
@@ -2417,46 +2414,6 @@ fn normalize_match_text(value: &str) -> String {
         .join(" ")
 }
 
-fn normalize_desktop_query(value: &str, kind: &str) -> String {
-    let normalized = normalize_match_text(value);
-    if kind != "application" {
-        return normalized;
-    }
-    let mut words = normalized.split_whitespace().collect::<Vec<_>>();
-    if words
-        .first()
-        .is_some_and(|word| matches!(*word, "my" | "the"))
-    {
-        words.remove(0);
-    }
-    if words
-        .last()
-        .is_some_and(|word| matches!(*word, "app" | "application"))
-    {
-        words.pop();
-    }
-    words.join(" ")
-}
-
-fn query_requests_uninstaller(query: &str) -> bool {
-    query
-        .split_whitespace()
-        .any(|word| matches!(word, "uninstall" | "uninstaller" | "remove"))
-}
-
-fn candidate_is_uninstaller(candidate: &Value) -> bool {
-    ["name", "exec", "target"].iter().any(|key| {
-        candidate
-            .get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|value| {
-                normalize_match_text(value)
-                    .split_whitespace()
-                    .any(|word| matches!(word, "uninstall" | "uninstaller"))
-            })
-    })
-}
-
 fn candidate_score(candidate: &Value) -> i64 {
     candidate.get("score").and_then(Value::as_i64).unwrap_or(0)
 }
@@ -4151,17 +4108,18 @@ mod tests {
     }
 
     #[test]
-    fn desktop_resolver_normalizes_app_phrases_and_rejects_uninstallers() {
+    fn desktop_resolver_preserves_all_query_terms() {
+        let query = super::normalize_match_text("my Spark app");
+
+        assert_eq!(query, "my spark app");
+        assert_eq!(super::match_score(&query, &["Spark"]), 13);
         assert_eq!(
-            super::normalize_desktop_query("my Spark app", "application"),
-            "spark"
+            super::match_score(
+                &super::normalize_match_text("Spark Uninstaller"),
+                &["Spark"]
+            ),
+            20
         );
-        assert!(!super::query_requests_uninstaller("spark"));
-        assert!(super::query_requests_uninstaller("spark uninstaller"));
-        assert!(super::candidate_is_uninstaller(&json!({
-            "name": "Spark Uninstaller",
-            "target": "windows-shortcut:spark"
-        })));
     }
 
     #[test]

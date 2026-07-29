@@ -56,6 +56,15 @@ value. An approval is consumed after one attempted action. Results include befor
 state and a verification status; an unverified launch or unchanged state is never
 reported as confirmed. Agent does not expose arbitrary shell execution as a desktop tool.
 
+Intent selection belongs to the model and the full conversation, not English keyword
+routers. Runtime code validates structural facts: exact tool schemas, workspace
+boundaries, observed window/element identifiers, process IDs returned by observation,
+approval records, and tool receipts. Desktop and workspace resolvers preserve the
+model-supplied query instead of deleting words such as application or project. The Rust
+TUI consumes typed command and configuration states from Python; human-readable status
+text is display-only and is never parsed to decide whether a key, endpoint, install, or
+other setup action is required.
+
 ## Open-source models (no login)
 
 Agent can use open-source models through local runtimes. These providers never open
@@ -94,19 +103,41 @@ raw private chain-of-thought is not displayed.
 Hosted providers remain available and request an API key or cloud credentials only
 when their provider requires it.
 
-## Subagent safety model
+## Parallel subagent safety model
 
-Agent supports only bounded discovery subagents. A discovery child is a fresh,
-in-memory agent instance with no parent conversation/session state and only these
-workspace tools: path resolution/status, listing/reading, tree inspection, glob,
-and grep. Mutation, shell, desktop, device, secret-scan, approval, and nested-agent
-tools are absent from its registry.
+Subagent delegation is a normal model tool decision inside the main agent loop. Agent
+does not run a separate orchestration classifier before every message. The main model
+receives `parallel_subagents` beside its other tools and either answers directly, uses
+ordinary tools, or invokes one parallel batch when multiple independent, bounded
+workstreams would materially improve the task. This follows the model-invoked task-tool
+pattern used by OpenCode, Goose, Codex, and Claude Code. Singleton and sequential
+subagent execution remain intentionally unsupported.
 
-Subagents execute synchronously and sequentially. A child must finish and return its
-evidence before the parent resumes; it cannot run in the background. The parent is
-the only agent allowed to propose or perform edits. TUI turns also use a per-session
-process lease plus a single Rust bridge slot, so a second active turn cannot replace
-the current bridge.
+Every child is a fresh in-memory agent with its own model/tool loop and no parent
+conversation/session state. It receives read/inspection tools and, when the parent
+declares `owns` directories, `write_file` and `edit_file` limited to those exact
+workspace-relative scopes. Ownership is normalized before spawning; workspace escape,
+symlinks, protected/generated directories, whole-workspace ownership, and overlapping
+child scopes are rejected. A child without `owns` remains read-only. Delete, arbitrary
+shell, desktop control, messaging, secret-scan, approval, and nested-agent tools remain
+absent. The coordinator records the plan, ownership, changed paths, and result of every
+child in `.agent/parallel-work.md`; the parent handles cross-cutting integration,
+destructive actions, approvals, and final verification.
+
+Concurrency defaults to four workers and is configurable from 2–8 with
+`AGENT_MAX_PARALLEL_SUBAGENTS`. Each worker receives eight model steps by default;
+set `AGENT_SUBAGENT_MAX_STEPS` from 2–20 for broader or narrower independent work.
+Set `AGENT_PARALLEL_WORK_FILE` to another workspace-relative path to move the shared
+ledger. The TUI tracks each run and task by structured IDs and renders queued, running,
+complete, and failed states instead of relying on summary text. TUI turns still use a
+per-session process lease, so a second parent turn cannot replace the current bridge.
+
+Primary implementation references:
+
+- [OpenCode task tool](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/task.ts)
+- [Goose subagent execution](https://github.com/aaif-goose/goose/blob/main/crates/goose/src/agents/subagent_handler.rs)
+- [Codex subagent documentation](https://developers.openai.com/codex/multi-agent)
+- [Claude Code subagents](https://code.claude.com/docs/en/sub-agents)
 
 ## Local control plane, routing, and skills
 

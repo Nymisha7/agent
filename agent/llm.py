@@ -41,6 +41,7 @@ class LLMClient:
     endpoint: str = field(default="", init=False)
     mode: str = field(default="", init=False)
     configuration_error: str | None = field(default=None, init=False)
+    configuration_state: str = field(default="ready", init=False)
     reasoning_effort: str | None = field(default=None, init=False)
     reasoning_summary: str | None = field(default=None, init=False)
     turn_usage: dict[str, int] = field(default_factory=lambda: empty_usage(), init=False)
@@ -59,6 +60,7 @@ class LLMClient:
                 self.client = OpenAI(api_key=api_key, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("OpenAI", "OPENAI_API_KEY")
+                self.configuration_state = "api_key_required"
         elif self.provider == "openai-compatible":
             base_url = os.environ.get("AGENT_OPENAI_COMPAT_BASE_URL") or ""
             self.endpoint = base_url
@@ -74,6 +76,7 @@ class LLMClient:
                     "OpenAI-compatible provider",
                     "AGENT_OPENAI_COMPAT_BASE_URL",
                 )
+                self.configuration_state = "endpoint_required"
         elif self.provider == "ollama":
             base_url = _ollama_base_url()
             self.client = OpenAI(
@@ -124,13 +127,16 @@ class LLMClient:
             self.mode = "hosted"
             if not os.environ.get("ANTHROPIC_API_KEY"):
                 self.configuration_error = _provider_configuration_error("Anthropic", "ANTHROPIC_API_KEY")
+                self.configuration_state = "api_key_required"
         elif self.provider == "gemini":
             self.endpoint = "Google Gemini"
             self.mode = "hosted"
             if not os.environ.get("GOOGLE_API_KEY"):
                 self.configuration_error = _provider_configuration_error("Google Gemini", "GOOGLE_API_KEY")
+                self.configuration_state = "api_key_required"
             else:
                 self.configuration_error = "Google Gemini transport is not implemented yet."
+                self.configuration_state = "unavailable"
         elif self.provider == "groq":
             self.endpoint = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
             self.mode = "hosted"
@@ -139,6 +145,7 @@ class LLMClient:
                 self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("Groq", "GROQ_API_KEY")
+                self.configuration_state = "api_key_required"
         elif self.provider == "openrouter":
             self.endpoint = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
             self.mode = "hosted"
@@ -147,31 +154,39 @@ class LLMClient:
                 self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("OpenRouter", "OPENROUTER_API_KEY")
+                self.configuration_state = "api_key_required"
         elif self.provider == "azure":
             self.endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "Azure OpenAI")
             self.mode = "hosted"
             if not os.environ.get("AZURE_OPENAI_API_KEY"):
                 self.configuration_error = _provider_configuration_error("Azure OpenAI", "AZURE_OPENAI_API_KEY")
+                self.configuration_state = "api_key_required"
             else:
                 self.configuration_error = "Azure OpenAI transport is not implemented yet."
+                self.configuration_state = "unavailable"
         elif self.provider == "bedrock":
             self.endpoint = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "AWS Bedrock"
             self.mode = "hosted"
             if not _has_bedrock_credentials():
                 self.configuration_error = "AWS Bedrock is not configured. Set AWS_PROFILE, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK."
+                self.configuration_state = "credentials_required"
             else:
                 self.configuration_error = "AWS Bedrock transport is not implemented yet."
+                self.configuration_state = "unavailable"
         elif self.provider == "vertexai":
             self.endpoint = os.environ.get("VERTEX_LOCATION") or os.environ.get("GOOGLE_CLOUD_LOCATION") or "Google Cloud Vertex AI"
             self.mode = "hosted"
             if not (os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT_ID")):
                 self.configuration_error = "Google Cloud Vertex AI is not configured. Set GOOGLE_CLOUD_PROJECT and authenticate with Application Default Credentials."
+                self.configuration_state = "credentials_required"
             else:
                 self.configuration_error = "Google Cloud Vertex AI transport is not implemented yet."
+                self.configuration_state = "unavailable"
         elif self.provider == "copilot":
             self.endpoint = "GitHub Copilot"
             self.mode = "hosted"
             self.configuration_error = "GitHub Copilot sign-in is not implemented yet."
+            self.configuration_state = "credentials_required"
         elif self.provider == "deepseek":
             self.endpoint = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
             self.mode = "hosted"
@@ -180,6 +195,7 @@ class LLMClient:
                 self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("DeepSeek", "DEEPSEEK_API_KEY")
+                self.configuration_state = "api_key_required"
         elif self.provider == "glm":
             self.endpoint = (
                 os.environ.get("GLM_BASE_URL")
@@ -194,6 +210,7 @@ class LLMClient:
                 self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
             else:
                 self.configuration_error = _provider_configuration_error("GLM", "GLM_API_KEY")
+                self.configuration_state = "api_key_required"
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
 

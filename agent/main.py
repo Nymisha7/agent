@@ -421,6 +421,59 @@ class AppContext:
 
     pending_provider: str | None = None
     pending_model: str | None = None
+    last_local_command_result: dict[str, Any] | None = None
+
+
+class LocalCommandText(str):
+    """Human-readable command output with a typed UI result contract."""
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        code: str = "ok",
+        setup_required: bool = False,
+        error: bool = False,
+        secret_provider: str | None = None,
+        next_command: str | None = None,
+    ) -> "LocalCommandText":
+        value = super().__new__(cls, text)
+        value.command_result = {
+            "code": code,
+            "setup_required": setup_required,
+            "error": error,
+            **({"secret_provider": secret_provider} if secret_provider else {}),
+            **({"next_command": next_command} if next_command else {}),
+        }
+        return value
+
+
+def _command_text(
+    text: str,
+    *,
+    code: str,
+    setup_required: bool = False,
+    error: bool = False,
+    secret_provider: str | None = None,
+    next_command: str | None = None,
+) -> LocalCommandText:
+    return LocalCommandText(
+        text,
+        code=code,
+        setup_required=setup_required,
+        error=error,
+        secret_provider=secret_provider,
+        next_command=next_command,
+    )
+
+
+def _prepend_command_text(prefix: str, result: str) -> LocalCommandText:
+    metadata = getattr(
+        result,
+        "command_result",
+        {"code": "ok", "setup_required": False, "error": False},
+    )
+    return _command_text(f"{prefix}\n{result}", **metadata)
 
 @dataclass(frozen=True)
 class PaletteEntry:
@@ -639,6 +692,13 @@ class LiveTurnState:
                 self._flush_text()
                 self.feed.append(_live_tool_result_feed_item(event))
                 self.phase = "observing"
+            elif isinstance(kind, str) and kind.startswith("subagent_"):
+                self._flush_reasoning()
+                self._flush_text()
+                summary = event.get("summary")
+                if isinstance(summary, str) and summary:
+                    self.feed.append(("subagent", summary))
+                self.phase = "subagents"
             elif kind == "approval_request":
                 self._flush_reasoning()
                 self._flush_text()
@@ -664,10 +724,14 @@ class LiveTurnState:
         with self.lock:
             self._flush_reasoning()
             self._flush_text()
-            # Tool activity is a live progress surface, not durable conversation
-            # content. The persisted user/assistant messages replace it when the
-            # turn ends; errors remain visible through the dedicated error field.
-            self.feed = []
+            # Ordinary tool traces are ephemeral, but retain the most recent
+            # parallel orchestration summary until the next turn so fast worker
+            # batches remain inspectable after the final answer arrives.
+            self.feed = [
+                (kind, content)
+                for kind, content in self.feed
+                if kind == "subagent"
+            ][-12:]
             self.prompt = ""
             self._current_tool = None
             self.active = False
@@ -714,6 +778,7 @@ def _tool_activity_label(name: str | None) -> str:
         "desktop_resolve": "Resolving desktop target",
         "process_list": "Checking running processes",
         "desktop_action": "Performing a desktop action",
+        "parallel_subagents": "Spawning parallel subagents",
         "load_skill": "Loading a skill",
         "finish_task": "Preparing the response",
     }
@@ -1215,7 +1280,7 @@ def _record_local_command_exchange(ctx: AppContext, prompt: str, answer: str) ->
 def repl(ctx: AppContext) -> int:
     print("Agent started.")
     print(f"Session: {ctx.session_id}")
-    print("Type 'exit' to quit.")
+    print("Type '/exit' to quit.")
     print()
 
     try:
@@ -1406,6 +1471,29 @@ def _handle_local_command(
     *,
     install_progress: Callable[[str], None] | None = None,
 ) -> str | None:
+    result = _dispatch_local_command(
+        ctx,
+        user_input,
+        install_progress=install_progress,
+    )
+    if result is None:
+        ctx.last_local_command_result = None
+        return None
+    metadata = getattr(
+        result,
+        "command_result",
+        {"code": "ok", "setup_required": False, "error": False},
+    )
+    ctx.last_local_command_result = dict(metadata)
+    return str(result)
+
+
+def _dispatch_local_command(
+    ctx: AppContext,
+    user_input: str,
+    *,
+    install_progress: Callable[[str], None] | None = None,
+) -> str | None:
     text = _normalized_command_prompt(user_input.strip())
     if not text.startswith("/"):
         return None
@@ -1431,9 +1519,12 @@ def _handle_local_command(
             env_name = PROVIDER_API_KEY_ENVS.get(normalized)
             api_key = os.environ.get(env_name, "") if env_name else ""
             if not api_key:
-                return (
+                return _command_text(
                     f"Paste the key using the hidden TUI prompt: /apikey {provider}\n"
-                    f"Non-TUI fallback: /apikey {provider} <api-key>"
+                    f"Non-TUI fallback: /apikey {provider} <api-key>",
+                    code="api_key_required",
+                    setup_required=True,
+                    secret_provider=normalized,
                 )
         return _set_provider_api_key(ctx, provider, api_key)
 
@@ -1520,14 +1611,15 @@ def _slash_help_text() -> str:
 def _provider_switch_text(ctx: AppContext) -> str:
     provider = _active_provider(ctx)
     configuration = _llm_configuration(ctx)
+    configuration_state = _llm_configuration_state(ctx)
     lines = [f"Model source switched to {_model_source_label(provider)} with model {ctx.llm.model}."]
-    if configuration == "ready":
+    if configuration_state == "ready":
         lines.append("Configuration: ready")
         return "\n".join(lines)
 
     env_name = PROVIDER_API_KEY_ENVS.get(provider)
     display_name = PROVIDER_DISPLAY_NAMES.get(provider, provider)
-    if provider == "openai-compatible" and "BASE_URL" in configuration:
+    if configuration_state == "endpoint_required":
         lines.extend([
             "",
             "OpenAI-compatible models need an endpoint before requests can run.",
@@ -1536,7 +1628,7 @@ def _provider_switch_text(ctx: AppContext) -> str:
         ])
         return "\n".join(lines)
 
-    if env_name:
+    if configuration_state == "api_key_required" and env_name:
         lines.extend([
             "",
             f"{display_name} needs an API key before requests can run.",
@@ -1693,7 +1785,16 @@ def _resolve_local_model_name(
         message = f"{message}\nDownload or load it in LM Studio first; no login is required."
     else:
         message = f"{message}\n{_manual_local_install_text(provider, requested_model)}"
-    return None, message
+    return None, _command_text(
+        message,
+        code="model_not_installed",
+        setup_required=True,
+        next_command=(
+            f"/install {provider} {requested_model}"
+            if install_entry is not None
+            else None
+        ),
+    )
 
 
 def _local_install_entry(provider: str, model: str) -> dict[str, str] | None:
@@ -1710,7 +1811,7 @@ def _local_install_entry(provider: str, model: str) -> dict[str, str] | None:
 def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
     source = _model_source_label(provider)
     if provider == "ollama":
-        return (
+        text = (
             f"{source} · {model}\n"
             "Status: runtime unavailable\n"
             "Start Ollama if it is installed. Otherwise install it from:\n"
@@ -1718,14 +1819,16 @@ def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
             f"Once it is running, install the model here: /install ollama {model}\n"
             f"Details: {detail}"
         )
+        return _command_text(text, code="runtime_unavailable", setup_required=True)
     if provider == "lmstudio":
-        return (
+        text = (
             f"{source} · {model}\n"
             "Status: runtime unavailable\n"
             "Install LM Studio, load the model, and start its local server first.\n"
             "Download: https://lmstudio.ai/download\n"
             f"Details: {detail}"
         )
+        return _command_text(text, code="runtime_unavailable", setup_required=True)
     if provider in {"llamacpp", "vllm", "localai"}:
         install_entry = _local_install_entry(provider, model)
         setup_hint = (
@@ -1733,13 +1836,14 @@ def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
             if install_entry is not None
             else _manual_local_install_text(provider, model)
         )
-        return (
+        text = (
             f"{source} · {model}\n"
             "Status: runtime unavailable\n"
             f"Start the {source} OpenAI-compatible server with that model loaded.\n"
             f"{setup_hint}\n"
             f"Details: {detail}"
         )
+        return _command_text(text, code="runtime_unavailable", setup_required=True)
     return detail
 
 
@@ -1756,12 +1860,17 @@ def _switch_model(
 
     if resolved_provider in UNIMPLEMENTED_PROVIDER_TRANSPORTS:
         source = _model_source_label(resolved_provider)
-        return "\n".join([
-            f"{source} · {model}",
-            "Status: unavailable",
-            f"{source} transport is not implemented in this Agent build.",
-            "No credentials were requested or changed.",
-        ])
+        return _command_text(
+            "\n".join([
+                f"{source} · {model}",
+                "Status: unavailable",
+                f"{source} transport is not implemented in this Agent build.",
+                "No credentials were requested or changed.",
+            ]),
+            code="unavailable",
+            setup_required=True,
+            error=True,
+        )
 
     if resolved_provider in LOCAL_PROVIDERS:
         resolved_model, setup_error = _resolve_local_model_name(
@@ -1781,7 +1890,12 @@ def _switch_model(
         )
         _apply_saved_reasoning_effort(ctx, candidate)
     except Exception as exc:
-        return f"Could not use model `{model}`: {exc}"
+        return _command_text(
+            f"Could not use model `{model}`: {exc}",
+            code="unavailable",
+            setup_required=True,
+            error=True,
+        )
 
     configuration_error = getattr(
         candidate,
@@ -1790,10 +1904,15 @@ def _switch_model(
     )
 
     if configuration_error:
+        configuration_state = _candidate_configuration_state(candidate)
         # Local models should show server/install instructions,
         # not an API-key prompt.
         if resolved_provider in LOCAL_PROVIDERS:
-            return _handle_model_setup(candidate)
+            return _command_text(
+                _handle_model_setup(candidate),
+                code="runtime_unavailable",
+                setup_required=True,
+            )
 
         # Make the selected hosted model active even while it waits for
         # credentials. TUI bridge commands run in separate processes, so an
@@ -1805,20 +1924,18 @@ def _switch_model(
             _persist_llm_config(ctx)
         except Exception as exc:
             ctx.llm = previous_llm
-            return f"Could not save model `{model}`: {exc}"
+            return _command_text(
+                f"Could not save model `{model}`: {exc}",
+                code="unavailable",
+                setup_required=True,
+                error=True,
+            )
 
         ctx.pending_provider = resolved_provider
         ctx.pending_model = str(getattr(candidate, "model", None) or model)
 
-        env_name = PROVIDER_API_KEY_ENVS.get(resolved_provider)
-        missing_api_key = bool(
-            env_name
-            and (
-                not os.environ.get(env_name)
-                or env_name.casefold() in str(configuration_error).casefold()
-            )
-        )
-        browser_setup = resolved_provider in {"bedrock", "vertexai", "copilot"}
+        missing_api_key = configuration_state == "api_key_required"
+        browser_setup = configuration_state == "credentials_required"
         opened_url = (
             _open_provider_setup_url(resolved_provider)
             if missing_api_key or browser_setup
@@ -1851,7 +1968,20 @@ def _switch_model(
             lines.append(open_line)
         if missing_api_key:
             lines.append(f"Complete the secure {_model_source_label(resolved_provider)} key prompt to continue.")
-        return "\n".join(lines)
+        code = (
+            "api_key_required"
+            if missing_api_key
+            else "credentials_required"
+            if browser_setup
+            else "unavailable"
+        )
+        return _command_text(
+            "\n".join(lines),
+            code=code,
+            setup_required=True,
+            error=code == "unavailable",
+            secret_provider=resolved_provider if missing_api_key else None,
+        )
 
     previous_llm = ctx.llm
 
@@ -1862,9 +1992,14 @@ def _switch_model(
         _persist_llm_config(ctx)
     except Exception as exc:
         ctx.llm = previous_llm
-        return f"Could not save model `{model}`: {exc}"
+        return _command_text(
+            f"Could not save model `{model}`: {exc}",
+            code="unavailable",
+            setup_required=True,
+            error=True,
+        )
 
-    return _model_switch_text(ctx)
+    return _command_text(_model_switch_text(ctx), code="ok")
 
 
 def _install_local_model(
@@ -1899,11 +2034,13 @@ def _install_local_model(
             "localai": "LocalAI gallery entry with known size metadata",
             "vllm": "Hugging Face model repository",
         }[normalized]
-        return (
+        return _command_text(
             "Status: model is not in the install catalog\n"
             f"Choose a listed {source} model: {available or 'none'}\n"
             f"Or provide a full {identifier_kind} identifier after `/install {normalized}`.\n"
-            "Agent will not preview or start an unknown-size local download."
+            "Agent will not preview or start an unknown-size local download.",
+            code="model_not_installed",
+            setup_required=True,
         )
     install_id = str(install_entry["install_id"] if install_entry else model)
 
@@ -1920,12 +2057,15 @@ def _install_local_model(
         )
 
     if shutil.which("ollama") is None:
-        return (
+        return _command_text(
             "Status: runtime not installed\n"
             "Ollama runtime is not installed.\n"
             "Install Ollama: https://ollama.com/download\n"
             "Start Ollama, then run this command again:\n"
-            f"/install ollama {model}"
+            f"/install ollama {model}",
+            code="runtime_not_installed",
+            setup_required=True,
+            next_command=f"/install ollama {model}",
         )
 
     if progress is not None:
@@ -1946,7 +2086,12 @@ def _install_local_model(
             bufsize=0,
         )
     except OSError as exc:
-        return f"Status: install failed\nCould not start Ollama: {exc}"
+        return _command_text(
+            f"Status: install failed\nCould not start Ollama: {exc}",
+            code="install_failed",
+            setup_required=True,
+            error=True,
+        )
 
     output_tail = ""
     stdout = process.stdout
@@ -1964,26 +2109,34 @@ def _install_local_model(
     returncode = process.wait()
     if returncode != 0:
         detail = _clean_install_progress(output_tail) or "Ollama pull failed."
-        return (
+        return _command_text(
             "Status: install failed\n"
             f"Could not install `{model}` with Ollama.\n"
             f"{truncate(detail, 1000)}\n"
-            f"Retry: /install ollama {model}"
+            f"Retry: /install ollama {model}",
+            code="install_failed",
+            setup_required=True,
+            error=True,
+            next_command=f"/install ollama {model}",
         )
 
     verification_error = _verify_local_model_ready(ctx, "ollama", model)
     if verification_error:
-        return (
+        return _command_text(
             "Status: install could not be verified\n"
             f"Ollama reported a successful pull for `{model}`, but Agent could not verify it locally.\n"
             f"{verification_error}\n"
-            f"Retry: /install ollama {model}"
+            f"Retry: /install ollama {model}",
+            code="install_unverified",
+            setup_required=True,
+            error=True,
+            next_command=f"/install ollama {model}",
         )
 
     if progress is not None:
         progress(f"Ollama · installed {model}; selecting model")
     switch_result = _switch_model(ctx, model=model, provider="ollama")
-    return f"Installed `{model}` with Ollama.\n{switch_result}"
+    return _prepend_command_text(f"Installed `{model}` with Ollama.", switch_result)
 
 
 def _local_install_preview(
@@ -2000,7 +2153,8 @@ def _local_install_preview(
         "context": "unknown",
         "quantization": "provider default",
     }
-    return "\n".join([
+    next_command = f"/install {provider} {model} --yes"
+    return _command_text("\n".join([
         "Local model install preview",
         f"Model: {model}",
         f"Provider: {source}",
@@ -2013,10 +2167,10 @@ def _local_install_preview(
         "Location: local runtime storage on this computer",
         "Authentication: none",
         "",
-        f"Confirm download: /install {provider} {model} --yes",
+        f"Confirm download: {next_command}",
         "Nothing has been downloaded yet.",
         "During installation, press Esc or Ctrl+C to stop without closing Agent.",
-    ])
+    ]), code="install_confirmation_required", next_command=next_command)
 
 
 def _install_non_ollama_model(
@@ -2072,10 +2226,13 @@ def _install_non_ollama_model(
             )
         hf_cli = shutil.which("hf")
         if hf_cli is None:
-            return (
+            return _command_text(
                 "Status: runtime helper unavailable\n"
                 "vLLM is installed, but the Hugging Face `hf` download command is unavailable.\n"
-                f"Install huggingface_hub, then retry: /install {provider} {model}"
+                f"Install huggingface_hub, then retry: /install {provider} {model}",
+                code="runtime_unavailable",
+                setup_required=True,
+                next_command=f"/install {provider} {model}",
             )
         command = [hf_cli, "download", install_id]
         runtime_url = "https://docs.vllm.ai/en/latest/models/supported_models/"
@@ -2088,11 +2245,14 @@ def _install_non_ollama_model(
         progress=progress,
     )
     if not ok:
-        return (
+        return _command_text(
             "Status: install failed\n"
             f"Could not install `{model}` with {source}.\n"
             f"{detail}\n"
-            f"Provider instructions: {runtime_url}"
+            f"Provider instructions: {runtime_url}",
+            code="install_failed",
+            setup_required=True,
+            error=True,
         )
 
     activation_error = _activate_local_runtime(
@@ -2103,26 +2263,33 @@ def _install_non_ollama_model(
         progress=progress,
     )
     if activation_error:
-        return (
+        return _command_text(
             f"Download command completed for `{model}` with {source}.\n"
             "Status: install not ready\n"
             f"{activation_error}\n"
-            f"Then select it with: /model {provider} {model}"
+            f"Then select it with: /model {provider} {model}",
+            code="install_not_ready",
+            setup_required=True,
+            next_command=f"/model {provider} {model}",
         )
 
     verification_error = _verify_local_model_ready(ctx, provider, model)
     if verification_error:
-        return (
+        return _command_text(
             "Status: install could not be verified\n"
             f"{source} completed its download command, but `{model}` is not exposed by its local API.\n"
             f"{verification_error}\n"
-            f"Retry: /install {provider} {model}"
+            f"Retry: /install {provider} {model}",
+            code="install_unverified",
+            setup_required=True,
+            error=True,
+            next_command=f"/install {provider} {model}",
         )
 
     if progress is not None:
         progress(f"{source} · installed locally; selecting {model}")
     switch_result = _switch_model(ctx, model=model, provider=provider)
-    return f"Installed `{model}` locally with {source}.\n{switch_result}"
+    return _prepend_command_text(f"Installed `{model}` locally with {source}.", switch_result)
 
 
 def _verify_local_model_ready(ctx: Any, provider: str, model: str) -> str | None:
@@ -2175,11 +2342,14 @@ def _runtime_not_installed_text(
     provider: str,
     model: str,
 ) -> str:
-    return (
+    return _command_text(
         "Status: runtime not installed\n"
         f"{source} is not installed on this computer.\n"
         f"Install the local runtime: {download_url}\n"
-        f"Then retry: /install {provider} {model}"
+        f"Then retry: /install {provider} {model}",
+        code="runtime_not_installed",
+        setup_required=True,
+        next_command=f"/install {provider} {model}",
     )
 
 
@@ -2207,10 +2377,12 @@ def _ensure_ollama_running(
     base_url = _provider_base_url(ctx, "ollama")
     hostname = (urllib.parse.urlparse(_normalize_base_url(base_url)).hostname or "").casefold()
     if hostname not in {"localhost", "127.0.0.1", "::1"}:
-        return (
+        return _command_text(
             "Status: runtime unavailable\n"
             f"Could not reach the configured Ollama server at {base_url}.\n"
-            f"Details: {discovery_error}"
+            f"Details: {discovery_error}",
+            code="runtime_unavailable",
+            setup_required=True,
         )
 
     if progress is not None:
@@ -2223,7 +2395,12 @@ def _ensure_ollama_running(
             start_new_session=True,
         )
     except OSError as exc:
-        return f"Status: runtime unavailable\nCould not start Ollama locally: {exc}"
+        return _command_text(
+            f"Status: runtime unavailable\nCould not start Ollama locally: {exc}",
+            code="runtime_unavailable",
+            setup_required=True,
+            error=True,
+        )
 
     last_error = discovery_error
     for _attempt in range(40):
@@ -2234,11 +2411,13 @@ def _ensure_ollama_running(
                 progress("Ollama · local runtime started")
             return None
 
-    return (
+    return _command_text(
         "Status: runtime unavailable\n"
         "Ollama is installed but its local server did not start.\n"
         "Run `ollama serve` in another terminal, then retry the install.\n"
-        f"Details: {last_error}"
+        f"Details: {last_error}",
+        code="runtime_unavailable",
+        setup_required=True,
     )
 
 
@@ -2329,32 +2508,40 @@ def _activate_local_runtime(
 def _manual_local_install_text(provider: str, model: str) -> str:
     source = _model_source_label(provider)
     if provider == "lmstudio":
-        return (
+        text = (
             "Status: manual setup required\n"
             f"Automatic installation is not available for {source}.\n"
             "Open LM Studio, download and load the model, then start the local server.\n"
             f"After it is loaded: /model lmstudio {model}"
         )
+        return _command_text(text, code="manual_setup_required", setup_required=True)
     if provider == "llamacpp":
-        return (
+        text = (
             "Status: manual setup required\n"
             f"Automatic installation is not available for {source}.\n"
             "Download a compatible GGUF model and start llama.cpp with it.\n"
             f"Then run: /model llamacpp {model}"
         )
+        return _command_text(text, code="manual_setup_required", setup_required=True)
     if provider == "vllm":
-        return (
+        text = (
             "Status: manual setup required\n"
             f"Start vLLM with `{model}` so it can download/load the model from its configured registry.\n"
             f"Then run: /model vllm {model}"
         )
+        return _command_text(text, code="manual_setup_required", setup_required=True)
     if provider == "localai":
-        return (
+        text = (
             "Status: manual setup required\n"
             f"Install `{model}` through the LocalAI model gallery and start the LocalAI server.\n"
             f"Then run: /model localai {model}"
         )
-    return f"{source} cannot install `{model}` automatically."
+        return _command_text(text, code="manual_setup_required", setup_required=True)
+    return _command_text(
+        f"{source} cannot install `{model}` automatically.",
+        code="manual_setup_required",
+        setup_required=True,
+    )
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -2779,8 +2966,7 @@ def _handle_model_setup(candidate: Any) -> str:
 def _model_switch_text(ctx: Any) -> str:
     provider = _active_provider(ctx)
     model = getattr(getattr(ctx, "llm", None), "model", None)
-    configuration = _llm_configuration(ctx)
-    if configuration == "ready":
+    if _llm_configuration_state(ctx) == "ready":
         return f"{_model_source_label(provider)} · {model}"
     return _provider_switch_text(ctx)
 
@@ -2863,7 +3049,11 @@ def _discovered_model_options(ctx: Any,) -> list[dict[str, Any]]:
                     if discovery_error
                     else ModelState.MODEL_NOT_INSTALLED
                 )
-            elif discovery_error and "key" in discovery_error.casefold():
+            elif (
+                discovery_error
+                and _provider_configuration_state_from_environment(provider)
+                == "api_key_required"
+            ):
                 state = ModelState.AUTH_REQUIRED
             elif discovery_error:
                 state = ModelState.UNAVAILABLE
@@ -3245,8 +3435,10 @@ def _tool_policy_label(name: str) -> str:
         return "allowlisted; service changes require approval"
     if name == "language_server":
         return "read-mostly; lifecycle actions scoped"
-    if name in {"load_skill", "discovery_subagent"}:
+    if name == "load_skill":
         return "instructions/read-only"
+    if name == "parallel_subagents":
+        return "parallel agents; scoped writes"
     return "read-only"
 
 
@@ -3376,6 +3568,57 @@ def _llm_configuration(ctx: AppContext) -> str:
     return str(error) if error else "ready"
 
 
+def _llm_configuration_state(ctx: AppContext) -> str:
+    llm = getattr(ctx, "llm", None)
+    explicit = getattr(llm, "configuration_state", None)
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    if _llm_configuration(ctx) == "ready":
+        return "ready"
+    return _provider_configuration_state_from_environment(_active_provider(ctx))
+
+
+def _candidate_configuration_state(candidate: Any) -> str:
+    explicit = getattr(candidate, "configuration_state", None)
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    if not getattr(candidate, "configuration_error", None):
+        return "ready"
+    provider = str(getattr(candidate, "provider", "") or "")
+    return _provider_configuration_state_from_environment(provider)
+
+
+def _provider_configuration_state_from_environment(provider: str) -> str:
+    if provider in LOCAL_PROVIDERS:
+        return "runtime_unavailable"
+    if provider == "openai-compatible" and not os.environ.get(
+        "AGENT_OPENAI_COMPAT_BASE_URL"
+    ):
+        return "endpoint_required"
+    env_name = PROVIDER_API_KEY_ENVS.get(provider)
+    if env_name and not os.environ.get(env_name):
+        return "api_key_required"
+    if provider == "bedrock":
+        has_credentials = bool(
+            os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+            or os.environ.get("AWS_PROFILE")
+            or (
+                os.environ.get("AWS_ACCESS_KEY_ID")
+                and os.environ.get("AWS_SECRET_ACCESS_KEY")
+            )
+        )
+        return "unavailable" if has_credentials else "credentials_required"
+    if provider == "vertexai":
+        has_project = bool(
+            os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GCP_PROJECT_ID")
+        )
+        return "unavailable" if has_project else "credentials_required"
+    if provider == "copilot":
+        return "credentials_required"
+    return "unavailable"
+
+
 def _persist_llm_config(ctx: Any) -> None:
     store = getattr(ctx, "store", None)
     session_id = getattr(ctx, "session_id", None)
@@ -3438,8 +3681,10 @@ def _provider_api_key_needed(
     if pending_provider:
         if pending_provider in LOCAL_PROVIDERS:
             return None
-
-        if pending_provider in PROVIDER_API_KEY_ENVS:
+        if (
+            pending_provider in PROVIDER_API_KEY_ENVS
+            and _llm_configuration_state(ctx) == "api_key_required"
+        ):
             return pending_provider
 
         return None
@@ -3449,13 +3694,10 @@ def _provider_api_key_needed(
     if provider in LOCAL_PROVIDERS:
         return None
 
-    if _llm_configuration(ctx) == "ready":
-        return None
-
-    if provider == "openai-compatible":
-        return None
-
-    if provider in PROVIDER_API_KEY_ENVS:
+    if (
+        provider in PROVIDER_API_KEY_ENVS
+        and _llm_configuration_state(ctx) == "api_key_required"
+    ):
         return provider
 
     return None
@@ -3513,7 +3755,7 @@ def _redact_local_command(text: str) -> str:
 
 
 def _is_exit_command(value: str) -> bool:
-    return value.strip().casefold() in {"exit", "quit", "/exit", "/quit", "/q"}
+    return value.strip().casefold() in {"/exit", "/quit", "/q"}
 
 
 def _active_provider(ctx: Any) -> str:
@@ -3748,6 +3990,7 @@ def _run_tui_stream_submit(ctx: AppContext, prompt: str) -> int:
                 "kind": "final",
                 "ok": True,
                 "answer": answer,
+                "command_result": ctx.last_local_command_result,
                 "snapshot": _tui_bridge_snapshot(ctx),
             })
             return 0
@@ -3853,6 +4096,7 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
                     payload = {
                         "ok": True,
                         "answer": answer,
+                        "command_result": ctx.last_local_command_result,
                         "snapshot": _tui_bridge_snapshot(ctx),
                     }
                 except Exception as exc:
@@ -3884,6 +4128,7 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             "mode": _llm_mode(ctx),
             "reasoning_effort": getattr(ctx.llm, "reasoning_effort", None) or "provider controlled",
             "configuration": _llm_configuration(ctx),
+            "configuration_state": _llm_configuration_state(ctx),
             "cost_usd": session.cost_usd,
             "tokens": {
                 "input": session.tokens.input,
@@ -5125,7 +5370,17 @@ def _render_tui_transcript(messages: list[Any], live_turn: dict[str, Any], width
             visible_messages = visible_messages[:-1]
 
     lines = _render_messages(visible_messages, width) if visible_messages else []
-    live_lines = _render_live_turn(live_turn, width) if active or error else []
+    has_recent_subagents = any(
+        isinstance(item, (list, tuple))
+        and len(item) == 2
+        and item[0] == "subagent"
+        for item in live_turn.get("feed", [])
+    )
+    live_lines = (
+        _render_live_turn(live_turn, width)
+        if active or error or has_recent_subagents
+        else []
+    )
 
     if lines and live_lines:
         return [*lines, *live_lines]
@@ -5191,6 +5446,10 @@ def _render_live_turn(live_turn: dict[str, Any], width: int) -> list[str]:
             lines.extend(_wrap_lines(str(content), width, indent="    Result: "))
         elif kind == "guardrail":
             lines.extend(_wrap_lines(str(content), width, indent="    Guardrail: "))
+        elif kind == "subagent":
+            if prev_kind != "subagent":
+                lines.append("  Subagents")
+            lines.extend(_wrap_lines(str(content), width, indent="    ↳ "))
         elif kind == "tool_error":
             lines.extend(_wrap_lines(str(content), width, indent="    Error: "))
         prev_kind = kind

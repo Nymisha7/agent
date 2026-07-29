@@ -181,6 +181,10 @@ class TuiRenderingTests(unittest.TestCase):
         )
         self.assertEqual(payload["snapshot"]["messages"][0]["content"], "/help")
         self.assertIn("Commands", payload["snapshot"]["messages"][1]["content"])
+        self.assertEqual(
+            payload["command_result"],
+            {"code": "ok", "setup_required": False, "error": False},
+        )
 
     def test_normal_prompt_round_trip_persists_user_and_assistant_messages(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -653,6 +657,8 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual(snapshot["approvals"][0]["id"], "req-1")
         self.assertEqual(snapshot["approvals"][0]["tool"], "delete_path")
         self.assertEqual(snapshot["approvals"][0]["display_path"], "Example file")
+        self.assertEqual(snapshot["session"]["configuration_state"], "ready")
+        self.assertNotIn("credential_provider", snapshot["session"])
         self.assertEqual(seen_limits, [TUI_TRANSCRIPT_LIMIT])
 
     def test_tui_bridge_approval_decision_persists_for_waiting_turn(self) -> None:
@@ -845,6 +851,30 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertIn("Here is the answer", text)
         self.assertNotIn("private detailed chain of thought", text)
 
+    def test_live_turn_renders_parallel_subagent_lifecycle(self) -> None:
+        live_turn = LiveTurnState()
+        live_turn.start("inspect independent workstreams")
+        live_turn.update({
+            "kind": "subagent_run_started",
+            "summary": "Spawned 2 parallel subagents · log: .agent/parallel-work.md",
+        })
+        live_turn.update({
+            "kind": "subagent_task_started",
+            "summary": "architecture · running — inspect architecture",
+        })
+        live_turn.update({
+            "kind": "subagent_task_completed",
+            "summary": "architecture · complete — found planner entry point",
+        })
+
+        rendered = _render_tui_transcript([], live_turn.snapshot(), 100)
+        text = "\n".join(rendered)
+
+        self.assertIn("Subagents", text)
+        self.assertIn("Spawned 2 parallel subagents", text)
+        self.assertIn("architecture · running", text)
+        self.assertIn("architecture · complete", text)
+
     def test_finished_turn_discards_ephemeral_tool_activity(self) -> None:
         live_turn = LiveTurnState()
         live_turn.start("inspect the repo")
@@ -863,6 +893,26 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual(snapshot["phase"], "completed")
         self.assertEqual(snapshot["prompt"], "")
         self.assertEqual(snapshot["feed"], [])
+
+    def test_finished_turn_retains_recent_parallel_summary(self) -> None:
+        live_turn = LiveTurnState()
+        live_turn.start("inspect two workstreams")
+        live_turn.update({
+            "kind": "subagent_run_started",
+            "summary": "Spawned 2 parallel subagents",
+        })
+        live_turn.update({
+            "kind": "subagent_run_completed",
+            "summary": "Parallel subagents finished · 2/2 complete",
+        })
+
+        live_turn.finish()
+        snapshot = live_turn.snapshot()
+        rendered = "\n".join(_render_tui_transcript([], snapshot, 80))
+
+        self.assertFalse(snapshot["active"])
+        self.assertIn("Subagents", rendered)
+        self.assertIn("2/2 complete", rendered)
 
     def test_failed_turn_keeps_error_but_discards_tool_trace(self) -> None:
         live_turn = LiveTurnState()
@@ -1299,6 +1349,8 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("Status: API key required", result)
         self.assertIn("/apikey deepseek", result)
         self.assertIn("Opened DeepSeek API-key page", result)
+        self.assertEqual(ctx.last_local_command_result["code"], "api_key_required")
+        self.assertEqual(ctx.last_local_command_result["secret_provider"], "deepseek")
         open_browser.assert_called_once_with("https://platform.deepseek.com/api_keys", new=2, autoraise=True)
 
     def test_provider_command_surfaces_configuration_error(self) -> None:
@@ -1325,6 +1377,8 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("Status: API key required", result)
         self.assertIn("/apikey openai", result)
         self.assertIn("Opened OpenAI API-key page", result)
+        self.assertEqual(ctx.last_local_command_result["code"], "api_key_required")
+        self.assertEqual(ctx.last_local_command_result["secret_provider"], "openai")
         self.assertEqual(ctx.llm.provider, "openai")
         self.assertEqual(ctx.llm.model, "gpt-4o")
         store.update_llm_config.assert_called_once_with(
@@ -1890,4 +1944,5 @@ class LocalCommandTests(unittest.TestCase):
     def test_slash_exit_aliases_are_exit_commands(self) -> None:
         self.assertTrue(_is_exit_command("/exit"))
         self.assertTrue(_is_exit_command("/q"))
-        self.assertTrue(_is_exit_command("quit"))
+        self.assertFalse(_is_exit_command("quit"))
+        self.assertFalse(_is_exit_command("exit"))
