@@ -88,6 +88,27 @@ SKIP_FILE_NAMES = {
     ".DS_Store",
 }
 
+DESKTOP_ACTIONS = frozenset({
+    "set_volume", "set_mute", "set_brightness",
+    "bluetooth_connect", "bluetooth_disconnect",
+    "network_connect", "network_disconnect", "eject_storage",
+    "terminate_process", "launch_application", "open_path", "open_url",
+    "focus_window", "minimize_window", "maximize_window", "restore_window",
+    "close_window", "clipboard_write", "send_key", "type_text", "mouse_click",
+    "scroll", "focus_element", "invoke_element", "set_field_text",
+})
+DESKTOP_TARGET_REQUIRED_ACTIONS = frozenset({
+    "bluetooth_connect", "bluetooth_disconnect", "network_connect",
+    "network_disconnect", "eject_storage", "terminate_process",
+    "launch_application", "open_path", "open_url", "focus_window",
+    "minimize_window", "maximize_window", "restore_window", "close_window",
+    "mouse_click", "focus_element", "invoke_element", "set_field_text",
+})
+DESKTOP_VALUE_REQUIRED_ACTIONS = frozenset({
+    "set_volume", "set_brightness", "clipboard_write", "send_key", "type_text",
+    "scroll", "invoke_element", "set_field_text",
+})
+
 TEXT_SUFFIXES = {
     ".cfg",
     ".css",
@@ -152,11 +173,13 @@ def build_tool_registry(ctx: ToolContext) -> ToolRegistry:
                 schema=_function_schema(
                     name="parallel_subagents",
                     description=(
-                        "Delegate one concurrent batch of independent tasks during the normal agent turn. "
+                        "Proactively delegate one concurrent batch during the normal agent turn when a "
+                        "complex request has at least two independent deliverables, repository areas, or "
+                        "verbose investigations that can proceed without waiting on one another. "
                         "Each child has a fresh model/tool loop, can read the workspace, and may write or edit "
                         "only inside its declared non-overlapping owns directories. Omit owns for a read-only "
-                        "research task. Use this when multiple substantial workstreams can proceed independently; "
-                        "do not create filler tasks or dependent phases. Children cannot delete, run arbitrary "
+                        "research task. Use delegation to reduce parent-context noise and allocate safe disjoint "
+                        "implementation work; do not create filler tasks or dependent phases. Children cannot delete, run arbitrary "
                         "commands, control the desktop, send messages, request approval, or spawn agents. "
                         "The parent integrates cross-cutting files, verifies the batch, and gives the final answer."
                     ),
@@ -238,6 +261,7 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
         ToolSpec(
             name="language_server",
             handler=_language_server,
+            default_enabled=False,
             schema=_function_schema(
                 name="language_server",
                 description=(
@@ -821,16 +845,7 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 properties={
                     "action": {
                         "type": "string",
-                        "enum": [
-                            "set_volume", "set_mute", "set_brightness",
-                            "bluetooth_connect", "bluetooth_disconnect",
-                            "network_connect", "network_disconnect", "eject_storage",
-                            "terminate_process", "launch_application", "open_path", "open_url",
-                            "focus_window", "minimize_window", "maximize_window",
-                            "restore_window", "close_window", "clipboard_write",
-                            "send_key", "type_text", "mouse_click", "scroll",
-                            "focus_element", "invoke_element", "set_field_text",
-                        ],
+                        "enum": sorted(DESKTOP_ACTIONS),
                         "description": "Typed desktop operation to perform.",
                     },
                     "target": {
@@ -1419,17 +1434,29 @@ def _is_broad_windows_path(value: str) -> bool:
 
 def _is_broad_external_path(path: Path) -> bool:
     resolved = _resolve_without_strict(path)
-    text = resolved.as_posix().rstrip("/") or "/"
-    broad = {
-        "/",
-        "/home",
-        "/mnt",
-        "/mnt/c",
-        "/mnt/c/Users",
-        "/mnt/d",
-        "/mnt/d/Users",
-    }
-    return text in broad
+    if not resolved.is_absolute():
+        return False
+
+    filesystem_root = Path(resolved.anchor).resolve(strict=False)
+    if resolved == filesystem_root or resolved.parent == filesystem_root:
+        return True
+
+    home = Path.home().expanduser().resolve(strict=False)
+    if resolved in {home, home.parent}:
+        return True
+
+    # Mount roots and their immediate children represent an entire volume or
+    # a broad top-level scope. This covers WSL drives and removable media
+    # without naming specific drive letters or directory names.
+    if os.path.ismount(resolved) or os.path.ismount(resolved.parent):
+        return True
+
+    configured = os.environ.get("AGENT_PROTECTED_PATHS", "")
+    return any(
+        resolved == _resolve_without_strict(Path(value.strip()))
+        for value in configured.split(os.pathsep)
+        if value.strip()
+    )
 
 
 def _resolve_without_strict(path: Path) -> Path:
@@ -2047,29 +2074,13 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
     action = _enum_arg(
         args.get("action"),
         default="",
-        allowed={
-            "set_volume", "set_mute", "set_brightness",
-            "bluetooth_connect", "bluetooth_disconnect",
-            "network_connect", "network_disconnect", "eject_storage",
-            "terminate_process", "launch_application", "open_path", "open_url",
-            "focus_window", "minimize_window", "maximize_window",
-                            "restore_window", "close_window", "clipboard_write",
-            "send_key", "type_text", "mouse_click", "scroll",
-            "focus_element", "invoke_element", "set_field_text",
-        },
+        allowed=DESKTOP_ACTIONS,
     )
     if not action:
         raise ValueError("desktop_action requires a supported action.")
     target = _optional_desktop_arg(args.get("target"), "target")
     value = _optional_desktop_arg(args.get("value"), "value")
-    if action in {
-        "bluetooth_connect", "bluetooth_disconnect", "network_connect",
-        "network_disconnect", "eject_storage", "terminate_process",
-        "launch_application", "open_path", "open_url",
-        "focus_window", "minimize_window", "maximize_window",
-        "restore_window", "close_window", "mouse_click",
-        "focus_element", "invoke_element", "set_field_text",
-    } and target is None:
+    if action in DESKTOP_TARGET_REQUIRED_ACTIONS and target is None:
         return {
             "ok": False,
             "tool": "desktop_action",
@@ -2079,7 +2090,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             "operation": "desktop",
             "guidance": f"{action} requires a concrete target before approval can be requested.",
         }
-    if action in {"set_volume", "set_brightness", "clipboard_write", "send_key", "type_text", "scroll", "invoke_element", "set_field_text"} and value is None:
+    if action in DESKTOP_VALUE_REQUIRED_ACTIONS and value is None:
         return {
             "ok": False,
             "tool": "desktop_action",

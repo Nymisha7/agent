@@ -1,7 +1,10 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from agent.attachments import import_attachment
 from agent.llm import (
     LLMClient,
     _anthropic_message_to_response,
@@ -11,11 +14,13 @@ from agent.llm import (
     _default_reasoning_effort,
     _default_reasoning_summary,
     _friendly_llm_error,
+    _image_data_url,
     _model_supports_reasoning,
     _normalize_provider,
     _responses_reasoning_config,
     _responses_messages_to_anthropic,
     _responses_messages_to_chat,
+    _responses_input_messages,
     _responses_tools_to_anthropic,
     _responses_tools_to_chat,
 )
@@ -355,6 +360,7 @@ class LLMProviderTests(unittest.TestCase):
 
     def test_reasoning_defaults_apply_only_to_reasoning_models(self) -> None:
         self.assertEqual(_default_reasoning_effort("openai", "gpt-5.4-mini"), "medium")
+        self.assertEqual(_default_reasoning_summary("openai", "gpt-5.4-mini"), "auto")
         self.assertIsNone(_default_reasoning_effort("openai", "gpt-4o"))
         self.assertIsNone(_default_reasoning_summary("deepseek", "deepseek-reasoner"))
 
@@ -438,6 +444,70 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(converted[2]["tool_calls"][0]["function"]["name"], "glob")
         self.assertEqual(converted[3]["role"], "tool")
         self.assertEqual(converted[3]["tool_call_id"], "call-1")
+
+    def test_responses_input_preserves_plain_text_messages(self) -> None:
+        messages = [
+            {"role": "user", "content": "first message"},
+            {"role": "assistant", "content": "first reply"},
+            {"role": "user", "content": "second message"},
+        ]
+
+        self.assertEqual(
+            _responses_input_messages(messages, provider="openai"),
+            messages,
+        )
+
+    def test_text_attachment_content_is_sent_to_the_model(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "finalreport.txt"
+            path.write_text("Release status: ready for review.", encoding="utf-8")
+            converted = _responses_input_messages([
+                {
+                    "role": "user",
+                    "content": "Summarize the attachment.",
+                    "attachments": [{
+                        "filename": path.name,
+                        "mime": "text/plain",
+                        "size_bytes": path.stat().st_size,
+                        "storage_path": str(path),
+                    }],
+                }
+            ], provider="openai")
+
+        parts = converted[0]["content"]
+        self.assertEqual(parts[0]["type"], "input_text")
+        self.assertIn("Release status: ready for review.", parts[0]["text"])
+        self.assertIn("<attached_file", parts[0]["text"])
+
+    def test_attached_snapshot_is_used_after_original_file_is_removed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "finalreport.txt"
+            source.write_text("Captured attachment content.", encoding="utf-8")
+            with patch.dict("os.environ", {"XDG_DATA_HOME": str(root / "data")}, clear=False):
+                attachment = import_attachment(source, source="user_file")
+                source.unlink()
+                converted = _responses_input_messages([
+                    {
+                        "role": "user",
+                        "content": "Summarize the attachment.",
+                        "attachments": [attachment.to_store_input()],
+                    }
+                ], provider="openai")
+
+        text = converted[0]["content"][0]["text"]
+        self.assertIn("Captured attachment content.", text)
+        self.assertNotIn(str(source), text)
+
+    def test_image_attachment_model_input_limit_is_configurable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            image = Path(tmp) / "large.png"
+            image.write_bytes(b"12345")
+            item = {"filename": image.name, "mime": "image/png", "storage_path": str(image)}
+
+            with patch.dict("os.environ", {"AGENT_MAX_IMAGE_ATTACHMENT_BYTES": "4"}):
+                with self.assertRaisesRegex(RuntimeError, "model-input limit"):
+                    _image_data_url(item)
 
     def test_responses_tools_convert_to_chat_and_anthropic_shapes(self) -> None:
         tools = [

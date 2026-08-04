@@ -385,9 +385,16 @@ fn read_directory_listing(path: &Path, options: &ReadPathOptions) -> Result<Read
     let start = offset.saturating_sub(1);
     let total_entries = entries.len();
 
-    let selected: Vec<String> = entries.into_iter().skip(start).take(limit).collect();
-    let content = selected.join("\n");
-    let end_line = end_line_for(offset, selected.len());
+    let mut content = String::new();
+    let mut selected_len = 0;
+    for entry in entries.into_iter().skip(start).take(limit) {
+        if selected_len > 0 {
+            content.push('\n');
+        }
+        content.push_str(&entry);
+        selected_len += 1;
+    }
+    let end_line = end_line_for(offset, selected_len);
 
     Ok(ReadPathResult {
         path: path.to_path_buf(),
@@ -400,9 +407,9 @@ fn read_directory_listing(path: &Path, options: &ReadPathOptions) -> Result<Read
         },
         offset,
         end_line,
-        lines_seen: selected.len(),
+        lines_seen: selected_len,
         total_lines: Some(total_entries),
-        truncated: start + selected.len() < total_entries,
+        truncated: start + selected_len < total_entries,
         bytes_read: content.len(),
         content,
     })
@@ -444,11 +451,11 @@ fn read_utf8_text_result(
     let mut lines_seen = 0usize;
     let mut bytes_read = 0usize;
     let mut output_bytes = 0usize;
-    let mut selected = Vec::new();
     let mut output_truncated = false;
     let mut line_truncated = false;
     let mut has_more_lines = false;
     let mut reached_eof = true;
+    let mut content = String::new();
 
     loop {
         line.clear();
@@ -478,7 +485,7 @@ fn read_utf8_text_result(
         let (line_text, was_line_truncated) = truncate_line(normalized, max_line_length);
         line_truncated |= was_line_truncated;
 
-        let next_size = line_text.len() + usize::from(!selected.is_empty());
+        let next_size = line_text.len() + usize::from(!content.is_empty());
         if output_bytes + next_size > max_bytes {
             output_truncated = true;
             has_more_lines = true;
@@ -487,12 +494,14 @@ fn read_utf8_text_result(
         }
 
         output_bytes += next_size;
-        selected.push(line_text);
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&line_text);
         lines_seen += 1;
     }
 
     detection.encoding = Some("UTF-8".to_string());
-    let content = selected.join("\n");
 
     Ok(ReadPathResult {
         path: path.to_path_buf(),
@@ -542,44 +551,55 @@ fn read_text_result_buffered(
         );
     }
 
-    let lines = split_lines(&text);
     let offset = effective_offset(options.offset);
     let limit = effective_limit(options);
     let start = offset.saturating_sub(1);
+    let total_lines = usize::from(!text.is_empty()) * text.split('\n').count();
 
-    let mut selected = Vec::new();
     let mut output_bytes = 0usize;
     let mut output_truncated = false;
     let mut line_truncated = false;
+    let mut content = String::new();
+    let mut lines_seen = 0usize;
 
-    for line in lines.iter().skip(start).take(limit) {
-        let (line, was_line_truncated) = truncate_line(line, options.limits.max_line_length);
-        line_truncated |= was_line_truncated;
+    if !text.is_empty() {
+        for line in text
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .skip(start)
+            .take(limit)
+        {
+            let (line, was_line_truncated) = truncate_line(line, options.limits.max_line_length);
+            line_truncated |= was_line_truncated;
 
-        let next_size = line.len() + usize::from(!selected.is_empty());
-        if output_bytes + next_size > max_bytes {
-            output_truncated = true;
-            break;
+            let next_size = line.len() + usize::from(!content.is_empty());
+            if output_bytes + next_size > max_bytes {
+                output_truncated = true;
+                break;
+            }
+
+            output_bytes += next_size;
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&line);
+            lines_seen += 1;
         }
-
-        output_bytes += next_size;
-        selected.push(line);
     }
 
-    let content = selected.join("\n");
-    let end_line = end_line_for(offset, selected.len());
-    let line_limit_truncated = start + selected.len() < lines.len();
+    let end_line = end_line_for(offset, lines_seen);
+    let line_limit_truncated = start + lines_seen < total_lines;
 
     Ok(ReadPathResult {
         path: path.to_path_buf(),
         detection,
         offset,
         end_line,
-        lines_seen: selected.len(),
+        lines_seen,
         total_lines: if byte_truncated {
             None
         } else {
-            Some(lines.len())
+            Some(total_lines)
         },
         truncated: byte_truncated || output_truncated || line_truncated || line_limit_truncated,
         bytes_read,
@@ -619,24 +639,13 @@ fn read_metadata_result(
     })
 }
 
-fn split_lines(text: &str) -> Vec<&str> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-
-    text.split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect()
-}
-
 fn truncate_line(line: &str, max_line_length: usize) -> (String, bool) {
     let max_line_length = max_line_length.max(1);
-    let mut chars = line.chars();
-
-    let mut output: String = chars.by_ref().take(max_line_length).collect();
-
-    if chars.next().is_some() {
-        output.push_str("... [line truncated]");
+    if let Some((boundary, _)) = line.char_indices().nth(max_line_length) {
+        let suffix = "... [line truncated]";
+        let mut output = String::with_capacity(boundary + suffix.len());
+        output.push_str(&line[..boundary]);
+        output.push_str(suffix);
         return (output, true);
     }
 
@@ -648,5 +657,21 @@ fn end_line_for(offset: usize, lines_seen: usize) -> usize {
         offset.saturating_sub(1)
     } else {
         offset + lines_seen - 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_line;
+
+    #[test]
+    fn truncation_preserves_utf8_boundaries_without_intermediate_string() {
+        let (value, truncated) = truncate_line("åβγ", 2);
+        assert_eq!(value, "åβ... [line truncated]");
+        assert!(truncated);
+
+        let (value, truncated) = truncate_line("åβ", 2);
+        assert_eq!(value, "åβ");
+        assert!(!truncated);
     }
 }

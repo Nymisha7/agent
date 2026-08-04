@@ -21,6 +21,7 @@ from typing import Any, Iterator, Protocol, TypeVar
 from .config import AgentConfig, PEER_KINDS, RouteBindingConfig, SESSION_SCOPES
 from .channel_health_policy import ChannelHealthPolicy, evaluate_channel_health
 from .channel_health_monitor import start_channel_health_monitor
+from .attachments import import_attachment
 from .device_identity import load_or_create_device_identity, public_key_raw_base64url_from_pem
 from .gateway_runtime import GatewayMethod, create_gateway_runtime_state
 from .heartbeat_events import get_last_heartbeat_event
@@ -1804,8 +1805,7 @@ class AgentGateway:
         message = _optional_text(params, "message")
         if not message:
             raise GatewayError("sessions.send requires a non-empty message")
-        if params.get("attachments") is not None:
-            raise GatewayError("sessions.send attachments are not implemented in Agent yet")
+        attachments = _gateway_attachment_inputs(params.get("attachments"))
         idempotency_key = _optional_text(params, "idempotency_key") or _optional_text(params, "idempotencyKey")
         if idempotency_key:
             cache_key = f"sessions.send:{idempotency_key}"
@@ -1819,12 +1819,16 @@ class AgentGateway:
             raise KeyError(f"Session not found: {resolved.get('key')}")
         session_id = str(resolved["session_id"])
         route_key = resolved.get("route_key")
-        messages = self.store.add_messages(
-            session_id,
-            [("user", message)],
-            last_prompt=message,
-            expected_route_key=route_key if isinstance(route_key, str) else None,
-        )
+        if attachments:
+            messages = [self.store.add_message_with_attachments(
+                session_id, "user", message, attachments, last_prompt=message,
+                expected_route_key=route_key if isinstance(route_key, str) else None,
+            )]
+        else:
+            messages = self.store.add_messages(
+                session_id, [("user", message)], last_prompt=message,
+                expected_route_key=route_key if isinstance(route_key, str) else None,
+            )
         appended = messages[-1]
         run_id = idempotency_key or f"session-send-{uuid.uuid4().hex}"
         payload = {
@@ -2362,6 +2366,25 @@ def canonical_route_key(
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
     return f"agent-route-v1:{digest}"
+
+
+def _gateway_attachment_inputs(value: Any) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not value:
+        raise GatewayError("attachments must be a non-empty array of local file paths.")
+    if len(value) > 16:
+        raise GatewayError("attachments may contain at most 16 files.")
+    inputs: list[dict[str, object]] = []
+    for item in value:
+        path = item.get("path") if isinstance(item, Mapping) else item
+        if not isinstance(path, str) or not path.strip():
+            raise GatewayError("attachments must each be a non-empty path or {path} object.")
+        try:
+            inputs.append(import_attachment(path, source="gateway_upload").to_store_input())
+        except ValueError as exc:
+            raise GatewayError(str(exc)) from exc
+    return inputs
 
 
 UNSUPPORTED_READ_GATEWAY_METHODS = (
@@ -3158,12 +3181,6 @@ def _agent_command_inventory() -> list[dict[str, Any]]:
                     "enum": ["minimal", "low", "medium", "high"],
                 },
             ],
-        },
-        {
-            "name": "tools",
-            "description": descriptions.get("/tools", "Show enabled tools grouped by purpose and approval policy"),
-            "textAliases": ["/tools"],
-            "args": [],
         },
         {
             "name": "skills",

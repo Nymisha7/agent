@@ -39,7 +39,7 @@ pub fn write_file(options: WriteFileOptions) -> Result<WriteFileResult> {
     let target = resolve_target_path(&options.path, &workspace_root)?;
     let resource = relative_display(&target, &workspace_root);
 
-    if target.exists() {
+    let existing_permissions = if target.exists() {
         let metadata = fs::symlink_metadata(&target)
             .with_context(|| format!("Failed to inspect target: {}", target.display()))?;
 
@@ -50,7 +50,10 @@ pub fn write_file(options: WriteFileOptions) -> Result<WriteFileResult> {
         if metadata.is_dir() {
             bail!("Path is a directory: {}", target.display());
         }
-    }
+        Some(metadata.permissions())
+    } else {
+        None
+    };
 
     let existing = if target.exists() {
         Some(
@@ -125,18 +128,27 @@ pub fn write_file(options: WriteFileOptions) -> Result<WriteFileResult> {
 
     let temp_path = temp_write_path(parent)?;
     write_temp_file(&temp_path, &final_bytes)?;
-
-    if existing.is_some() {
-        let _ = fs::remove_file(&target);
+    if let Some(permissions) = existing_permissions {
+        if let Err(error) = fs::set_permissions(&temp_path, permissions) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to preserve permissions for replacement file: {}",
+                    target.display()
+                )
+            });
+        }
     }
-
-    fs::rename(&temp_path, &target).with_context(|| {
-        format!(
-            "Failed to move temporary file into place: {} -> {}",
-            temp_path.display(),
-            target.display()
-        )
-    })?;
+    if let Err(error) = fs::rename(&temp_path, &target) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to atomically move temporary file into place: {} -> {}",
+                temp_path.display(),
+                target.display()
+            )
+        });
+    }
 
     if let Ok(dir) = File::open(parent) {
         let _ = dir.sync_all();
@@ -253,7 +265,7 @@ fn strip_utf8_bom(text: &str) -> &str {
 }
 
 fn has_utf8_bom(bytes: &[u8]) -> bool {
-    bytes.len() >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf
+    bytes.starts_with(&[0xef, 0xbb, 0xbf])
 }
 
 fn line_count(text: &str) -> usize {
@@ -382,6 +394,35 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbfalpha\r\nbeta\r\n");
         assert!(!result.created);
         assert_eq!(result.line_ending, "\r\n");
+        cleanup(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let path = dir.join("executable.sh");
+        fs::write(&path, "#!/bin/sh\necho old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o751)).unwrap();
+
+        write_file(WriteFileOptions {
+            path: PathBuf::from("executable.sh"),
+            workspace_root: dir.clone(),
+            content: "#!/bin/sh\necho new\n".to_string(),
+            create_dirs: true,
+            overwrite: true,
+            preserve_line_endings: true,
+            expected_sha256: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\necho new\n");
         cleanup(&dir);
     }
 

@@ -55,36 +55,46 @@ pub(crate) fn ripgrep_paths(root: &Path, options: RipgrepFilesOptions) -> Result
         bail!(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
-    let mut files = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|bytes| !bytes.is_empty())
-        .map(path_from_bytes)
-        .map(|path| strip_dot_prefix(&path))
-        .filter(|path| !path.as_os_str().is_empty())
-        .collect::<Vec<_>>();
-    files.sort();
-    files.dedup();
-
-    let mut directories = files
-        .iter()
-        .flat_map(|path| path.ancestors().skip(1))
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .collect::<Vec<_>>();
-    directories.sort();
-    directories.dedup();
-
-    let mut paths = Vec::with_capacity(files.len() + directories.len());
-    paths.extend(directories.into_iter().map(|relative| RipgrepPath {
-        relative,
-        kind: RipgrepPathKind::Directory,
-    }));
-    paths.extend(files.into_iter().map(|relative| RipgrepPath {
-        relative,
-        kind: RipgrepPathKind::File,
-    }));
+    // Keep the final representation while deriving parent directories.  The former
+    // files -> directories -> paths pipeline held three overlapping collections.
+    let mut paths = Vec::new();
+    for bytes in output.stdout.split(|byte| *byte == 0) {
+        if bytes.is_empty() {
+            continue;
+        }
+        let relative = strip_dot_prefix(&path_from_bytes(bytes));
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        paths.extend(
+            relative
+                .ancestors()
+                .skip(1)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| RipgrepPath {
+                    relative: path.to_path_buf(),
+                    kind: RipgrepPathKind::Directory,
+                }),
+        );
+        paths.push(RipgrepPath {
+            relative,
+            kind: RipgrepPathKind::File,
+        });
+    }
+    paths.sort_by(|left, right| {
+        ripgrep_kind_rank(left.kind)
+            .cmp(&ripgrep_kind_rank(right.kind))
+            .then_with(|| left.relative.cmp(&right.relative))
+    });
+    paths.dedup_by(|left, right| left.kind == right.kind && left.relative == right.relative);
     Ok(paths)
+}
+
+fn ripgrep_kind_rank(kind: RipgrepPathKind) -> u8 {
+    match kind {
+        RipgrepPathKind::Directory => 0,
+        RipgrepPathKind::File => 1,
+    }
 }
 
 fn strip_dot_prefix(path: &Path) -> PathBuf {

@@ -1,17 +1,18 @@
 use anyhow::Result;
 mod host;
+mod session_store;
 
 use agent_rust::{
-    delete_path, edit_file, glob_files, grep_files, read_path, resolve_search_roots,
-    resolve_target, search_files, system_search_roots, write_file, DeletePathOptions,
-    EditFileOptions, FileSearchOptions, GlobKind, GlobOptions, GrepOptions, ReadLimits,
-    ReadPathOptions, ResolveTargetOptions, SearchKind, SearchMode, SearchStrategy, TargetKind,
-    WriteFileOptions,
+    compact_whitespace, delete_path, edit_file, glob_files, grep_files, read_path,
+    resolve_search_roots, resolve_target, search_files, system_search_roots, write_file,
+    DeletePathOptions, EditFileOptions, FileSearchOptions, GlobKind, GlobOptions, GrepOptions,
+    ReadLimits, ReadPathOptions, ResolveTargetOptions, SearchKind, SearchMode, SearchStrategy,
+    TargetKind, WriteFileOptions,
 };
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -19,7 +20,9 @@ use crossterm::terminal::{
 };
 use host::{
     connected_devices, desktop_action, desktop_capabilities, desktop_clipboard_files,
-    desktop_observe, desktop_resolve, process_list, run_system_command, system_info,
+    desktop_clipboard_image_to_file, desktop_clipboard_read_text, desktop_observe,
+    desktop_open_user_file, desktop_pick_file, desktop_resolve, desktop_screenshot, process_list,
+    run_system_command, system_info,
 };
 #[cfg(test)]
 use host::{valid_bluetooth_address, valid_identifier, valid_path_token, windows_device_category};
@@ -27,25 +30,34 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, WidgetRef, Wrap};
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
+use session_store::{SessionStoreCall, SessionStoreRegistry};
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, BufReader, Read};
+use std::fs::File;
+use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::thread;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
-use tokio::sync::{mpsc as async_mpsc, Semaphore};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::process::{Child as AsyncChild, Command as AsyncProcessCommand};
+use tokio::runtime::Handle as RuntimeHandle;
+use tokio::sync::{mpsc as async_mpsc, watch, Semaphore};
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-rust")]
@@ -56,6 +68,7 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::enum_variant_names)] // Renaming changes the public command contract.
 enum Command {
     Serve(ServeArgs),
     Search(SearchArgs),
@@ -76,6 +89,7 @@ enum Command {
     RunSystemCommand(RunSystemCommandArgs),
     DesktopAction(DesktopActionArgs),
     DesktopClipboardFiles(DesktopClipboardFilesArgs),
+    DesktopScreenshot(DesktopScreenshotArgs),
     Tui(TuiArgs),
 }
 
@@ -96,6 +110,63 @@ struct WorkerResponse {
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
+}
+
+impl WorkerResponse {
+    fn success(id: Option<Value>, result: Value) -> Self {
+        Self {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+            error_code: None,
+            retryable: None,
+            details: None,
+        }
+    }
+
+    fn failure(id: Option<Value>, error: impl ToString) -> Self {
+        Self {
+            id,
+            ok: false,
+            result: None,
+            error: Some(error.to_string()),
+            error_code: None,
+            retryable: None,
+            details: None,
+        }
+    }
+
+    fn store_failure(id: Option<Value>, error: session_store::StoreError) -> Self {
+        let session_store::StoreError {
+            code,
+            message,
+            retryable,
+            details,
+        } = error;
+        let error_code = serde_json::to_value(code)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned));
+        Self {
+            id,
+            ok: false,
+            result: None,
+            error: Some(message),
+            error_code,
+            retryable: Some(retryable),
+            details,
+        }
+    }
+}
+
+thread_local! {
+    static WORKER_CLI: RefCell<clap::Command> = RefCell::new(Cli::command());
 }
 
 #[derive(Debug, Parser)]
@@ -164,6 +235,9 @@ struct DesktopClipboardFilesArgs {
     #[arg(long, default_value = "copy")]
     operation: String,
 }
+
+#[derive(Debug, Parser)]
+struct DesktopScreenshotArgs {}
 
 #[derive(Debug, Parser)]
 struct InspectTargetArgs {
@@ -608,17 +682,17 @@ struct BridgeSession {
     provider: String,
     model: String,
     mode: String,
-    #[serde(default = "provider_controlled_reasoning")]
-    reasoning_effort: String,
     configuration: String,
     #[serde(default = "ready_configuration_state")]
     configuration_state: String,
+    #[serde(default, rename = "context_limit")]
+    _context_limit: Option<i64>,
+    #[serde(default)]
+    pending_attachments: Vec<BridgeAttachment>,
+    #[serde(rename = "tokens")]
+    _tokens: BridgeTokens,
+    #[serde(default)]
     cost_usd: f64,
-    tokens: BridgeTokens,
-}
-
-fn provider_controlled_reasoning() -> String {
-    String::from("provider controlled")
 }
 
 fn ready_configuration_state() -> String {
@@ -627,11 +701,16 @@ fn ready_configuration_state() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 struct BridgeTokens {
-    input: i64,
-    output: i64,
-    reasoning: i64,
-    cache_read: i64,
-    cache_write: i64,
+    #[serde(rename = "input")]
+    _input: i64,
+    #[serde(rename = "output")]
+    _output: i64,
+    #[serde(default, rename = "reasoning")]
+    _reasoning: i64,
+    #[serde(default, rename = "cache_read")]
+    _cache_read: i64,
+    #[serde(default, rename = "cache_write")]
+    _cache_write: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -639,6 +718,17 @@ struct BridgeMessage {
     role: String,
     content: String,
     created_at: String,
+    #[serde(default)]
+    attachments: Vec<BridgeAttachment>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BridgeAttachment {
+    filename: String,
+    mime: String,
+    size_bytes: i64,
+    #[serde(default)]
+    storage_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -765,26 +855,61 @@ struct UiNotice {
     error: bool,
 }
 
+#[derive(Debug, Clone)]
+struct AttachmentHitArea {
+    area: Rect,
+    filename: String,
+    mime: String,
+    size_bytes: i64,
+    storage_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AttachmentPreview {
+    filename: String,
+    mime: String,
+    size_bytes: i64,
+    storage_path: String,
+    text: Option<String>,
+    truncated: bool,
+    scroll: u16,
+}
+
 #[derive(Debug)]
 enum AppEvent {
     StreamFrame(Result<BridgeStreamFrame>),
 }
 
+struct TranscriptCache {
+    show_inline_activity: bool,
+    area: Rect,
+    auto_follow: bool,
+    requested_scroll: u16,
+    paragraph: Paragraph<'static>,
+    attachment_hit_areas: Vec<AttachmentHitArea>,
+}
+
 struct TuiApp {
     snapshot: BridgeSnapshot,
     input: String,
+    attachment_path_mode: bool,
+    attachment_button_area: Option<Rect>,
+    attachment_hit_areas: Vec<AttachmentHitArea>,
+    attachment_preview: Option<AttachmentPreview>,
     status: String,
     scroll: u16,
     auto_follow: bool,
     submitting: bool,
     cancel_requested: bool,
     cancel_signal: Arc<AtomicBool>,
-    active_bridge: Arc<Mutex<Option<Child>>>,
+    active_bridge: Arc<Mutex<Option<AsyncChild>>>,
     queued_prompts: VecDeque<String>,
     activity: Vec<ActivityLine>,
     subagent_run: Option<SubagentRunState>,
     palette: BridgeCompletions,
+    palette_source: Option<Arc<str>>,
     palette_selected: usize,
+    transcript_cache: Option<TranscriptCache>,
     approval_selected: usize,
     current_tool: Option<String>,
     reasoning_text: String,
@@ -792,7 +917,7 @@ struct TuiApp {
     running_prompt: Option<String>,
     secret_provider: Option<String>,
     secret_input: String,
-    notices: Vec<UiNotice>,
+    notices: VecDeque<UiNotice>,
     setup_required: bool,
     gateway_view: Option<GatewayViewState>,
 }
@@ -832,11 +957,22 @@ fn parse_glob_kind(raw: &str) -> GlobKind {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
+    #[cfg(feature = "tokio-console")]
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(console_subscriber::spawn())
+            .init();
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
         Command::Serve(_args) => run_worker().await?,
-        Command::Tui(args) => run_tui(args)?,
+        Command::Tui(args) => run_tui(args).await?,
         command => {
             println!("{}", serde_json::to_string(&run_command(command)?)?);
         }
@@ -845,8 +981,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(
+    feature = "tokio-console",
+    tracing::instrument(name = "worker.run", skip_all)
+)]
 async fn run_worker() -> Result<()> {
     let mut lines = AsyncBufReader::new(tokio::io::stdin()).lines();
+    let session_stores = Arc::new(SessionStoreRegistry::new());
     let concurrency = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4);
@@ -867,16 +1008,46 @@ async fn run_worker() -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let request = match serde_json::from_str::<WorkerRequest>(&line) {
+        let raw_request = match serde_json::from_str::<Value>(&line) {
             Ok(request) => request,
             Err(error) => {
                 response_tx
-                    .send(WorkerResponse {
-                        id: None,
-                        ok: false,
-                        result: None,
-                        error: Some(error.to_string()),
-                    })
+                    .send(WorkerResponse::failure(None, error))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("worker response channel closed"))?;
+                continue;
+            }
+        };
+        let request_id = raw_request.get("id").cloned();
+        if raw_request.get("service").and_then(Value::as_str) == Some("session_store") {
+            let call = match serde_json::from_value::<SessionStoreCall>(raw_request) {
+                Ok(call) => call,
+                Err(error) => {
+                    response_tx
+                        .send(WorkerResponse::failure(request_id, error))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("worker response channel closed"))?;
+                    continue;
+                }
+            };
+            let response_tx = response_tx.clone();
+            let permit = Arc::clone(&permits).acquire_owned().await?;
+            let session_stores = Arc::clone(&session_stores);
+            tokio::spawn(async move {
+                let response = match session_stores.handle(call).await {
+                    Ok(result) => WorkerResponse::success(request_id, result),
+                    Err(error) => WorkerResponse::store_failure(request_id, error),
+                };
+                let _permit = permit;
+                let _ = response_tx.send(response).await;
+            });
+            continue;
+        }
+        let request = match serde_json::from_value::<WorkerRequest>(raw_request) {
+            Ok(request) => request,
+            Err(error) => {
+                response_tx
+                    .send(WorkerResponse::failure(request_id, error))
                     .await
                     .map_err(|_| anyhow::anyhow!("worker response channel closed"))?;
                 continue;
@@ -889,12 +1060,7 @@ async fn run_worker() -> Result<()> {
             let response =
                 match tokio::task::spawn_blocking(move || run_worker_request(request)).await {
                     Ok(response) => response,
-                    Err(error) => WorkerResponse {
-                        id: request_id,
-                        ok: false,
-                        result: None,
-                        error: Some(error.to_string()),
-                    },
+                    Err(error) => WorkerResponse::failure(request_id, error),
                 };
             let _permit = permit;
             let _ = response_tx.send(response).await;
@@ -903,6 +1069,7 @@ async fn run_worker() -> Result<()> {
 
     drop(response_tx);
     writer.await??;
+    session_stores.close().await;
     Ok(())
 }
 
@@ -926,14 +1093,37 @@ mod worker_tests {
         assert!(response.result.is_some());
         assert!(response.error.is_none());
     }
+
+    #[test]
+    fn worker_parser_recovers_after_invalid_request() {
+        let invalid = run_worker_request(WorkerRequest {
+            id: None,
+            args: vec![String::from("not-a-command")],
+        });
+        let valid = run_worker_request(WorkerRequest {
+            id: None,
+            args: vec![String::from("system-info")],
+        });
+
+        assert!(!invalid.ok);
+        assert!(valid.ok);
+    }
 }
 
+#[cfg_attr(
+    feature = "tokio-console",
+    tracing::instrument(name = "worker.request", skip_all)
+)]
 fn run_worker_request(request: WorkerRequest) -> WorkerResponse {
     let mut argv = Vec::with_capacity(request.args.len() + 1);
     argv.push("agent-rust".to_string());
     argv.extend(request.args);
 
-    let result = Cli::try_parse_from(argv)
+    let result = WORKER_CLI
+        .with_borrow_mut(|command| {
+            let mut matches = command.try_get_matches_from_mut(argv)?;
+            Cli::from_arg_matches_mut(&mut matches)
+        })
         .map_err(|error| anyhow::anyhow!(error.to_string()))
         .and_then(|cli| match cli.command {
             Command::Serve(_) | Command::Tui(_) => Err(anyhow::anyhow!(
@@ -943,18 +1133,8 @@ fn run_worker_request(request: WorkerRequest) -> WorkerResponse {
         });
 
     match result {
-        Ok(value) => WorkerResponse {
-            id: request.id,
-            ok: true,
-            result: Some(value),
-            error: None,
-        },
-        Err(error) => WorkerResponse {
-            id: request.id,
-            ok: false,
-            result: None,
-            error: Some(error.to_string()),
-        },
+        Ok(value) => WorkerResponse::success(request.id, value),
+        Err(error) => WorkerResponse::failure(request.id, error),
     }
 }
 
@@ -997,6 +1177,7 @@ fn run_command(command: Command) -> Result<Value> {
             &args.paths,
             &args.operation,
         )?)?),
+        Command::DesktopScreenshot(_) => Ok(serde_json::to_value(desktop_screenshot()?)?),
         Command::Search(args) => {
             let mut options = FileSearchOptions::new(args.query);
 
@@ -1128,8 +1309,13 @@ fn run_command(command: Command) -> Result<Value> {
     }
 }
 
-fn run_tui(args: TuiArgs) -> Result<()> {
-    let initial = call_bridge(&args, "snapshot", None)?;
+async fn run_tui(args: TuiArgs) -> Result<()> {
+    let runtime = RuntimeHandle::current();
+    tokio::task::block_in_place(move || run_tui_blocking(Arc::new(args), runtime))
+}
+
+fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
+    let initial = call_bridge(args.as_ref(), "snapshot", None)?;
     let snapshot = initial
         .snapshot
         .ok_or_else(|| anyhow::anyhow!("Bridge did not return a snapshot."))?;
@@ -1154,16 +1340,26 @@ fn run_tui(args: TuiArgs) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_tui_loop(
         &mut terminal,
         args,
+        runtime,
         TuiApp {
             snapshot,
             input: String::new(),
+            attachment_path_mode: false,
+            attachment_button_area: None,
+            attachment_hit_areas: Vec::new(),
+            attachment_preview: None,
             status: initial_status,
             scroll: 0,
             auto_follow: true,
@@ -1175,7 +1371,9 @@ fn run_tui(args: TuiArgs) -> Result<()> {
             activity: Vec::new(),
             subagent_run: None,
             palette: BridgeCompletions::default(),
+            palette_source: None,
             palette_selected: 0,
+            transcript_cache: None,
             approval_selected: 0,
             current_tool: None,
             reasoning_text: String::new(),
@@ -1183,7 +1381,7 @@ fn run_tui(args: TuiArgs) -> Result<()> {
             running_prompt: None,
             secret_provider: None,
             secret_input: String::new(),
-            notices: initial_notices,
+            notices: initial_notices.into(),
             setup_required: initial_needs_setup,
             gateway_view: None,
         },
@@ -1192,6 +1390,7 @@ fn run_tui(args: TuiArgs) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -1201,15 +1400,26 @@ fn run_tui(args: TuiArgs) -> Result<()> {
 
 fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    args: TuiArgs,
+    args: Arc<TuiArgs>,
+    runtime: RuntimeHandle,
     mut app: TuiApp,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<AppEvent>();
-    refresh_palette(&args, &mut app);
+    let (palette_tx, palette_rx) = watch::channel(None::<Arc<str>>);
+    let (palette_result_tx, palette_result_rx) =
+        mpsc::channel::<(Arc<str>, Result<BridgeResponse>)>();
+    spawn_palette_worker(&runtime, Arc::clone(&args), palette_rx, palette_result_tx);
+    request_palette_refresh(&palette_tx, &mut app);
+    let mut needs_redraw = true;
 
     loop {
         while let Ok(event) = rx.try_recv() {
             handle_app_event(&mut app, event);
+            needs_redraw = true;
+        }
+        while let Ok((prompt, result)) = palette_result_rx.try_recv() {
+            apply_palette_result(&mut app, &prompt, result);
+            needs_redraw = true;
         }
 
         if !app.submitting
@@ -1218,11 +1428,15 @@ fn run_tui_loop(
             && app.snapshot.approvals.is_empty()
         {
             if let Some(prompt) = app.queued_prompts.pop_front() {
-                start_prompt_submission(&args, &tx, &mut app, prompt);
+                start_prompt_submission(&runtime, &args, &tx, &mut app, prompt);
+                needs_redraw = true;
             }
         }
 
-        terminal.draw(|frame| draw_app(frame, &app))?;
+        if needs_redraw {
+            terminal.draw(|frame| draw_app(frame, &mut app))?;
+            needs_redraw = false;
+        }
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -1234,13 +1448,81 @@ fn run_tui_loop(
                 match mouse.kind {
                     MouseEventKind::ScrollUp => scroll_active_view(&mut app, false),
                     MouseEventKind::ScrollDown => scroll_active_view(&mut app, true),
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                        if app.secret_provider.is_none()
+                            && app.snapshot.approvals.is_empty()
+                            && app.attachment_preview.is_none()
+                            && app.attachment_hit_areas.iter().any(|target| {
+                                mouse_in_rect(mouse.column, mouse.row, target.area)
+                            }) =>
+                    {
+                        open_clicked_attachment(&mut app, mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                        if app.secret_provider.is_none()
+                            && app.snapshot.approvals.is_empty()
+                            && app.attachment_preview.is_none()
+                            && app.attachment_button_area.is_some_and(|area| {
+                                mouse_in_rect(mouse.column, mouse.row, area)
+                            }) =>
+                    {
+                        open_attachment_picker(&runtime, &args, &tx, &mut app);
+                    }
                     _ => {}
                 }
+                needs_redraw = true;
+                continue;
+            }
+            Event::Paste(text) => {
+                insert_composer_paste(&mut app, &text);
+                needs_redraw = true;
+                continue;
+            }
+            Event::Resize(_, _) => {
+                needs_redraw = true;
                 continue;
             }
             _ => continue,
         };
-        if key.kind != KeyEventKind::Press {
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        needs_redraw = true;
+
+        if app.attachment_preview.is_some() && app.snapshot.approvals.is_empty() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.attachment_preview = None;
+                    app.status = String::from("Ready");
+                }
+                KeyCode::Enter | KeyCode::Char('o') => open_preview_in_system_viewer(&mut app),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(preview) = app.attachment_preview.as_mut() {
+                        preview.scroll = preview.scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(preview) = app.attachment_preview.as_mut() {
+                        preview.scroll = preview.scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(preview) = app.attachment_preview.as_mut() {
+                        preview.scroll = preview.scroll.saturating_add(10);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(preview) = app.attachment_preview.as_mut() {
+                        preview.scroll = preview.scroll.saturating_sub(10);
+                    }
+                }
+                KeyCode::Home => {
+                    if let Some(preview) = app.attachment_preview.as_mut() {
+                        preview.scroll = 0;
+                    }
+                }
+                _ => {}
+            }
             continue;
         }
 
@@ -1287,7 +1569,7 @@ fn run_tui_loop(
                         view.scroll = 0;
                     }
                 }
-                KeyCode::Char('r') => open_gateway_view(&args, &mut app),
+                KeyCode::Char('r') => open_gateway_view(args.as_ref(), &mut app),
                 _ => {}
             }
             continue;
@@ -1301,14 +1583,19 @@ fn run_tui_loop(
                     app.status = String::from("API key entry cancelled");
                     continue;
                 }
+                if app.attachment_path_mode {
+                    app.attachment_path_mode = false;
+                    app.input.clear();
+                    app.status = String::from("Attachment cancelled");
+                    continue;
+                }
                 if !app.snapshot.approvals.is_empty() {
                     apply_approval_action(&args, &mut app, "deny");
                     continue;
                 }
                 if palette_is_open(&app) || !app.input.is_empty() {
                     app.input.clear();
-                    app.palette = BridgeCompletions::default();
-                    app.palette_selected = 0;
+                    clear_palette(&mut app);
                     continue;
                 }
                 if app.submitting {
@@ -1353,12 +1640,27 @@ fn run_tui_loop(
                     app.approval_selected = app.approval_selected.saturating_sub(1);
                 }
             }
+            KeyCode::F(4) if app.secret_provider.is_none() && app.snapshot.approvals.is_empty() => {
+                open_attachment_picker(&runtime, &args, &tx, &mut app);
+            }
+            KeyCode::Char('o')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.secret_provider.is_none()
+                    && app.snapshot.approvals.is_empty() =>
+            {
+                open_attachment_picker(&runtime, &args, &tx, &mut app);
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                paste_clipboard_into_composer(&runtime, &args, &tx, &mut app);
+            }
             KeyCode::Backspace => {
                 if app.secret_provider.is_some() {
                     app.secret_input.pop();
                 } else {
                     app.input.pop();
-                    refresh_palette(&args, &mut app);
+                    if !app.attachment_path_mode {
+                        request_palette_refresh(&palette_tx, &mut app);
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -1390,19 +1692,21 @@ fn run_tui_loop(
                     app.reasoning_text.clear();
                     app.streaming_text.clear();
                     app.current_tool = None;
+                    invalidate_transcript(&mut app);
                     let tx_clone = tx.clone();
                     let err_tx = tx.clone();
                     let args_clone = args.clone();
                     let active_bridge = Arc::clone(&app.active_bridge);
                     let cancel_signal = Arc::clone(&app.cancel_signal);
-                    thread::spawn(move || {
+                    runtime.spawn(async move {
                         let result = stream_bridge_submit(
-                            &args_clone,
+                            args_clone.as_ref(),
                             &prompt,
                             tx_clone,
                             active_bridge,
                             cancel_signal,
-                        );
+                        )
+                        .await;
                         if let Err(err) = result {
                             let _ = err_tx.send(AppEvent::StreamFrame(Err(err)));
                         }
@@ -1413,9 +1717,24 @@ fn run_tui_loop(
                     apply_approval_action(&args, &mut app, "approve");
                     continue;
                 }
-                if !app.palette.entries.is_empty() && app.input.starts_with('/') {
+                if app.attachment_path_mode {
+                    let path = app.input.trim().to_string();
+                    if path.is_empty() {
+                        app.status = String::from("Attachment cancelled — no path entered");
+                        app.attachment_path_mode = false;
+                        continue;
+                    }
+                    app.attachment_path_mode = false;
+                    app.input.clear();
+                    submit_attachment_path(&runtime, &args, &tx, &mut app, path);
+                    continue;
+                }
+                if palette_is_open(&app) {
+                    let query = palette_context(&app.input)
+                        .map(|context| context.query)
+                        .unwrap_or_default();
                     app.palette_selected =
-                        closest_selectable_palette_index(&app.palette, app.palette_selected)
+                        closest_selectable_palette_index(&app.palette, query, app.palette_selected)
                             .unwrap_or(0);
                     let selected = app.palette.entries.get(app.palette_selected).cloned();
                     if let Some(entry) = selected {
@@ -1423,7 +1742,7 @@ fn run_tui_loop(
                             app.input = entry.complete_to;
                         } else {
                             app.input = entry.complete_to;
-                            refresh_palette(&args, &mut app);
+                            request_palette_refresh(&palette_tx, &mut app);
                             continue;
                         }
                     }
@@ -1435,8 +1754,7 @@ fn run_tui_loop(
                 if app.submitting || bridge_process_active(&app) {
                     app.input.clear();
                     let queued_count = enqueue_prompt(&mut app.queued_prompts, prompt);
-                    app.palette = BridgeCompletions::default();
-                    app.palette_selected = 0;
+                    clear_palette(&mut app);
                     app.status = format!("Queued {} prompt(s)", queued_count);
                     continue;
                 }
@@ -1445,17 +1763,19 @@ fn run_tui_loop(
                 }
                 if prompt == "/gateway" {
                     app.input.clear();
-                    app.palette = BridgeCompletions::default();
-                    app.palette_selected = 0;
-                    open_gateway_view(&args, &mut app);
+                    clear_palette(&mut app);
+                    open_gateway_view(args.as_ref(), &mut app);
                     continue;
                 }
-                start_prompt_submission(&args, &tx, &mut app, prompt);
+                start_prompt_submission(&runtime, &args, &tx, &mut app, prompt);
             }
             KeyCode::Up => {
                 if palette_is_open(&app) {
+                    let query = palette_context(&app.input)
+                        .map(|context| context.query)
+                        .unwrap_or_default();
                     app.palette_selected =
-                        previous_palette_index(&app.palette, app.palette_selected);
+                        previous_palette_index(&app.palette, query, app.palette_selected);
                 } else {
                     app.auto_follow = false;
                     app.scroll = app.scroll.saturating_sub(1);
@@ -1463,15 +1783,23 @@ fn run_tui_loop(
             }
             KeyCode::Down => {
                 if palette_is_open(&app) {
-                    app.palette_selected = next_palette_index(&app.palette, app.palette_selected);
+                    let query = palette_context(&app.input)
+                        .map(|context| context.query)
+                        .unwrap_or_default();
+                    app.palette_selected =
+                        next_palette_index(&app.palette, query, app.palette_selected);
                 } else {
                     app.scroll = app.scroll.saturating_add(1);
                 }
             }
             KeyCode::PageUp => {
                 if palette_is_open(&app) {
+                    let query = palette_context(&app.input)
+                        .map(|context| context.query)
+                        .unwrap_or_default();
                     app.palette_selected = move_palette_index(
                         &app.palette,
+                        query,
                         app.palette_selected,
                         -(PALETTE_PAGE_SIZE as isize),
                     );
@@ -1482,8 +1810,12 @@ fn run_tui_loop(
             }
             KeyCode::PageDown => {
                 if palette_is_open(&app) {
+                    let query = palette_context(&app.input)
+                        .map(|context| context.query)
+                        .unwrap_or_default();
                     app.palette_selected = move_palette_index(
                         &app.palette,
+                        query,
                         app.palette_selected,
                         PALETTE_PAGE_SIZE as isize,
                     );
@@ -1493,8 +1825,11 @@ fn run_tui_loop(
             }
             KeyCode::Home => {
                 if palette_is_open(&app) {
+                    let query = palette_context(&app.input)
+                        .map(|context| context.query)
+                        .unwrap_or_default();
                     app.palette_selected =
-                        first_selectable_palette_index(&app.palette).unwrap_or(0);
+                        first_selectable_palette_index(&app.palette, query).unwrap_or(0);
                 } else {
                     app.scroll = 0;
                     app.auto_follow = false;
@@ -1502,7 +1837,11 @@ fn run_tui_loop(
             }
             KeyCode::End => {
                 if palette_is_open(&app) {
-                    app.palette_selected = last_selectable_palette_index(&app.palette).unwrap_or(0);
+                    let query = palette_context(&app.input)
+                        .map(|context| context.query)
+                        .unwrap_or_default();
+                    app.palette_selected =
+                        last_selectable_palette_index(&app.palette, query).unwrap_or(0);
                 } else {
                     app.auto_follow = true;
                 }
@@ -1511,21 +1850,26 @@ fn run_tui_loop(
                 if app.secret_provider.is_some() {
                     continue;
                 }
+                let query = palette_context(&app.input)
+                    .map(|context| context.query)
+                    .unwrap_or_default();
                 app.palette_selected =
-                    closest_selectable_palette_index(&app.palette, app.palette_selected)
+                    closest_selectable_palette_index(&app.palette, query, app.palette_selected)
                         .unwrap_or(0);
                 if let Some(entry) = app.palette.entries.get(app.palette_selected) {
                     app.input = entry.complete_to.clone();
-                    refresh_palette(&args, &mut app);
+                    request_palette_refresh(&palette_tx, &mut app);
                 }
             }
-            KeyCode::Char(ch) => {
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                    if app.secret_provider.is_some() {
-                        app.secret_input.push(ch);
-                    } else {
-                        app.input.push(ch);
-                        refresh_palette(&args, &mut app);
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if app.secret_provider.is_some() {
+                    app.secret_input.push(ch);
+                } else {
+                    app.input.push(ch);
+                    if !app.attachment_path_mode {
+                        request_palette_refresh(&palette_tx, &mut app);
                     }
                 }
             }
@@ -1533,6 +1877,9 @@ fn run_tui_loop(
         }
     }
 
+    if app.submitting || bridge_process_active(&app) {
+        request_active_stop(&mut app);
+    }
     Ok(())
 }
 
@@ -1562,20 +1909,264 @@ fn enqueue_prompt(queue: &mut VecDeque<String>, prompt: String) -> usize {
     queue.len()
 }
 
+fn mouse_in_rect(column: u16, row: u16, area: Rect) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn insert_composer_paste(app: &mut TuiApp, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if app.secret_provider.is_some() {
+        app.secret_input.push_str(text);
+    } else {
+        app.input.push_str(text);
+        app.status = String::from("Pasted text — review and press Enter to send");
+    }
+}
+
+fn attachment_bridge_prompt(path: &str) -> String {
+    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("/__nym_attach \"{escaped}\"")
+}
+
+fn submit_attachment_path(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    app: &mut TuiApp,
+    path: String,
+) {
+    if app.submitting || bridge_process_active(app) {
+        app.status = String::from("Finish the current task before adding a file");
+        return;
+    }
+    let draft = std::mem::take(&mut app.input);
+    start_prompt_submission(runtime, args, tx, app, attachment_bridge_prompt(&path));
+    app.input = draft;
+    app.status = format!("Adding {}...", attachment_display_name(&path));
+}
+
+fn attachment_display_name(path: &str) -> Cow<'_, str> {
+    PathBuf::from(path)
+        .file_name()
+        .map(|name| Cow::Owned(name.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| Cow::Borrowed(path))
+}
+
+const ATTACHMENT_PREVIEW_BYTES: u64 = 256 * 1024;
+
+fn open_clicked_attachment(app: &mut TuiApp, column: u16, row: u16) {
+    let Some(target) = app
+        .attachment_hit_areas
+        .iter()
+        .find(|target| mouse_in_rect(column, row, target.area))
+        .cloned()
+    else {
+        return;
+    };
+    let Some(path) = target.storage_path.as_deref() else {
+        app.status = format!("{} cannot be opened from this session", target.filename);
+        return;
+    };
+    match load_attachment_preview(&target, path) {
+        Ok(preview) => {
+            app.status = format!("Previewing {}", target.filename);
+            app.attachment_preview = Some(preview);
+        }
+        Err(err) => {
+            app.status = format!("{}: {}", target.filename, clip_status(&err.to_string(), 72));
+        }
+    }
+}
+
+fn load_attachment_preview(target: &AttachmentHitArea, path: &str) -> Result<AttachmentPreview> {
+    let text_like = target.mime.starts_with("text/")
+        || matches!(
+            target.mime.as_str(),
+            "application/json" | "application/xml" | "application/javascript"
+        );
+    let (text, truncated) = if text_like {
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(ATTACHMENT_PREVIEW_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let truncated = bytes.len() as u64 > ATTACHMENT_PREVIEW_BYTES;
+        if truncated {
+            bytes.truncate(ATTACHMENT_PREVIEW_BYTES as usize);
+        }
+        (
+            Some(String::from_utf8_lossy(&bytes).into_owned()),
+            truncated,
+        )
+    } else {
+        if !std::path::Path::new(path).is_file() {
+            return Err(anyhow::anyhow!(
+                "The stored attachment is no longer available"
+            ));
+        }
+        (None, false)
+    };
+    Ok(AttachmentPreview {
+        filename: target.filename.clone(),
+        mime: target.mime.clone(),
+        size_bytes: target.size_bytes,
+        storage_path: path.to_string(),
+        text,
+        truncated,
+        scroll: 0,
+    })
+}
+
+fn open_preview_in_system_viewer(app: &mut TuiApp) {
+    let Some(preview) = app.attachment_preview.as_ref() else {
+        return;
+    };
+    match desktop_open_user_file(&preview.storage_path) {
+        Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+            app.status = format!("Sent {} to the system viewer", preview.filename);
+        }
+        Ok(value) => {
+            let error = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("The system viewer could not open this attachment");
+            app.status = format!("{}: {}", preview.filename, clip_status(error, 72));
+        }
+        Err(err) => {
+            app.status = format!(
+                "{}: {}",
+                preview.filename,
+                clip_status(&err.to_string(), 72)
+            );
+        }
+    }
+}
+
+fn open_attachment_picker(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    app: &mut TuiApp,
+) {
+    if app.submitting || bridge_process_active(app) {
+        app.status = String::from("Finish the current task before adding a file");
+        return;
+    }
+    match desktop_pick_file() {
+        Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+            if let Some(path) = value.get("path").and_then(Value::as_str) {
+                submit_attachment_path(runtime, args, tx, app, path.to_string());
+                return;
+            }
+            app.status = String::from("The file picker did not return a file");
+        }
+        Ok(value) if value.get("cancelled").and_then(Value::as_bool) == Some(true) => {
+            app.status = String::from("File selection cancelled");
+        }
+        Ok(value) => {
+            app.attachment_path_mode = true;
+            app.input.clear();
+            clear_palette(app);
+            let guidance = value
+                .get("guidance")
+                .and_then(Value::as_str)
+                .unwrap_or("No native picker is available");
+            app.status = format!("{guidance} Enter a file path instead");
+        }
+        Err(err) => {
+            app.attachment_path_mode = true;
+            app.input.clear();
+            clear_palette(app);
+            app.status = format!(
+                "File picker unavailable: {}. Enter a file path instead",
+                clip_status(&err.to_string(), 64)
+            );
+        }
+    }
+}
+
+fn paste_clipboard_into_composer(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    app: &mut TuiApp,
+) {
+    if app.secret_provider.is_some() || !app.snapshot.approvals.is_empty() {
+        return;
+    }
+    if app.submitting || bridge_process_active(app) {
+        if !paste_clipboard_text(app) {
+            app.status = String::from("Finish the current task before attaching a clipboard image");
+        }
+        return;
+    }
+    let image_result = desktop_clipboard_image_to_file();
+    match &image_result {
+        Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+            if let Some(path) = value.get("path").and_then(Value::as_str) {
+                submit_attachment_path(runtime, args, tx, app, path.to_string());
+                return;
+            }
+            app.status = String::from("Clipboard image could not be prepared for attachment");
+            return;
+        }
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    if paste_clipboard_text(app) {
+        return;
+    }
+    match image_result {
+        Ok(value) => {
+            app.status = value
+                .get("guidance")
+                .or_else(|| value.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or("Clipboard has no supported text or image to paste")
+                .to_string();
+        }
+        Err(err) => {
+            app.status = format!(
+                "Clipboard paste unavailable: {}",
+                clip_status(&err.to_string(), 72)
+            );
+        }
+    }
+}
+
+fn paste_clipboard_text(app: &mut TuiApp) -> bool {
+    if let Ok(value) = desktop_clipboard_read_text() {
+        if let Some(text) = value
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            app.input.push_str(text);
+            app.status = String::from("Pasted text from the clipboard");
+            return true;
+        }
+    }
+    false
+}
+
 fn request_active_stop(app: &mut TuiApp) {
     app.cancel_requested = true;
     app.cancel_signal.store(true, Ordering::SeqCst);
     app.status = String::from("Stopping current task...");
-    if let Ok(mut active) = app.active_bridge.lock() {
-        if let Some(child) = active.as_mut() {
-            let _ = interrupt_process_tree(child);
+    invalidate_transcript(app);
+    if let Ok(active) = app.active_bridge.lock() {
+        if let Some(child) = active.as_ref() {
+            if let Some(pid) = child.id() {
+                let _ = interrupt_process_tree_pid(pid);
+            }
         }
     }
 }
 
 #[cfg(unix)]
-fn interrupt_process_tree(child: &mut Child) -> io::Result<()> {
-    let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGINT) };
+fn interrupt_process_tree_pid(pid: u32) -> io::Result<()> {
+    let result = unsafe { libc::kill(-(pid as i32), libc::SIGINT) };
     if result == 0 {
         Ok(())
     } else {
@@ -1584,14 +2175,14 @@ fn interrupt_process_tree(child: &mut Child) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn interrupt_process_tree(child: &mut Child) -> io::Result<()> {
+fn interrupt_process_tree_pid(pid: u32) -> io::Result<()> {
     let status = ProcessCommand::new("taskkill")
-        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
         .status()?;
     if status.success() {
         Ok(())
     } else {
-        child.kill()
+        Err(io::Error::other("Could not stop the bridge process tree"))
     }
 }
 
@@ -1603,7 +2194,8 @@ fn bridge_process_active(app: &TuiApp) -> bool {
 }
 
 fn start_prompt_submission(
-    args: &TuiArgs,
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
     tx: &mpsc::Sender<AppEvent>,
     app: &mut TuiApp,
     prompt: String,
@@ -1620,45 +2212,54 @@ fn start_prompt_submission(
     app.reasoning_text.clear();
     app.streaming_text.clear();
     app.current_tool = None;
-    app.palette = BridgeCompletions::default();
-    app.palette_selected = 0;
+    clear_palette(app);
+    invalidate_transcript(app);
     let tx_clone = tx.clone();
     let err_tx = tx.clone();
-    let args_clone = args.clone();
+    let args_clone = Arc::clone(args);
     let active_bridge = Arc::clone(&app.active_bridge);
     let cancel_signal = Arc::clone(&app.cancel_signal);
-    thread::spawn(move || {
-        let result =
-            stream_bridge_submit(&args_clone, &prompt, tx_clone, active_bridge, cancel_signal);
+    runtime.spawn(async move {
+        let result = stream_bridge_submit(
+            args_clone.as_ref(),
+            &prompt,
+            tx_clone,
+            active_bridge,
+            cancel_signal,
+        )
+        .await;
         if let Err(err) = result {
             let _ = err_tx.send(AppEvent::StreamFrame(Err(err)));
         }
     });
 }
 
-fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
+fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
+    app.attachment_hit_areas.clear();
     let area = frame.area();
-    let chunks = Layout::default()
+    let [header_area, content_area, status_area, composer_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
-        .split(area);
-    let show_sidebar = area.width >= 92;
-    let body = if show_sidebar {
+        .areas(area);
+    let show_sidebar = should_show_sidebar(area.width, app);
+    let [conversation_area, sidebar_area] = if show_sidebar {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(48), Constraint::Length(34)])
-            .split(chunks[1])
+            .areas(content_area)
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(0)])
-            .split(chunks[1])
+            .areas(content_area)
     };
+
+    render_transcript(frame, conversation_area, app, true);
 
     let session = &app.snapshot.session;
     let header_lines = vec![
@@ -1685,14 +2286,14 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 Style::default().fg(Color::Gray),
             ),
             Span::styled("  session ", Style::default().fg(Color::DarkGray)),
-            Span::styled(session.id.clone(), Style::default().fg(Color::Gray)),
+            Span::styled(session.id.as_str(), Style::default().fg(Color::Gray)),
             Span::styled("  model ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{}/{}", session.provider, session.model),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled("  mode ", Style::default().fg(Color::DarkGray)),
-            Span::styled(session.mode.clone(), Style::default().fg(Color::Magenta)),
+            Span::styled(session.mode.as_str(), Style::default().fg(Color::Magenta)),
         ]),
     ];
     frame.render_widget(
@@ -1701,45 +2302,28 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 .borders(Borders::BOTTOM)
                 .border_style(Style::default().fg(Color::DarkGray)),
         ),
-        chunks[0],
+        header_area,
     );
-
-    let transcript_lines = transcript_text(&app.snapshot, app, !show_sidebar);
-    let max_scroll = transcript_max_scroll(
-        &transcript_lines,
-        body[0].width.saturating_sub(2),
-        body[0].height.saturating_sub(2),
-    );
-    let scroll = if app.auto_follow {
-        max_scroll
-    } else {
-        app.scroll.min(max_scroll)
-    };
-    let transcript_title = if app.submitting {
-        format!(" {} ", clip_status(&app.status, 42))
-    } else {
-        String::from(" conversation ")
-    };
-    let transcript = Paragraph::new(transcript_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(if app.submitting {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                }))
-                .title(transcript_title),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(transcript, body[0]);
 
     if show_sidebar {
-        draw_sidebar(frame, body[1], app);
+        draw_sidebar(frame, sidebar_area, app);
     }
 
     let (state_label, state_color) = ui_state_badge(app);
+    let cost_text = footer_cost_text(app.snapshot.session.cost_usd);
+    let cost_width = cost_text.len() as u16;
+    let cost_gap = if area.width > cost_width + 2 {
+        cost_width + 1
+    } else {
+        0
+    };
+    let left_status_area = Rect {
+        x: status_area.x,
+        y: status_area.y,
+        width: status_area.width.saturating_sub(cost_gap),
+        height: status_area.height,
+    };
+    let status_limit = left_status_area.width.saturating_sub(40) as usize;
     let status = Line::from(vec![
         Span::styled(
             format!(" {state_label} "),
@@ -1750,18 +2334,8 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         ),
         Span::raw(" "),
         Span::styled(
-            clip_status(&app.status, 54),
+            clip_status(&app.status, status_limit.max(16)),
             Style::default().fg(Color::White),
-        ),
-        Span::styled(
-            format!(
-                "  tokens {}  reasoning {}  cache {}  ${:.4}",
-                format_number(session.tokens.input + session.tokens.output),
-                format_number(session.tokens.reasoning),
-                format_number(session.tokens.cache_read + session.tokens.cache_write),
-                session.cost_usd,
-            ),
-            Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
             format!(
@@ -1775,66 +2349,134 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
             Style::default().fg(Color::DarkGray),
         ),
     ]);
-    frame.render_widget(Paragraph::new(status), chunks[2]);
+    frame.render_widget(Paragraph::new(status), left_status_area);
+    if cost_gap > 0 {
+        let cost_area = Rect {
+            x: status_area.x + status_area.width.saturating_sub(cost_width),
+            y: status_area.y,
+            width: cost_width,
+            height: status_area.height,
+        };
+        frame.render_widget(
+            Paragraph::new(cost_text).style(Style::default().fg(Color::Green)),
+            cost_area,
+        );
+    }
 
     let input_title = if let Some(provider) = app.secret_provider.as_deref() {
         format!(
             " {} API key (kept in memory) ",
             provider_display_name(provider)
         )
+    } else if app.attachment_path_mode {
+        String::from(" attach file path · Enter adds it · Esc cancels ")
     } else if install_command_is_confirmed(&app.input) {
         String::from(" confirm local install · Enter starts · Esc cancels ")
     } else if app.submitting {
         String::from(" message (agent working · Enter queues) ")
     } else if !app.palette.entries.is_empty() && app.input.starts_with('/') {
-        String::from(" command ")
+        String::from(" Commands ")
     } else {
-        String::from(" message ")
+        let count = app.snapshot.session.pending_attachments.len();
+        if count == 0 {
+            String::from(" Message ")
+        } else {
+            format!(
+                " Message · {count} {} ",
+                if count == 1 { "file" } else { "files" }
+            )
+        }
     };
+    let controls_enabled = app.secret_provider.is_none()
+        && app.snapshot.approvals.is_empty()
+        && !app.attachment_path_mode
+        && !app.submitting;
+    let composer_inner = Rect {
+        x: composer_area.x.saturating_add(1),
+        y: composer_area.y.saturating_add(1),
+        width: composer_area.width.saturating_sub(2),
+        height: composer_area.height.saturating_sub(2),
+    };
+    let attachment_width = 4;
+    let [attachment_area, input_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(attachment_width), Constraint::Min(12)])
+        .areas(composer_inner);
+    app.attachment_button_area = Some(attachment_area);
+
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if app.submitting {
+                Color::DarkGray
+            } else if app.secret_provider.is_some() {
+                Color::Yellow
+            } else if app.attachment_path_mode {
+                Color::Cyan
+            } else {
+                Color::Rgb(62, 68, 78)
+            }))
+            .title(input_title),
+        composer_area,
+    );
     let visible_input = if app.secret_provider.is_some() {
-        "•".repeat(app.secret_input.chars().count())
+        Cow::Owned("•".repeat(app.secret_input.chars().count()))
     } else {
-        app.input.clone()
+        Cow::Borrowed(app.input.as_str())
     };
-    let input_text = Line::from(vec![
+    let show_attachment_chips =
+        !app.snapshot.session.pending_attachments.is_empty() && app.secret_provider.is_none();
+    let mut input_lines = Vec::with_capacity(if show_attachment_chips { 2 } else { 1 });
+    if show_attachment_chips {
+        let (line, hit_areas) = attachment_chip_line(
+            &app.snapshot.session.pending_attachments,
+            input_area.x,
+            input_area.y,
+            input_area.width,
+        );
+        app.attachment_hit_areas.extend(hit_areas);
+        input_lines.push(line);
+    }
+    input_lines.push(Line::from(vec![
         Span::styled(
-            "> ",
+            if app.attachment_path_mode {
+                "path: "
+            } else {
+                "› "
+            },
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(visible_input.as_str()),
-    ]);
-    let input = Paragraph::new(input_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(if app.submitting {
-                    Color::DarkGray
-                } else if app.secret_provider.is_some() {
-                    Color::Yellow
-                } else {
-                    Color::Cyan
-                }))
-                .title(input_title),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(input, chunks[3]);
+        Span::raw(visible_input.as_ref()),
+    ]));
+    let input = Paragraph::new(input_lines).wrap(Wrap { trim: false });
+    frame.render_widget(input, input_area);
 
+    frame.render_widget(
+        Paragraph::new(attachment_button_text(controls_enabled))
+            .alignment(ratatui::layout::Alignment::Center),
+        attachment_area,
+    );
     if palette_is_open(app) {
-        let max_popup_height = chunks[3].y.saturating_sub(area.y).clamp(3, 20);
-        let popup_height = (app.palette.entries.len() as u16 + 2).min(max_popup_height);
+        let query = palette_context(&app.input)
+            .map(|context| context.query)
+            .unwrap_or_default();
+        let palette_len = visible_palette_indices(&app.palette, query).count();
+        let max_popup_height = input_area.y.saturating_sub(area.y).clamp(3, 20);
+        let popup_height = (palette_len as u16 + 2).min(max_popup_height);
         let visible_count = popup_height.saturating_sub(2) as usize;
-        let popup_y = chunks[3].y.saturating_sub(popup_height);
+        let popup_y = input_area.y.saturating_sub(popup_height);
         let popup_area = Rect {
-            x: chunks[3].x,
+            x: input_area.x,
             y: popup_y,
-            width: body[0].width.min(chunks[3].width).max(20),
+            width: conversation_area.width.min(input_area.width).max(20),
             height: popup_height,
         };
         frame.render_widget(Clear, popup_area);
         let popup = Paragraph::new(palette_text(
             &app.palette,
+            query,
             app.palette_selected,
             visible_count,
             popup_area.width,
@@ -1845,7 +2487,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
                 .border_style(Style::default().fg(Color::Magenta))
                 .title(format!(
                     " {} ",
-                    palette_title(&app.palette, app.palette_selected, visible_count)
+                    palette_title(&app.palette, query, app.palette_selected, visible_count)
                 )),
         )
         .wrap(Wrap { trim: false });
@@ -1856,18 +2498,83 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &TuiApp) {
         draw_gateway_dialog(frame, area, view);
     }
 
+    if let Some(preview) = app.attachment_preview.as_ref() {
+        draw_attachment_preview(frame, area, preview);
+    }
+
     if !app.snapshot.approvals.is_empty() {
         draw_approval_dialog(frame, area, app);
     }
 
-    let cursor_x = chunks[3]
+    let cursor_x = input_area
         .x
-        .saturating_add(3)
+        .saturating_add(2)
         .saturating_add(visible_input.chars().count() as u16);
-    let cursor_y = chunks[3].y.saturating_add(1);
-    if app.snapshot.approvals.is_empty() && app.gateway_view.is_none() {
-        frame.set_cursor_position((cursor_x.min(chunks[3].right().saturating_sub(2)), cursor_y));
+    let cursor_y = input_area
+        .y
+        .saturating_add(u16::from(show_attachment_chips));
+    if app.snapshot.approvals.is_empty()
+        && app.gateway_view.is_none()
+        && app.attachment_preview.is_none()
+    {
+        frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(2)), cursor_y));
     }
+}
+
+fn attachment_chip_line(
+    attachments: &[BridgeAttachment],
+    x: u16,
+    y: u16,
+    width: u16,
+) -> (Line<'static>, Vec<AttachmentHitArea>) {
+    let mut spans = Vec::new();
+    let mut hit_areas = Vec::new();
+    let mut used = 0u16;
+    for attachment in attachments {
+        let separator = if used == 0 { "" } else { "  " };
+        let separator_width = separator.chars().count() as u16;
+        let available = width.saturating_sub(used).saturating_sub(separator_width);
+        if available < 7 {
+            break;
+        }
+        let filename_limit = available.saturating_sub(4).min(28) as usize;
+        let filename = clip_status(&attachment.filename, filename_limit).into_owned();
+        let chip = format!(" ▤ {filename} ");
+        let chip_width = chip.chars().count() as u16;
+        if !separator.is_empty() {
+            spans.push(Span::raw(separator));
+        }
+        let chip_x = x.saturating_add(used).saturating_add(separator_width);
+        spans.push(Span::styled(
+            chip,
+            Style::default()
+                .fg(Color::Rgb(205, 220, 232))
+                .bg(Color::Rgb(35, 40, 48)),
+        ));
+        hit_areas.push(AttachmentHitArea {
+            area: Rect::new(chip_x, y, chip_width, 1),
+            filename: attachment.filename.clone(),
+            mime: attachment.mime.clone(),
+            size_bytes: attachment.size_bytes,
+            storage_path: attachment.storage_path.clone(),
+        });
+        used = used
+            .saturating_add(separator_width)
+            .saturating_add(chip_width);
+    }
+    (Line::from(spans), hit_areas)
+}
+
+fn attachment_button_text(enabled: bool) -> Text<'static> {
+    let icon = if enabled {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    Text::from(Line::from(Span::styled(
+        "+",
+        Style::default().fg(icon).add_modifier(Modifier::BOLD),
+    )))
 }
 
 fn footer_help_text(auth_active: bool, approval_active: bool, submitting: bool) -> &'static str {
@@ -1878,7 +2585,7 @@ fn footer_help_text(auth_active: bool, approval_active: bool, submitting: bool) 
     } else if submitting {
         "Esc/Ctrl+C stop  Enter queue  End follow"
     } else {
-        "Enter send  / commands  Tab complete  End follow  Esc close"
+        "Enter send  click +/Ctrl+O/F4  Ctrl+V paste  / commands  Esc close"
     }
 }
 
@@ -1886,8 +2593,8 @@ fn draw_approval_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp
     let Some(approval) = app.snapshot.approvals.get(app.approval_selected) else {
         return;
     };
-    let width = area.width.saturating_sub(4).min(72).max(1);
-    let height = area.height.saturating_sub(4).min(11).max(1);
+    let width = area.width.saturating_sub(4).clamp(1, 72);
+    let height = area.height.saturating_sub(4).clamp(1, 11);
     let popup_area = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -1940,8 +2647,8 @@ fn draw_approval_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp
 }
 
 fn draw_gateway_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, view: &GatewayViewState) {
-    let width = area.width.saturating_sub(4).min(112).max(1);
-    let height = area.height.saturating_sub(2).min(36).max(1);
+    let width = area.width.saturating_sub(4).clamp(1, 112);
+    let height = area.height.saturating_sub(2).clamp(1, 36);
     let popup_area = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -1953,23 +2660,23 @@ fn draw_gateway_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, view: &Gatewa
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Agent Gateway ");
     let inner = block.inner(popup_area);
-    let sections = Layout::default()
+    let [tabs_area, content_area, help_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
-        .split(inner);
+        .areas(inner);
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(block, popup_area);
-    frame.render_widget(Paragraph::new(gateway_tabs_line(view.tab)), sections[0]);
+    frame.render_widget(Paragraph::new(gateway_tabs_line(view.tab)), tabs_area);
     frame.render_widget(
         Paragraph::new(gateway_tab_text(view))
             .wrap(Wrap { trim: false })
             .scroll((view.scroll, 0)),
-        sections[1],
+        content_area,
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1982,8 +2689,115 @@ fn draw_gateway_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, view: &Gatewa
             Span::styled("Esc/Q", Style::default().fg(Color::Cyan)),
             Span::styled(" close", Style::default().fg(Color::DarkGray)),
         ])),
-        sections[2],
+        help_area,
     );
+}
+
+fn draw_attachment_preview(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    preview: &AttachmentPreview,
+) {
+    let width = area.width.saturating_sub(6).clamp(1, 100);
+    let height = area.height.saturating_sub(4).clamp(1, 32);
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(82, 92, 105)))
+        .title(format!(
+            " Preview · {} ",
+            clip_status(&preview.filename, 64)
+        ));
+    let inner = block.inner(popup_area);
+    let [metadata_area, preview_area, help_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(2),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(preview.mime.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                human_file_size(preview.size_bytes),
+                Style::default().fg(Color::Gray),
+            ),
+            if preview.truncated {
+                Span::styled("  ·  preview truncated", Style::default().fg(Color::Yellow))
+            } else {
+                Span::raw("")
+            },
+        ])),
+        metadata_area,
+    );
+
+    if let Some(text) = preview.text.as_deref() {
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((preview.scroll, 0)),
+            preview_area,
+        );
+    } else {
+        let kind = if preview.mime.starts_with("image/") {
+            "Image"
+        } else if preview.mime == "application/pdf" {
+            "PDF"
+        } else {
+            "Binary file"
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("{kind} ready"),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Open this file in its system viewer to see the full preview.",
+                    Style::default().fg(Color::Gray),
+                )),
+            ])
+            .wrap(Wrap { trim: false }),
+            preview_area,
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓ PgUp/PgDn", Style::default().fg(Color::Cyan)),
+            Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("O/Enter", Style::default().fg(Color::Cyan)),
+            Span::styled(" system viewer  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc/Q", Style::default().fg(Color::Cyan)),
+            Span::styled(" close", Style::default().fg(Color::DarkGray)),
+        ])),
+        help_area,
+    );
+}
+
+fn human_file_size(size_bytes: i64) -> String {
+    let size = size_bytes.max(0) as f64;
+    if size < 1024.0 {
+        return format!("{} B", size as u64);
+    }
+    if size < 1024.0 * 1024.0 {
+        return format!("{:.1} KiB", size / 1024.0);
+    }
+    format!("{:.1} MiB", size / (1024.0 * 1024.0))
 }
 
 fn gateway_tabs_line(selected: usize) -> Line<'static> {
@@ -2346,6 +3160,7 @@ fn gateway_binding_matcher(binding: &BridgeGatewayBinding) -> String {
     String::from("channel/account")
 }
 
+#[cfg(test)]
 fn transcript_max_scroll(lines: &Text<'_>, width: u16, height: u16) -> u16 {
     let wrapped = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     wrapped
@@ -2354,78 +3169,153 @@ fn transcript_max_scroll(lines: &Text<'_>, width: u16, height: u16) -> u16 {
         .min(u16::MAX as usize) as u16
 }
 
-fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Min(6),
-        ])
-        .split(area);
-
-    let session = Paragraph::new(session_panel_text(app))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" session "),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(session, chunks[0]);
-
-    let approvals_border = if app.snapshot.approvals.is_empty() {
-        Color::DarkGray
-    } else {
-        Color::Red
-    };
-    let approvals = Paragraph::new(approval_panel_text(app))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(approvals_border))
-                .title(" approvals "),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(approvals, chunks[1]);
-
-    let activity = Paragraph::new(activity_panel_text(app))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" activity "),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(activity, chunks[2]);
+fn invalidate_transcript(app: &mut TuiApp) {
+    app.transcript_cache = None;
 }
 
-fn session_panel_text(app: &TuiApp) -> Text<'static> {
-    let session = &app.snapshot.session;
-    let configuration_ready = session.configuration_state == "ready";
-    let lines = vec![
-        metric_line("Source", &session.provider, Color::Cyan),
-        metric_line("Model", &clip_status(&session.model, 20), Color::White),
-        metric_line("Mode", &session.mode, Color::Magenta),
-        metric_line("Reason", &session.reasoning_effort, Color::Blue),
-        metric_line(
-            "Config",
-            configuration_summary(session),
-            if configuration_ready {
-                Color::Green
-            } else {
-                Color::Yellow
-            },
-        ),
-        Line::from(""),
-        metric_line(
-            "Tokens",
-            &format_number(session.tokens.input + session.tokens.output),
-            Color::Green,
-        ),
-        metric_line("Cost", &format!("${:.4}", session.cost_usd), Color::Green),
-    ];
-    Text::from(lines)
+fn render_transcript(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &mut TuiApp,
+    show_inline_activity: bool,
+) {
+    let cache_is_current = app.transcript_cache.as_ref().is_some_and(|cache| {
+        cache.show_inline_activity == show_inline_activity
+            && cache.area == area
+            && cache.auto_follow == app.auto_follow
+            && cache.requested_scroll == app.scroll
+    });
+
+    if !cache_is_current {
+        let lines = transcript_text(&app.snapshot, app, show_inline_activity);
+        let mut paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let max_scroll = paragraph
+            .line_count(area.width.saturating_sub(2))
+            .saturating_sub(area.height.saturating_sub(2) as usize)
+            .min(u16::MAX as usize) as u16;
+        let scroll = if app.auto_follow {
+            max_scroll
+        } else {
+            app.scroll.min(max_scroll)
+        };
+        let title = if app.submitting {
+            format!(" {} ", clip_status(&app.status, 42))
+        } else {
+            String::from(" conversation ")
+        };
+        paragraph = paragraph
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if app.submitting {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }))
+                    .title(title),
+            )
+            .scroll((scroll, 0));
+        let attachment_hit_areas =
+            transcript_attachment_hit_areas(&lines, &app.snapshot, area, scroll);
+        app.transcript_cache = Some(TranscriptCache {
+            show_inline_activity,
+            area,
+            auto_follow: app.auto_follow,
+            requested_scroll: app.scroll,
+            paragraph,
+            attachment_hit_areas,
+        });
+    }
+
+    if let Some(cache) = app.transcript_cache.as_ref() {
+        cache.paragraph.render_ref(area, frame.buffer_mut());
+        app.attachment_hit_areas
+            .extend(cache.attachment_hit_areas.iter().cloned());
+    }
+}
+
+fn transcript_attachment_hit_areas(
+    lines: &Text<'_>,
+    snapshot: &BridgeSnapshot,
+    area: Rect,
+    scroll: u16,
+) -> Vec<AttachmentHitArea> {
+    let width = area.width.saturating_sub(2);
+    let height = area.height.saturating_sub(2);
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    let mut line_index = 0usize;
+    for message in &snapshot.messages {
+        line_index += 1;
+        line_index += message.content.lines().count().max(1);
+        for attachment in &message.attachments {
+            targets.push((line_index, attachment));
+            line_index += 1;
+        }
+        line_index += 1;
+    }
+
+    let mut hit_areas = Vec::with_capacity(targets.len());
+    let mut visual_row = 0usize;
+    let mut target_index = 0usize;
+    for (index, line) in lines.lines.iter().enumerate() {
+        let row_count = Paragraph::new(Text::from(line.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .max(1);
+        while let Some((target_line, attachment)) = targets.get(target_index) {
+            if *target_line != index {
+                break;
+            }
+            let visible_top = scroll as usize;
+            let visible_bottom = visible_top + height as usize;
+            let target_bottom = visual_row + row_count;
+            if target_bottom > visible_top && visual_row < visible_bottom {
+                let clipped_start = visual_row.max(visible_top);
+                let clipped_end = target_bottom.min(visible_bottom);
+                let visible_start = clipped_start - visible_top;
+                hit_areas.push(AttachmentHitArea {
+                    area: Rect::new(
+                        area.x.saturating_add(1),
+                        area.y.saturating_add(1 + visible_start as u16),
+                        width,
+                        (clipped_end - clipped_start) as u16,
+                    ),
+                    filename: attachment.filename.clone(),
+                    mime: attachment.mime.clone(),
+                    size_bytes: attachment.size_bytes,
+                    storage_path: attachment.storage_path.clone(),
+                });
+            }
+            target_index += 1;
+        }
+        visual_row += row_count;
+        if target_index >= targets.len() {
+            break;
+        }
+    }
+    hit_areas
+}
+
+fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
+    if !app.snapshot.approvals.is_empty() {
+        let approvals = Paragraph::new(approval_panel_text(app))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Action needed "),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(approvals, area);
+    }
+}
+
+fn should_show_sidebar(width: u16, app: &TuiApp) -> bool {
+    width >= 92 && !app.snapshot.approvals.is_empty()
 }
 
 fn approval_panel_text(app: &TuiApp) -> Text<'static> {
@@ -2457,7 +3347,7 @@ fn approval_panel_text(app: &TuiApp) -> Text<'static> {
         lines.push(Line::from(vec![
             Span::styled(if selected { " > " } else { "   " }, marker_style),
             Span::styled(
-                clip_status(&approval.tool, 18),
+                clip_status(&approval.tool, 18).into_owned(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -2465,13 +3355,16 @@ fn approval_panel_text(app: &TuiApp) -> Text<'static> {
         ]));
         lines.push(Line::from(vec![
             Span::raw("   "),
-            Span::styled(clip_status(&path, 28), Style::default().fg(Color::Gray)),
+            Span::styled(
+                clip_status(&path, 28).into_owned(),
+                Style::default().fg(Color::Gray),
+            ),
         ]));
         if !approval.reason.is_empty() {
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 Span::styled(
-                    clip_status(&approval.reason, 28),
+                    clip_status(&approval.reason, 28).into_owned(),
                     Style::default().fg(Color::Red),
                 ),
             ]));
@@ -2506,12 +3399,13 @@ fn sanitize_approval_target(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() >= 3 && parts[0] == "desktop" {
-        let action = parts[1];
-        let target = parts[2];
+    let mut parts = trimmed.split_whitespace();
+    if parts.next() == Some("desktop") {
+        let (Some(action), Some(target)) = (parts.next(), parts.next()) else {
+            return Some(trimmed.to_string());
+        };
         if target.starts_with("windows-app:") || target.starts_with("windows-shortcut:") {
-            if let Some(label) = parts.last().copied().filter(|label| !label.contains(':')) {
+            if let Some(label) = parts.next_back().filter(|label| !label.contains(':')) {
                 return Some(format!("desktop {action} {label}"));
             }
             return Some(format!("desktop {action} selected app"));
@@ -2543,84 +3437,26 @@ fn normalize_window_id_for_display(value: &str) -> Option<u64> {
     }
 }
 
-fn activity_panel_text(app: &TuiApp) -> Text<'static> {
-    let mut lines = Vec::new();
-    if !app.submitting {
-        if app.activity.is_empty() && app.subagent_run.is_none() {
-            lines.push(Line::from(vec![Span::styled(
-                "Idle",
-                Style::default().fg(Color::DarkGray),
-            )]));
-            return Text::from(lines);
+fn append_subagent_run_lines(lines: &mut Vec<Line<'static>>, run: &SubagentRunState, _live: bool) {
+    let running = run
+        .tasks
+        .iter()
+        .filter(|task| task.status == "running")
+        .count();
+    let running_label = if running == 1 { "agent" } else { "agents" };
+    let title = match run.status.as_str() {
+        "complete" => format!("✓ {} agents finished", run.total),
+        "incomplete" => format!(
+            "! {}/{} agents finished · {} failed",
+            run.completed, run.total, run.failed
+        ),
+        _ if run.completed > 0 => {
+            format!(
+                "● {running} {running_label} running · {} done",
+                run.completed
+            )
         }
-        if let Some(run) = app.subagent_run.as_ref() {
-            append_subagent_run_lines(&mut lines, run, false);
-        }
-        for item in app.activity.iter().rev().take(10).rev() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{} ", bullet_for_kind(&item.kind)),
-                    activity_style(&item.kind).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    clip_status(&item.text, 28),
-                    Style::default().fg(Color::Gray),
-                ),
-            ]));
-        }
-        return Text::from(lines);
-    }
-
-    if let Some(run) = app.subagent_run.as_ref() {
-        append_subagent_run_lines(&mut lines, run, true);
-    }
-    for item in app.activity.iter().rev().take(12).rev() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} ", bullet_for_kind(&item.kind)),
-                activity_style(&item.kind).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                clip_status(&item.text, 28),
-                Style::default().fg(Color::Gray),
-            ),
-        ]));
-    }
-    if !app.streaming_text.trim().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                ": ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                clip_status(&app.streaming_text, 28),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    } else if !app.reasoning_text.trim().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "· ",
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("Reasoning", Style::default().fg(Color::Blue)),
-        ]));
-    }
-    Text::from(lines)
-}
-
-fn append_subagent_run_lines(lines: &mut Vec<Line<'static>>, run: &SubagentRunState, live: bool) {
-    let title = if live {
-        format!("Parallel agents  {}/{} complete", run.completed, run.total)
-    } else {
-        format!(
-            "Recent parallel run  {}/{} complete",
-            run.completed, run.total
-        )
+        _ => format!("● {running} {running_label} running"),
     };
     let title_color = if run.failed > 0 {
         Color::Yellow
@@ -2634,7 +3470,9 @@ fn append_subagent_run_lines(lines: &mut Vec<Line<'static>>, run: &SubagentRunSt
             .add_modifier(Modifier::BOLD),
     )]));
 
-    for task in run.tasks.iter().take(8) {
+    let visible_tasks = run.tasks.iter().take(8);
+    let visible_count = visible_tasks.len();
+    for (index, task) in visible_tasks.enumerate() {
         let (symbol, color) = match task.status.as_str() {
             "complete" => ("✓", Color::Green),
             "blocked" => ("!", Color::Yellow),
@@ -2643,10 +3481,7 @@ fn append_subagent_run_lines(lines: &mut Vec<Line<'static>>, run: &SubagentRunSt
             _ => ("○", Color::DarkGray),
         };
         let detail = match task.status.as_str() {
-            "running" if !task.summary.trim().is_empty() => task.summary.clone(),
-            "queued" if !task.owned_paths.is_empty() => {
-                format!("owns {}", task.owned_paths.join(", "))
-            }
+            "running" | "queued" if !task.description.trim().is_empty() => task.description.clone(),
             "complete" if task.changed_count > 0 => {
                 format!("{} file(s) changed", task.changed_count)
             }
@@ -2654,44 +3489,49 @@ fn append_subagent_run_lines(lines: &mut Vec<Line<'static>>, run: &SubagentRunSt
             _ if !task.description.trim().is_empty() => task.description.clone(),
             _ => task.summary.clone(),
         };
+        let branch = if index + 1 == visible_count {
+            "└─"
+        } else {
+            "├─"
+        };
+        let state = match task.status.as_str() {
+            "complete" => "Done",
+            "blocked" => "Blocked",
+            "failed" => "Failed",
+            "running" => "Running",
+            _ => "Queued",
+        };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{symbol} "),
+                format!("{branch} {symbol} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(clip_status(&task.id, 18), Style::default().fg(Color::White)),
             Span::styled(
-                format!(" · {}", clip_status(&task.status, 10)),
-                Style::default().fg(color),
+                clip_status(&task.id, 18).into_owned(),
+                Style::default().fg(Color::White),
             ),
+            Span::styled(format!("  {state}"), Style::default().fg(color)),
             Span::styled(
-                format!(" — {}", clip_status(&detail, 38)),
+                format!(" · {}", clip_status(&detail, 42)),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
     }
     if run.tasks.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            clip_status(&run.run_id, 48),
+            clip_status(&run.run_id, 48).into_owned(),
             Style::default().fg(Color::DarkGray),
         )]));
     }
     if let Some(work_file) = run.work_file.as_deref() {
         lines.push(Line::from(vec![
-            Span::styled("log ", Style::default().fg(Color::DarkGray)),
-            Span::styled(clip_status(work_file, 48), Style::default().fg(Color::Blue)),
+            Span::styled("↳ shared log  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                clip_status(work_file, 48).into_owned(),
+                Style::default().fg(Color::Blue),
+            ),
         ]));
     }
-}
-
-fn metric_line(label: &str, value: &str, color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{:<7}", label),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(value.to_string(), Style::default().fg(color)),
-    ])
 }
 
 fn activity_style(kind: &str) -> Style {
@@ -2706,20 +3546,19 @@ fn activity_style(kind: &str) -> Style {
     }
 }
 
-fn format_number(value: i64) -> String {
-    let raw = value.abs().to_string();
-    let mut formatted = String::new();
-    for (index, ch) in raw.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-        formatted.push(ch);
+fn footer_cost_text(value: f64) -> String {
+    format!("cost {}", format_cost_usd(value))
+}
+
+fn format_cost_usd(value: f64) -> String {
+    let value = value.max(0.0);
+    if value == 0.0 {
+        String::from("$0")
+    } else if value < 0.01 {
+        format!("${value:.4}")
+    } else {
+        format!("${value:.2}")
     }
-    let mut result = formatted.chars().rev().collect::<String>();
-    if value < 0 {
-        result.insert(0, '-');
-    }
-    result
 }
 
 fn role_label(role: &str) -> (&'static str, Color) {
@@ -2744,6 +3583,298 @@ fn role_header(role: &str, detail: &str) -> Line<'static> {
         Span::raw(" "),
         Span::styled(detail.to_string(), Style::default().fg(Color::DarkGray)),
     ])
+}
+
+fn terminal_math_text(text: &str) -> String {
+    if !contains_latex_math(text) {
+        return text.to_string();
+    }
+    MathText::new(text).render()
+}
+
+fn contains_latex_math(text: &str) -> bool {
+    let mut remaining = text;
+    while let Some(position) = remaining.find('\\') {
+        let after_slash = &remaining[position + 1..];
+        let Some(first) = after_slash.chars().next() else {
+            return false;
+        };
+        if matches!(first, '(' | ')' | '[' | ']') {
+            return true;
+        }
+        let command_end = after_slash
+            .find(|value: char| !value.is_ascii_alphabetic())
+            .unwrap_or(after_slash.len());
+        let command = &after_slash[..command_end];
+        if math_command(command).is_some()
+            || matches!(
+                command,
+                "frac"
+                    | "sqrt"
+                    | "mathcal"
+                    | "mathbf"
+                    | "mathrm"
+                    | "mathit"
+                    | "text"
+                    | "operatorname"
+                    | "left"
+                    | "right"
+            )
+        {
+            return true;
+        }
+        remaining = &after_slash[first.len_utf8()..];
+    }
+    false
+}
+
+struct MathText<'a> {
+    source: &'a str,
+    position: usize,
+}
+
+impl<'a> MathText<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            position: 0,
+        }
+    }
+
+    fn render(mut self) -> String {
+        let mut output = String::with_capacity(self.source.len());
+        while let Some(character) = self.peek() {
+            match character {
+                '\\' => output.push_str(&self.render_command()),
+                '_' | '^' => {
+                    let superscript = character == '^';
+                    self.bump();
+                    let argument = self.render_argument();
+                    if let Some(converted) = script_text(&argument, superscript) {
+                        output.push_str(&converted);
+                    } else {
+                        output.push(if superscript { '^' } else { '_' });
+                        output.push('(');
+                        output.push_str(&argument);
+                        output.push(')');
+                    }
+                }
+                '{' => {
+                    self.bump();
+                    output.push_str(&self.render_nested_group());
+                }
+                '}' => {
+                    self.bump();
+                }
+                _ => {
+                    output.push(character);
+                    self.bump();
+                }
+            }
+        }
+        output
+    }
+
+    fn render_command(&mut self) -> String {
+        self.bump();
+        let Some(next) = self.peek() else {
+            return String::new();
+        };
+        if !next.is_ascii_alphabetic() {
+            self.bump();
+            return match next {
+                '(' | ')' | '[' | ']' | '\\' => String::new(),
+                ',' | ';' | ':' => String::from(" "),
+                '!' => String::new(),
+                '{' | '}' | '_' | '%' | '#' | '&' => next.to_string(),
+                _ => next.to_string(),
+            };
+        }
+
+        let start = self.position;
+        while self.peek().is_some_and(|value| value.is_ascii_alphabetic()) {
+            self.bump();
+        }
+        let command = &self.source[start..self.position];
+        match command {
+            "frac" => {
+                let numerator = self.render_argument();
+                let denominator = self.render_argument();
+                format!("({numerator})/({denominator})")
+            }
+            "sqrt" => format!("√({})", self.render_argument()),
+            "mathcal" => script_capital(&self.render_argument()),
+            "mathbf" | "mathrm" | "mathit" | "text" | "operatorname" => self.render_argument(),
+            "left" | "right" => String::new(),
+            _ => math_command(command).unwrap_or(command).to_string(),
+        }
+    }
+
+    fn render_argument(&mut self) -> String {
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.bump();
+        }
+        if self.peek() == Some('{') {
+            self.bump();
+            return self.render_nested_group();
+        }
+        self.bump()
+            .map_or_else(String::new, |value| value.to_string())
+    }
+
+    fn render_nested_group(&mut self) -> String {
+        let start = self.position;
+        let mut depth = 1usize;
+        while let Some(character) = self.bump() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = self.position.saturating_sub(1);
+                        return MathText::new(&self.source[start..end]).render();
+                    }
+                }
+                _ => {}
+            }
+        }
+        MathText::new(&self.source[start..]).render()
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.source[self.position..].chars().next()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let character = self.peek()?;
+        self.position += character.len_utf8();
+        Some(character)
+    }
+}
+
+fn math_command(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "sum" => "∑",
+        "prod" => "∏",
+        "int" => "∫",
+        "nabla" => "∇",
+        "partial" => "∂",
+        "infty" => "∞",
+        "cdot" => "·",
+        "times" => "×",
+        "pm" => "±",
+        "approx" => "≈",
+        "neq" | "ne" => "≠",
+        "le" | "leq" => "≤",
+        "ge" | "geq" => "≥",
+        "to" | "rightarrow" => "→",
+        "leftarrow" => "←",
+        "leftrightarrow" | "iff" => "↔",
+        "in" => "∈",
+        "notin" => "∉",
+        "forall" => "∀",
+        "exists" => "∃",
+        "alpha" => "α",
+        "beta" => "β",
+        "gamma" => "γ",
+        "delta" => "δ",
+        "epsilon" => "ε",
+        "theta" => "θ",
+        "lambda" => "λ",
+        "mu" => "μ",
+        "pi" => "π",
+        "rho" => "ρ",
+        "sigma" => "σ",
+        "phi" => "φ",
+        "omega" => "ω",
+        _ => return None,
+    })
+}
+
+fn script_text(value: &str, superscript: bool) -> Option<String> {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        output.push(if superscript {
+            superscript_char(character)?
+        } else {
+            subscript_char(character)?
+        });
+    }
+    Some(output)
+}
+
+fn superscript_char(value: char) -> Option<char> {
+    Some(match value {
+        '0' => '⁰',
+        '1' => '¹',
+        '2' => '²',
+        '3' => '³',
+        '4' => '⁴',
+        '5' => '⁵',
+        '6' => '⁶',
+        '7' => '⁷',
+        '8' => '⁸',
+        '9' => '⁹',
+        '+' => '⁺',
+        '-' => '⁻',
+        '=' => '⁼',
+        '(' => '⁽',
+        ')' => '⁾',
+        'i' => 'ⁱ',
+        'n' => 'ⁿ',
+        'L' => 'ᴸ',
+        _ => return None,
+    })
+}
+
+fn subscript_char(value: char) -> Option<char> {
+    Some(match value {
+        '0' => '₀',
+        '1' => '₁',
+        '2' => '₂',
+        '3' => '₃',
+        '4' => '₄',
+        '5' => '₅',
+        '6' => '₆',
+        '7' => '₇',
+        '8' => '₈',
+        '9' => '₉',
+        '+' => '₊',
+        '-' => '₋',
+        '=' => '₌',
+        '(' => '₍',
+        ')' => '₎',
+        'a' => 'ₐ',
+        'e' => 'ₑ',
+        'h' => 'ₕ',
+        'i' => 'ᵢ',
+        'j' => 'ⱼ',
+        'k' => 'ₖ',
+        'l' => 'ₗ',
+        'm' => 'ₘ',
+        'n' => 'ₙ',
+        'o' => 'ₒ',
+        'p' => 'ₚ',
+        'r' => 'ᵣ',
+        's' => 'ₛ',
+        't' => 'ₜ',
+        'u' => 'ᵤ',
+        'v' => 'ᵥ',
+        'x' => 'ₓ',
+        _ => return None,
+    })
+}
+
+fn script_capital(value: &str) -> String {
+    match value {
+        "E" => String::from("ℰ"),
+        "F" => String::from("ℱ"),
+        "H" => String::from("ℋ"),
+        "L" => String::from("ℒ"),
+        "P" => String::from("℘"),
+        "R" => String::from("ℛ"),
+        _ => value.to_string(),
+    }
 }
 
 fn message_body_line(text: &str) -> Line<'static> {
@@ -2802,16 +3933,22 @@ fn markdown_inline_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
             (None, None) => None,
         };
         let Some((start, delimiter)) = marker else {
-            spans.push(Span::styled(remaining.to_string(), base_style));
+            spans.push(Span::styled(terminal_math_text(remaining), base_style));
             break;
         };
         if start > 0 {
-            spans.push(Span::styled(remaining[..start].to_string(), base_style));
+            spans.push(Span::styled(
+                terminal_math_text(&remaining[..start]),
+                base_style,
+            ));
         }
         let after_start = start + delimiter.len();
         let after_marker = &remaining[after_start..];
         let Some(end) = after_marker.find(delimiter) else {
-            spans.push(Span::styled(remaining[start..].to_string(), base_style));
+            spans.push(Span::styled(
+                terminal_math_text(&remaining[start..]),
+                base_style,
+            ));
             break;
         };
         let content = &after_marker[..end];
@@ -2820,7 +3957,14 @@ fn markdown_inline_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
         } else {
             base_style.fg(Color::Cyan).bg(Color::Rgb(28, 28, 28))
         };
-        spans.push(Span::styled(content.to_string(), style));
+        spans.push(Span::styled(
+            if delimiter == "`" {
+                content.to_string()
+            } else {
+                terminal_math_text(content)
+            },
+            style,
+        ));
         remaining = &after_marker[end + delimiter.len()..];
     }
     spans
@@ -2840,8 +3984,85 @@ fn transcript_text(
         if message.content.is_empty() {
             lines.push(message_body_line(""));
         }
+        for attachment in &message.attachments {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  Attachment: {} ({}, {} bytes)",
+                    attachment.filename, attachment.mime, attachment.size_bytes
+                ),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::UNDERLINED),
+            )));
+        }
         lines.push(Line::from(""));
     }
+    if let Some(prompt) = &app.running_prompt {
+        let prompt_is_persisted = snapshot.messages.last().is_some_and(|message| {
+            message.role == "user" && message.content.trim() == prompt.trim()
+        });
+        if !prompt_is_persisted {
+            lines.push(role_header("user", "in progress"));
+            lines.push(message_body_line(prompt));
+            lines.push(Line::from(""));
+        }
+    }
+    if show_inline_activity && !app.reasoning_text.trim().is_empty() {
+        let summary = clean_reasoning_summary(&app.reasoning_text);
+        if !summary.is_empty() {
+            for (index, line) in summary.lines().take(4).enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if index == 0 { "• " } else { "  " },
+                        Style::default().fg(Color::Blue),
+                    ),
+                    Span::styled(
+                        terminal_math_text(line),
+                        Style::default().fg(if index == 0 {
+                            Color::Blue
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                ]));
+            }
+        }
+    }
+    if show_inline_activity {
+        if let Some(run) = app.subagent_run.as_ref() {
+            append_subagent_run_lines(&mut lines, run, app.submitting);
+        }
+        const WORK_TRACE_LIMIT: usize = 6;
+        let visible_activity = app
+            .activity
+            .iter()
+            .filter(|item| item.kind != "thinking")
+            .count();
+        for item in app
+            .activity
+            .iter()
+            .filter(|item| item.kind != "thinking")
+            .skip(visible_activity.saturating_sub(WORK_TRACE_LIMIT))
+        {
+            lines.push(Line::from(vec![
+                Span::styled("• ", activity_style(&item.kind)),
+                Span::styled(item.text.clone(), Style::default().fg(Color::Gray)),
+            ]));
+        }
+        if app.subagent_run.is_some() || app.activity.iter().any(|item| item.kind != "thinking") {
+            lines.push(Line::from(""));
+        }
+    }
+    if app.submitting && !app.streaming_text.trim().is_empty() {
+        lines.push(role_header("assistant", "drafting"));
+        for line in app.streaming_text.lines() {
+            lines.push(message_body_line(line));
+        }
+        lines.push(Line::from(""));
+    }
+    // Notices belong after the active conversation turn. Keeping them here
+    // prevents setup or error text from splitting the prompt from its live
+    // reasoning/tool progress.
     for notice in &app.notices {
         let color = if notice.error {
             Color::Red
@@ -2864,52 +4085,6 @@ fn transcript_text(
         }
         lines.push(Line::from(""));
     }
-    if let Some(prompt) = &app.running_prompt {
-        let prompt_is_persisted = snapshot.messages.last().is_some_and(|message| {
-            message.role == "user" && message.content.trim() == prompt.trim()
-        });
-        if !prompt_is_persisted {
-            lines.push(role_header("user", "in progress"));
-            lines.push(message_body_line(prompt));
-            lines.push(Line::from(""));
-        }
-    }
-    if app.submitting && show_inline_activity {
-        const INLINE_ACTIVITY_LIMIT: usize = 8;
-        let hidden = app.activity.len().saturating_sub(INLINE_ACTIVITY_LIMIT);
-        if hidden > 0 {
-            lines.push(Line::from(vec![
-                Span::styled(" ACTIVITY  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("… {hidden} earlier steps hidden"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-        for item in app.activity.iter().skip(hidden) {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {:<9} ", item.kind.to_uppercase()),
-                    activity_style(&item.kind).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(item.text.clone(), Style::default().fg(Color::Gray)),
-            ]));
-        }
-    }
-    if app.submitting && !app.streaming_text.trim().is_empty() {
-        lines.push(role_header("assistant", "drafting"));
-        for line in app.streaming_text.lines() {
-            lines.push(message_body_line(line));
-        }
-        lines.push(Line::from(""));
-    } else if app.submitting && show_inline_activity && !app.reasoning_text.trim().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  · ", Style::default().fg(Color::Blue)),
-            Span::styled("Reasoning", Style::default().fg(Color::DarkGray)),
-        ]));
-        lines.push(Line::from(""));
-    }
     if lines.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "What would you like to build? Type / for commands.",
@@ -2919,11 +4094,145 @@ fn transcript_text(
     Text::from(lines)
 }
 
+fn clean_reasoning_summary(value: &str) -> String {
+    let mut cleaned = String::with_capacity(value.len());
+    for line in value.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "<!-- -->" {
+            continue;
+        }
+        if !cleaned.is_empty() {
+            cleaned.push('\n');
+        }
+        cleaned.push_str(line);
+    }
+    cleaned
+}
+
+#[derive(Clone, Copy)]
+enum PaletteSource<'a> {
+    Root(&'a str),
+    Command(&'a str),
+}
+
+impl PaletteSource<'_> {
+    fn matches(self, stored: &str) -> bool {
+        match self {
+            Self::Root(marker) => stored == marker,
+            Self::Command(command) => stored
+                .strip_suffix(' ')
+                .is_some_and(|stored_command| stored_command.eq_ignore_ascii_case(command)),
+        }
+    }
+
+    fn into_shared(self) -> Arc<str> {
+        match self {
+            Self::Root(marker) => Arc::from(marker),
+            Self::Command(command) => Arc::from(format!("{command} ")),
+        }
+    }
+}
+
+struct PaletteContext<'a> {
+    source: PaletteSource<'a>,
+    query: &'a str,
+}
+
+fn palette_context(input: &str) -> Option<PaletteContext<'_>> {
+    if !input.starts_with('/') {
+        return None;
+    }
+    let trimmed = input.trim_end();
+    let mut words = trimmed.split_whitespace();
+    let command = words.next().unwrap_or(&input[..1]);
+    let query = words.next();
+    if words.next().is_some() {
+        return None;
+    }
+    let has_argument_slot = input[command.len()..].chars().any(char::is_whitespace);
+    Some(if has_argument_slot {
+        PaletteContext {
+            source: PaletteSource::Command(command),
+            query: query.unwrap_or_default(),
+        }
+    } else {
+        PaletteContext {
+            source: PaletteSource::Root(&input[..1]),
+            query: command,
+        }
+    })
+}
+
+fn palette_entry_matches(entry: &BridgeCompletionEntry, query: &str) -> bool {
+    query.is_empty()
+        || starts_with_ignore_ascii_case(&entry.label, query)
+        || starts_with_ignore_ascii_case(&entry.value, query)
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
+
+fn palette_has_matches(palette: &BridgeCompletions, query: &str) -> bool {
+    palette
+        .entries
+        .iter()
+        .filter(|entry| palette_entry_selectable(entry))
+        .any(|entry| palette_entry_matches(entry, query))
+}
+
+fn palette_entry_visible(
+    palette: &BridgeCompletions,
+    index: usize,
+    entry: &BridgeCompletionEntry,
+    query: &str,
+    has_matches: bool,
+) -> bool {
+    if !has_matches {
+        return true;
+    }
+    if palette_entry_selectable(entry) {
+        return palette_entry_matches(entry, query);
+    }
+    palette
+        .entries
+        .iter()
+        .skip(index + 1)
+        .take_while(|candidate| palette_entry_selectable(candidate))
+        .any(|candidate| palette_entry_matches(candidate, query))
+}
+
+fn visible_palette_entries<'a>(
+    palette: &'a BridgeCompletions,
+    query: &'a str,
+) -> impl Iterator<Item = (usize, &'a BridgeCompletionEntry)> + 'a {
+    let has_matches = palette_has_matches(palette, query);
+    palette
+        .entries
+        .iter()
+        .enumerate()
+        .filter(move |(index, entry)| {
+            palette_entry_visible(palette, *index, entry, query, has_matches)
+        })
+}
+
+fn visible_palette_indices<'a>(
+    palette: &'a BridgeCompletions,
+    query: &'a str,
+) -> impl Iterator<Item = usize> + 'a {
+    visible_palette_entries(palette, query).map(|(index, _)| index)
+}
+
 fn palette_is_open(app: &TuiApp) -> bool {
     app.secret_provider.is_none()
         && app.snapshot.approvals.is_empty()
-        && !app.palette.entries.is_empty()
-        && app.input.starts_with('/')
+        && palette_context(&app.input).is_some_and(|context| {
+            visible_palette_indices(&app.palette, context.query)
+                .next()
+                .is_some()
+        })
 }
 
 fn palette_visible_start(total: usize, selected: usize, visible_count: usize) -> usize {
@@ -2937,64 +4246,63 @@ fn palette_visible_start(total: usize, selected: usize, visible_count: usize) ->
         .min(max_start)
 }
 
-fn first_selectable_palette_index(palette: &BridgeCompletions) -> Option<usize> {
-    palette.entries.iter().position(palette_entry_selectable)
+fn first_selectable_palette_index(palette: &BridgeCompletions, query: &str) -> Option<usize> {
+    visible_palette_entries(palette, query)
+        .find(|(_, entry)| palette_entry_selectable(entry))
+        .map(|(index, _)| index)
 }
 
-fn last_selectable_palette_index(palette: &BridgeCompletions) -> Option<usize> {
-    palette.entries.iter().rposition(palette_entry_selectable)
+fn last_selectable_palette_index(palette: &BridgeCompletions, query: &str) -> Option<usize> {
+    visible_palette_entries(palette, query)
+        .filter(|(_, entry)| palette_entry_selectable(entry))
+        .map(|(index, _)| index)
+        .last()
 }
 
-fn closest_selectable_palette_index(palette: &BridgeCompletions, selected: usize) -> Option<usize> {
-    if palette.entries.is_empty() {
-        return None;
-    }
-    let selected = selected.min(palette.entries.len().saturating_sub(1));
-    if palette
-        .entries
-        .get(selected)
-        .is_some_and(palette_entry_selectable)
-    {
-        return Some(selected);
-    }
-    (selected + 1..palette.entries.len())
-        .find(|index| palette_entry_selectable(&palette.entries[*index]))
+fn closest_selectable_palette_index(
+    palette: &BridgeCompletions,
+    query: &str,
+    selected: usize,
+) -> Option<usize> {
+    visible_palette_entries(palette, query)
+        .find(|(index, entry)| *index >= selected && palette_entry_selectable(entry))
+        .map(|(index, _)| index)
         .or_else(|| {
-            (0..selected)
-                .rev()
-                .find(|index| palette_entry_selectable(&palette.entries[*index]))
+            visible_palette_entries(palette, query)
+                .filter(|(_, entry)| palette_entry_selectable(entry))
+                .map(|(index, _)| index)
+                .last()
         })
 }
 
-fn next_palette_index(palette: &BridgeCompletions, selected: usize) -> usize {
-    if palette.entries.is_empty() {
-        return 0;
-    }
-    let selected = selected.min(palette.entries.len().saturating_sub(1));
-    (selected + 1..palette.entries.len())
-        .find(|index| palette_entry_selectable(&palette.entries[*index]))
+fn next_palette_index(palette: &BridgeCompletions, query: &str, selected: usize) -> usize {
+    visible_palette_entries(palette, query)
+        .find(|(index, entry)| *index > selected && palette_entry_selectable(entry))
+        .map(|(index, _)| index)
         .unwrap_or(selected)
 }
 
-fn previous_palette_index(palette: &BridgeCompletions, selected: usize) -> usize {
-    if palette.entries.is_empty() {
-        return 0;
-    }
-    let selected = selected.min(palette.entries.len().saturating_sub(1));
-    (0..selected)
-        .rev()
-        .find(|index| palette_entry_selectable(&palette.entries[*index]))
+fn previous_palette_index(palette: &BridgeCompletions, query: &str, selected: usize) -> usize {
+    visible_palette_entries(palette, query)
+        .filter(|(index, entry)| *index < selected && palette_entry_selectable(entry))
+        .map(|(index, _)| index)
+        .last()
         .unwrap_or(selected)
 }
 
-fn move_palette_index(palette: &BridgeCompletions, selected: usize, delta: isize) -> usize {
-    let mut index = closest_selectable_palette_index(palette, selected).unwrap_or(0);
+fn move_palette_index(
+    palette: &BridgeCompletions,
+    query: &str,
+    selected: usize,
+    delta: isize,
+) -> usize {
+    let mut index = closest_selectable_palette_index(palette, query, selected).unwrap_or(0);
     let steps = delta.unsigned_abs();
     for _ in 0..steps {
         let next = if delta >= 0 {
-            next_palette_index(palette, index)
+            next_palette_index(palette, query, index)
         } else {
-            previous_palette_index(palette, index)
+            previous_palette_index(palette, query, index)
         };
         if next == index {
             break;
@@ -3008,12 +4316,19 @@ fn palette_entry_selectable(entry: &BridgeCompletionEntry) -> bool {
     !entry.value.starts_with("section:")
 }
 
-fn palette_title(palette: &BridgeCompletions, selected: usize, visible_count: usize) -> String {
-    let total = palette.entries.len();
+fn palette_title(
+    palette: &BridgeCompletions,
+    query: &str,
+    selected: usize,
+    visible_count: usize,
+) -> String {
+    let total = visible_palette_indices(palette, query).count();
     if total == 0 {
         return palette.title.clone();
     }
-    let selected = selected.min(total.saturating_sub(1));
+    let selected = visible_palette_indices(palette, query)
+        .position(|index| index == selected)
+        .unwrap_or(0);
     let start = palette_visible_start(total, selected, visible_count.max(1));
     let end = (start + visible_count.max(1)).min(total);
     format!(
@@ -3026,6 +4341,14 @@ fn palette_title(palette: &BridgeCompletions, selected: usize, visible_count: us
 }
 
 fn scroll_active_view(app: &mut TuiApp, down: bool) {
+    if let Some(preview) = app.attachment_preview.as_mut() {
+        preview.scroll = if down {
+            preview.scroll.saturating_add(3)
+        } else {
+            preview.scroll.saturating_sub(3)
+        };
+        return;
+    }
     if let Some(view) = app.gateway_view.as_mut() {
         view.scroll = if down {
             view.scroll.saturating_add(3)
@@ -3035,10 +4358,13 @@ fn scroll_active_view(app: &mut TuiApp, down: bool) {
         return;
     }
     if palette_is_open(app) {
+        let query = palette_context(&app.input)
+            .map(|context| context.query)
+            .unwrap_or_default();
         app.palette_selected = if down {
-            move_palette_index(&app.palette, app.palette_selected, 3)
+            move_palette_index(&app.palette, query, app.palette_selected, 3)
         } else {
-            move_palette_index(&app.palette, app.palette_selected, -3)
+            move_palette_index(&app.palette, query, app.palette_selected, -3)
         };
         return;
     }
@@ -3052,24 +4378,28 @@ fn scroll_active_view(app: &mut TuiApp, down: bool) {
 
 fn palette_text(
     palette: &BridgeCompletions,
+    query: &str,
     selected: usize,
     visible_count: usize,
     width: u16,
 ) -> Text<'static> {
     let mut lines = Vec::new();
     let label_width = if width > 64 { 24 } else { 16 };
-    let total = palette.entries.len();
-    let selected = selected.min(total.saturating_sub(1));
+    let total = visible_palette_indices(palette, query).count();
+    let selected_position = visible_palette_indices(palette, query)
+        .position(|index| index == selected)
+        .unwrap_or(0);
     let visible_count = visible_count.max(1);
-    let start = palette_visible_start(total, selected, visible_count);
-    let end = (start + visible_count).min(total);
-    for (index, entry) in palette.entries[start..end].iter().enumerate() {
-        let index = start + index;
+    let start = palette_visible_start(total, selected_position, visible_count);
+    for (index, entry) in visible_palette_entries(palette, query)
+        .skip(start)
+        .take(visible_count)
+    {
         if !palette_entry_selectable(entry) {
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 Span::styled(
-                    clip_status(&entry.label, width.saturating_sub(4) as usize),
+                    clip_status(&entry.label, width.saturating_sub(4) as usize).into_owned(),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
@@ -3085,7 +4415,32 @@ fn palette_text(
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let _ = &entry.value;
+        if is_model_palette_entry(entry) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if index == selected { " > " } else { "   " },
+                    selected_style,
+                ),
+                Span::styled(
+                    entry.label.clone(),
+                    Style::default().fg(if index == selected {
+                        Color::Cyan
+                    } else {
+                        Color::White
+                    }),
+                ),
+            ]));
+            if !entry.description.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(
+                        entry.description.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+            continue;
+        }
         lines.push(Line::from(vec![
             Span::styled(
                 if index == selected { " > " } else { "   " },
@@ -3103,7 +4458,8 @@ fn palette_text(
                 clip_status(
                     &entry.description,
                     width.saturating_sub(label_width as u16 + 8) as usize,
-                ),
+                )
+                .into_owned(),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -3111,16 +4467,8 @@ fn palette_text(
     Text::from(lines)
 }
 
-fn bullet_for_kind(kind: &str) -> &'static str {
-    match kind {
-        "thinking" => "~",
-        "install" => "↓",
-        "tool" => "+",
-        "subagent" => "↳",
-        "guardrail" => "!",
-        "text" => ":",
-        _ => "-",
-    }
+fn is_model_palette_entry(entry: &BridgeCompletionEntry) -> bool {
+    entry.execute && entry.complete_to.starts_with("/model ")
 }
 
 fn tool_activity_label(tool: &str) -> String {
@@ -3187,28 +4535,78 @@ fn apply_approval_action(args: &TuiArgs, app: &mut TuiApp, action: &str) {
             app.status = format!("Error: {}", clip_status(&err.to_string(), 96));
         }
     }
+    invalidate_transcript(app);
 }
 
-fn clip_status(value: &str, limit: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= limit {
+fn clip_status(value: &str, limit: usize) -> Cow<'_, str> {
+    let compact = compact_whitespace(value);
+    if compact.chars().count() <= limit {
         return compact;
     }
     if limit <= 3 {
-        return compact.chars().take(limit).collect();
+        return Cow::Owned(compact.chars().take(limit).collect());
     }
     let mut clipped = compact.chars().take(limit - 3).collect::<String>();
     clipped.push_str("...");
-    clipped
+    Cow::Owned(clipped)
 }
 
-fn refresh_palette(args: &TuiArgs, app: &mut TuiApp) {
-    if !app.input.starts_with('/') {
-        app.palette = BridgeCompletions::default();
-        app.palette_selected = 0;
+fn spawn_palette_worker(
+    runtime: &RuntimeHandle,
+    args: Arc<TuiArgs>,
+    mut requests: watch::Receiver<Option<Arc<str>>>,
+    results: mpsc::Sender<(Arc<str>, Result<BridgeResponse>)>,
+) {
+    runtime.spawn(async move {
+        while requests.changed().await.is_ok() {
+            let request = match requests.borrow_and_update().clone() {
+                Some(request) => request,
+                None => continue,
+            };
+            let result = call_bridge_async(args.as_ref(), "complete", Some(request.as_ref())).await;
+            if results.send((request, result)).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+fn clear_palette(app: &mut TuiApp) {
+    app.palette = BridgeCompletions::default();
+    app.palette_source = None;
+    app.palette_selected = 0;
+}
+
+fn request_palette_refresh(requests: &watch::Sender<Option<Arc<str>>>, app: &mut TuiApp) {
+    let Some(context) = palette_context(&app.input) else {
+        clear_palette(app);
+        return;
+    };
+    if app
+        .palette_source
+        .as_deref()
+        .is_some_and(|source| context.source.matches(source))
+    {
         return;
     }
-    match call_bridge(args, "complete", Some(&app.input)) {
+
+    let source = context.source.into_shared();
+    clear_palette(app);
+    app.palette_source = Some(Arc::clone(&source));
+    if requests.is_closed() {
+        app.palette_source = None;
+        app.status = String::from("Command completion worker is unavailable");
+        return;
+    }
+    requests.send_replace(Some(source));
+}
+
+fn apply_palette_result(app: &mut TuiApp, prompt: &str, result: Result<BridgeResponse>) {
+    if !palette_context(&app.input).is_some_and(|context| context.source.matches(prompt)) {
+        return;
+    }
+
+    match result {
         Ok(response) => {
             app.palette = response.completions.unwrap_or_default();
             app.palette_selected = app
@@ -3216,18 +4614,22 @@ fn refresh_palette(args: &TuiArgs, app: &mut TuiApp) {
                 .selected_index
                 .unwrap_or(app.palette_selected)
                 .min(app.palette.entries.len().saturating_sub(1));
+            let query = palette_context(&app.input)
+                .map(|context| context.query)
+                .unwrap_or_default();
             app.palette_selected =
-                closest_selectable_palette_index(&app.palette, app.palette_selected).unwrap_or(0);
+                closest_selectable_palette_index(&app.palette, query, app.palette_selected)
+                    .unwrap_or(0);
         }
         Err(err) => {
             app.status = format!("Error: {}", clip_status(&err.to_string(), 96));
-            app.palette = BridgeCompletions::default();
-            app.palette_selected = 0;
+            clear_palette(app);
         }
     }
 }
 
 fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
+    invalidate_transcript(app);
     match event {
         AppEvent::StreamFrame(Ok(frame)) => match frame.kind.as_str() {
             "submitted" => {
@@ -3247,32 +4649,24 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     let max_index = app.snapshot.approvals.len().saturating_sub(1);
                     app.approval_selected = app.approval_selected.min(max_index);
                 }
-                app.activity.push(ActivityLine {
-                    kind: if app
-                        .running_prompt
-                        .as_deref()
-                        .is_some_and(|prompt| prompt.trim_start().starts_with("/install "))
-                    {
-                        String::from("install")
-                    } else {
-                        String::from("thinking")
-                    },
-                    text: if app
-                        .running_prompt
-                        .as_deref()
-                        .is_some_and(install_command_is_confirmed)
-                    {
-                        String::from("Starting local download")
-                    } else if app
-                        .running_prompt
-                        .as_deref()
-                        .is_some_and(|prompt| prompt.trim_start().starts_with("/install "))
-                    {
-                        String::from("Reviewing model size and runtime requirements")
-                    } else {
-                        String::from("Waiting for model response")
-                    },
-                });
+                if app
+                    .running_prompt
+                    .as_deref()
+                    .is_some_and(|prompt| prompt.trim_start().starts_with("/install "))
+                {
+                    app.activity.push(ActivityLine {
+                        kind: String::from("install"),
+                        text: if app
+                            .running_prompt
+                            .as_deref()
+                            .is_some_and(install_command_is_confirmed)
+                        {
+                            String::from("Starting local download")
+                        } else {
+                            String::from("Reviewing model size and runtime requirements")
+                        },
+                    });
+                }
             }
             "stream_event" => {
                 if let Some(snapshot) = frame.snapshot {
@@ -3320,14 +4714,27 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     if app.snapshot.session.configuration_state == "ready" && !command_needs_setup {
                         app.notices.clear();
                     }
-                    app.status = command_result
-                        .map(command_result_status)
-                        .unwrap_or_else(|| String::from("Ready"));
+                    app.status = if completed_prompt
+                        .as_deref()
+                        .is_some_and(is_attachment_bridge_prompt)
+                    {
+                        app.snapshot
+                            .session
+                            .pending_attachments
+                            .last()
+                            .map(|attachment| {
+                                format!("Attached {} · click the file to open", attachment.filename)
+                            })
+                            .unwrap_or_else(|| String::from("Attachment was not added"))
+                    } else {
+                        command_result
+                            .map(command_result_status)
+                            .unwrap_or_else(|| String::from("Ready"))
+                    };
                 }
                 if let Some(command) = next_command {
                     app.input = command;
-                    app.palette = BridgeCompletions::default();
-                    app.palette_selected = 0;
+                    clear_palette(app);
                 }
                 if let Some(provider) = key_prompt_provider {
                     app.secret_provider = Some(provider.clone());
@@ -3369,24 +4776,34 @@ fn ensure_final_frame_messages_visible(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if !snapshot_contains_message(&app.snapshot, "user", prompt) {
+        if !is_attachment_bridge_prompt(prompt)
+            && !snapshot_contains_message(&app.snapshot, "user", prompt)
+        {
             app.snapshot.messages.push(BridgeMessage {
                 role: String::from("user"),
                 content: prompt.to_string(),
                 created_at: String::from("just now"),
+                attachments: Vec::new(),
             });
         }
     }
 
-    if let Some(answer) = answer.map(str::trim).filter(|value| !value.is_empty()) {
-        if !snapshot_contains_message(&app.snapshot, "assistant", answer) {
-            app.snapshot.messages.push(BridgeMessage {
-                role: String::from("assistant"),
-                content: answer.to_string(),
-                created_at: String::from("just now"),
-            });
+    if !completed_prompt.is_some_and(is_attachment_bridge_prompt) {
+        if let Some(answer) = answer.map(str::trim).filter(|value| !value.is_empty()) {
+            if !snapshot_contains_message(&app.snapshot, "assistant", answer) {
+                app.snapshot.messages.push(BridgeMessage {
+                    role: String::from("assistant"),
+                    content: answer.to_string(),
+                    created_at: String::from("just now"),
+                    attachments: Vec::new(),
+                });
+            }
         }
     }
+}
+
+fn is_attachment_bridge_prompt(prompt: &str) -> bool {
+    prompt.split_whitespace().next() == Some("/__nym_attach")
 }
 
 fn snapshot_contains_message(snapshot: &BridgeSnapshot, role: &str, content: &str) -> bool {
@@ -3399,15 +4816,22 @@ fn snapshot_contains_message(snapshot: &BridgeSnapshot, role: &str, content: &st
 fn apply_bridge_event(app: &mut TuiApp, event: BridgeEvent) {
     match event.kind.as_str() {
         "reasoning_delta" | "reasoning_started" => {
-            // Raw chain-of-thought is private. Keep only a visible activity
-            // indicator and render tool/results as the inspectable trace.
-            app.reasoning_text = format!("Reasoning · {}", app.snapshot.session.reasoning_effort);
+            // Raw chain-of-thought remains private. A provider-supplied
+            // reasoning summary can replace this neutral state below.
+            if app.reasoning_text.is_empty() {
+                app.reasoning_text = String::from("Thinking…");
+            }
+        }
+        "reasoning_summary_delta" => {
+            if let Some(delta) = event.delta {
+                if app.reasoning_text == "Thinking…" {
+                    app.reasoning_text.clear();
+                }
+                app.reasoning_text.push_str(&delta);
+            }
         }
         "text_delta" => {
             if let Some(delta) = event.delta {
-                if !delta.is_empty() {
-                    app.reasoning_text.clear();
-                }
                 app.streaming_text.push_str(&delta);
             }
         }
@@ -3424,15 +4848,22 @@ fn apply_bridge_event(app: &mut TuiApp, event: BridgeEvent) {
                 text: tool_activity_label(&tool),
             });
         }
-        "tool_result" | "approval_request" | "approval_decision" => {
+        "tool_result" => {
             if let Some(summary) = event.summary {
-                let kind = if event.kind.starts_with("approval") {
-                    "guardrail"
+                if let Some(last) = app.activity.last_mut().filter(|item| item.kind == "tool") {
+                    last.text = summary;
                 } else {
-                    "tool"
-                };
+                    app.activity.push(ActivityLine {
+                        kind: String::from("tool"),
+                        text: summary,
+                    });
+                }
+            }
+        }
+        "approval_request" | "approval_decision" => {
+            if let Some(summary) = event.summary {
                 app.activity.push(ActivityLine {
-                    kind: kind.to_string(),
+                    kind: String::from("guardrail"),
                     text: summary,
                 });
             }
@@ -3446,7 +4877,7 @@ fn apply_bridge_event(app: &mut TuiApp, event: BridgeEvent) {
         }
         "install_progress" => {
             if let Some(summary) = event.summary {
-                app.status = clip_status(&summary, 72);
+                app.status = clip_status(&summary, 72).into_owned();
                 if let Some(last) = app
                     .activity
                     .last_mut()
@@ -3586,7 +5017,7 @@ fn apply_subagent_lifecycle_event(app: &mut TuiApp, event: &BridgeEvent) {
     }
 
     if let Some(summary) = event.summary.as_ref() {
-        app.status = clip_status(summary, 72);
+        app.status = clip_status(summary, 72).into_owned();
     } else {
         app.status = format!("Parallel agents: {}/{} complete", run.completed, run.total);
     }
@@ -3679,9 +5110,9 @@ fn provider_setup_notice(
 fn push_notice(app: &mut TuiApp, title: &str, text: &str, error: bool) {
     const MAX_NOTICES: usize = 20;
     if app.notices.len() >= MAX_NOTICES {
-        app.notices.remove(0);
+        app.notices.pop_front();
     }
-    app.notices.push(UiNotice {
+    app.notices.push_back(UiNotice {
         title: title.to_string(),
         text: text.to_string(),
         error,
@@ -3702,20 +5133,6 @@ fn ui_state_badge(app: &TuiApp) -> (&'static str, Color) {
         return ("setup", Color::Yellow);
     }
     ("ready", Color::Green)
-}
-
-fn configuration_needs_api_key(session: &BridgeSession) -> bool {
-    session.configuration_state == "api_key_required"
-}
-
-fn configuration_summary(session: &BridgeSession) -> &'static str {
-    if session.configuration_state == "ready" {
-        "Ready"
-    } else if configuration_needs_api_key(session) {
-        "API key required"
-    } else {
-        "Setup required"
-    }
 }
 
 fn command_result_status(result: &BridgeCommandResult) -> String {
@@ -3749,8 +5166,12 @@ fn command_result_status(result: &BridgeCommandResult) -> String {
 }
 
 fn install_command_is_confirmed(command: &str) -> bool {
-    let parts = command.split_whitespace().collect::<Vec<_>>();
-    parts.len() == 4 && parts[0] == "/install" && parts[3] == "--yes"
+    let mut parts = command.split_whitespace();
+    parts.next() == Some("/install")
+        && parts.next().is_some()
+        && parts.next().is_some()
+        && parts.next() == Some("--yes")
+        && parts.next().is_none()
 }
 
 fn apply_bridge_credentials(command: &mut ProcessCommand, args: &TuiArgs) {
@@ -3776,7 +5197,10 @@ fn call_bridge(args: &TuiArgs, action: &str, prompt: Option<&str>) -> Result<Bri
         command.arg("--bridge-prompt").arg(prompt);
     }
 
-    let output = command.output()?;
+    parse_bridge_output(command.output()?)
+}
+
+fn parse_bridge_output(output: std::process::Output) -> Result<BridgeResponse> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
@@ -3814,6 +5238,33 @@ fn call_bridge(args: &TuiArgs, action: &str, prompt: Option<&str>) -> Result<Bri
     }
 
     Ok(response)
+}
+
+async fn call_bridge_async(
+    args: &TuiArgs,
+    action: &str,
+    prompt: Option<&str>,
+) -> Result<BridgeResponse> {
+    let mut command = AsyncProcessCommand::new(&args.python);
+    command
+        .arg("-m")
+        .arg("agent.main")
+        .arg("--tui-bridge")
+        .arg(action)
+        .arg("--bridge-session-id")
+        .arg(&args.session_id)
+        .current_dir(&args.repo_root)
+        .kill_on_drop(true);
+    if let Ok(api_keys) = args.api_keys.lock() {
+        for (env_name, api_key) in api_keys.iter() {
+            command.env(env_name, api_key);
+        }
+    }
+    if let Some(prompt) = prompt {
+        command.arg("--bridge-prompt").arg(prompt);
+    }
+
+    parse_bridge_output(command.output().await?)
 }
 
 fn call_bridge_with_request_id(
@@ -3834,46 +5285,14 @@ fn call_bridge_with_request_id(
         .current_dir(&args.repo_root);
     apply_bridge_credentials(&mut command, args);
 
-    let output = command.output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stdout.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Bridge produced no JSON output. stderr: {}",
-            stderr
-        ));
-    }
-    let response: BridgeResponse = serde_json::from_str(&stdout).map_err(|err| {
-        anyhow::anyhow!(
-            "Could not parse bridge response: {}. stdout: {} stderr: {}",
-            err,
-            stdout,
-            stderr
-        )
-    })?;
-    if !response.ok {
-        if let Some(error) = response.error.as_deref() {
-            return Err(anyhow::anyhow!("Bridge error: {}", error));
-        }
-    }
-    if !output.status.success() {
-        if let Some(error) = response.error.as_deref() {
-            return Err(anyhow::anyhow!("Bridge error: {}", error));
-        }
-        return Err(anyhow::anyhow!(
-            "Bridge exited with {} and stderr: {}",
-            output.status,
-            stderr
-        ));
-    }
-    Ok(response)
+    parse_bridge_output(command.output()?)
 }
 
-fn stream_bridge_submit(
+async fn stream_bridge_submit(
     args: &TuiArgs,
     prompt: &str,
     tx: mpsc::Sender<AppEvent>,
-    active_bridge: Arc<Mutex<Option<Child>>>,
+    active_bridge: Arc<Mutex<Option<AsyncChild>>>,
     cancel_signal: Arc<AtomicBool>,
 ) -> Result<()> {
     let (stdout, stderr) = {
@@ -3885,7 +5304,7 @@ fn stream_bridge_submit(
                 "A bridge turn is already active; wait for it to finish before starting another."
             ));
         }
-        let mut child = spawn_bridge(args, "stream-submit", Some(prompt))?;
+        let mut child = spawn_bridge_async(args, "stream-submit", Some(prompt))?;
         let stdout = child
             .stdout
             .take()
@@ -3894,24 +5313,27 @@ fn stream_bridge_submit(
         *active = Some(child);
         if cancel_signal.load(Ordering::SeqCst) {
             if let Some(child) = active.as_mut() {
-                let _ = interrupt_process_tree(child);
+                if let Some(pid) = child.id() {
+                    let _ = interrupt_process_tree_pid(pid);
+                }
             }
         }
         (stdout, stderr)
     };
     let stderr_reader = stderr.map(|mut pipe| {
-        thread::spawn(move || {
+        tokio::spawn(async move {
             let mut text = String::new();
-            let _ = pipe.read_to_string(&mut text);
+            let _ = pipe.read_to_string(&mut text).await;
             text
         })
     });
-    let reader = BufReader::new(stdout);
+    let mut reader = AsyncBufReader::new(stdout).lines();
     let mut saw_final_frame = false;
     let mut stream_error: Option<anyhow::Error> = None;
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(line) => line,
+    loop {
+        let line = match reader.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
             Err(err) => {
                 stream_error = Some(err.into());
                 break;
@@ -3930,28 +5352,33 @@ fn stream_bridge_submit(
         if parsed.kind == "final" {
             saw_final_frame = true;
         }
-        let _ = tx.send(AppEvent::StreamFrame(Ok(parsed)));
+        if tx.send(AppEvent::StreamFrame(Ok(parsed))).is_err() {
+            stream_error = Some(anyhow::anyhow!("UI event receiver closed"));
+            break;
+        }
     }
     if stream_error.is_some() {
-        if let Ok(mut active) = active_bridge.lock() {
-            if let Some(child) = active.as_mut() {
-                let _ = interrupt_process_tree(child);
+        if let Ok(active) = active_bridge.lock() {
+            if let Some(child) = active.as_ref() {
+                if let Some(pid) = child.id() {
+                    let _ = interrupt_process_tree_pid(pid);
+                }
             }
         }
     }
-    let status = {
+    let mut child = {
         let mut active = active_bridge
             .lock()
             .map_err(|_| anyhow::anyhow!("Could not finish the active bridge process."))?;
-        let mut child = active
+        active
             .take()
-            .ok_or_else(|| anyhow::anyhow!("Active bridge process was lost."))?;
-        drop(active);
-        child.wait()?
+            .ok_or_else(|| anyhow::anyhow!("Active bridge process was lost."))?
     };
-    let stderr = stderr_reader
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
+    let status = child.wait().await?;
+    let stderr = match stderr_reader {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => String::new(),
+    };
     if let Some(error) = stream_error {
         return Err(error);
     }
@@ -4027,16 +5454,16 @@ mod tui_lifecycle_tests {
         command.args(["-c", "sleep 30"]).process_group(0);
         let mut child = command.spawn().expect("spawn cancellable task");
 
-        interrupt_process_tree(&mut child).expect("interrupt process group");
+        interrupt_process_tree_pid(child.id()).expect("interrupt process group");
         let status = child.wait().expect("wait for interrupted task");
 
         assert!(!status.success());
     }
 
     #[cfg(unix)]
-    #[test]
-    fn second_stream_bridge_is_rejected_while_one_is_active() {
-        let child = ProcessCommand::new("sh")
+    #[tokio::test]
+    async fn second_stream_bridge_is_rejected_while_one_is_active() {
+        let child = AsyncProcessCommand::new("sh")
             .args(["-c", "sleep 30"])
             .spawn()
             .expect("spawn active bridge placeholder");
@@ -4055,7 +5482,8 @@ mod tui_lifecycle_tests {
             tx,
             Arc::clone(&active_bridge),
             Arc::new(AtomicBool::new(false)),
-        );
+        )
+        .await;
 
         assert!(result
             .expect_err("second bridge must be rejected")
@@ -4066,8 +5494,8 @@ mod tui_lifecycle_tests {
             .expect("active bridge lock")
             .take()
             .expect("active bridge child");
-        child.kill().expect("stop placeholder bridge");
-        child.wait().expect("reap placeholder bridge");
+        child.start_kill().expect("stop placeholder bridge");
+        child.wait().await.expect("reap placeholder bridge");
     }
 }
 
@@ -4119,8 +5547,8 @@ mod host_capability_tests {
     }
 }
 
-fn spawn_bridge(args: &TuiArgs, action: &str, prompt: Option<&str>) -> Result<Child> {
-    let mut command = ProcessCommand::new(&args.python);
+fn spawn_bridge_async(args: &TuiArgs, action: &str, prompt: Option<&str>) -> Result<AsyncChild> {
+    let mut command = AsyncProcessCommand::new(&args.python);
     command
         .arg("-m")
         .arg("agent.main")
@@ -4130,15 +5558,20 @@ fn spawn_bridge(args: &TuiArgs, action: &str, prompt: Option<&str>) -> Result<Ch
         .arg(&args.session_id)
         .current_dir(&args.repo_root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_bridge_credentials(&mut command, args);
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Ok(api_keys) = args.api_keys.lock() {
+        for (env_name, api_key) in api_keys.iter() {
+            command.env(env_name, api_key);
+        }
+    }
     if let Some(prompt) = prompt {
         command.arg("--bridge-prompt").arg(prompt);
     }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        command.as_std_mut().process_group(0);
     }
     Ok(command.spawn()?)
 }
@@ -4155,17 +5588,18 @@ mod tui_tests {
             provider: String::from("anthropic"),
             model: String::from("claude-sonnet-4.5"),
             mode: String::from("hosted"),
-            reasoning_effort: String::from("provider controlled"),
             configuration: String::from("Anthropic is not configured. Set ANTHROPIC_API_KEY."),
             configuration_state: String::from("api_key_required"),
-            cost_usd: 0.0,
-            tokens: BridgeTokens {
-                input: 0,
-                output: 0,
-                reasoning: 0,
-                cache_read: 0,
-                cache_write: 0,
+            _context_limit: Some(128_000),
+            pending_attachments: Vec::new(),
+            _tokens: BridgeTokens {
+                _input: 0,
+                _output: 0,
+                _reasoning: 0,
+                _cache_read: 0,
+                _cache_write: 0,
             },
+            cost_usd: 0.0,
         }
     }
 
@@ -4182,6 +5616,10 @@ mod tui_tests {
                 messages: Vec::new(),
             },
             input: String::new(),
+            attachment_path_mode: false,
+            attachment_button_area: None,
+            attachment_hit_areas: Vec::new(),
+            attachment_preview: None,
             status: String::from("Ready"),
             scroll: 0,
             auto_follow: true,
@@ -4193,7 +5631,9 @@ mod tui_tests {
             activity: Vec::new(),
             subagent_run: None,
             palette: BridgeCompletions::default(),
+            palette_source: None,
             palette_selected: 0,
+            transcript_cache: None,
             approval_selected: 0,
             current_tool: None,
             reasoning_text: String::new(),
@@ -4201,7 +5641,7 @@ mod tui_tests {
             running_prompt: None,
             secret_provider: None,
             secret_input: String::new(),
-            notices: Vec::new(),
+            notices: VecDeque::new(),
             setup_required: false,
             gateway_view: None,
         }
@@ -4292,7 +5732,7 @@ mod tui_tests {
     }
 
     #[test]
-    fn parallel_subagent_events_are_visible_in_activity_panel() {
+    fn parallel_subagent_events_are_visible_in_conversation_trace() {
         let mut app = test_app();
         app.submitting = true;
 
@@ -4334,12 +5774,11 @@ mod tui_tests {
             },
         );
 
-        let rendered = rendered_text(&activity_panel_text(&app));
-        assert!(rendered.contains("Parallel agents"));
-        assert!(rendered.contains("0/2 complete"));
+        let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
+        assert!(rendered.contains("1 agent running"));
         assert!(rendered.contains("architecture"));
-        assert!(rendered.contains("running"));
-        assert!(rendered.contains("owns tests"));
+        assert!(rendered.contains("Running"));
+        assert!(rendered.contains("inspect tests"));
         assert!(rendered.contains(".agent/parallel-work.md"));
         assert_eq!(app.status, "architecture · running — inspect architecture");
     }
@@ -4398,11 +5837,11 @@ mod tui_tests {
         assert_eq!(run.completed, 1);
         assert_eq!(run.failed, 1);
         assert_eq!(run.status, "incomplete");
-        let rendered = rendered_text(&activity_panel_text(&app));
+        let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
         let compact = rendered.replace('\n', "");
-        assert!(rendered.contains("1/2 complete"));
-        assert!(compact.contains("python · complete"));
-        assert!(compact.contains("rust · failed"));
+        assert!(rendered.contains("1/2 agents finished"));
+        assert!(compact.contains("python  Done"));
+        assert!(compact.contains("rust  Failed"));
     }
 
     #[test]
@@ -4448,7 +5887,9 @@ mod tui_tests {
         assert_eq!(task.status, "running");
         assert_eq!(task.owned_paths, vec![String::from("tasker/client")]);
         assert_eq!(task.changed_count, 2);
-        assert!(rendered_text(&activity_panel_text(&app)).contains("write_file"));
+        let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
+        assert!(rendered.contains("implement client"));
+        assert!(!rendered.contains("write_file"));
     }
 
     #[test]
@@ -4498,6 +5939,59 @@ mod tui_tests {
     }
 
     #[test]
+    fn provider_reasoning_summary_is_inline_but_raw_reasoning_is_not() {
+        let mut app = test_app();
+        app.submitting = true;
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("reasoning_started"),
+                ..BridgeEvent::default()
+            },
+        );
+        apply_bridge_event(
+            &mut app,
+            BridgeEvent {
+                kind: String::from("reasoning_summary_delta"),
+                delta: Some(String::from("Inspecting the affected files")),
+                ..BridgeEvent::default()
+            },
+        );
+
+        let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
+
+        assert!(rendered.contains("Inspecting the affected files"));
+        assert!(!rendered.contains("Reasoning ·"));
+        assert!(!rendered.contains("ACTIVITY"));
+    }
+
+    #[test]
+    fn reasoning_summary_filters_empty_protocol_placeholders() {
+        assert_eq!(
+            clean_reasoning_summary("**Checking**\n<!-- -->\n\nReading tests"),
+            "**Checking**\nReading tests"
+        );
+    }
+
+    #[test]
+    fn latex_formulas_are_rendered_as_readable_terminal_math() {
+        let state = terminal_math_text(r"\[ h_L = h_l + \sum_{i=1}^{L-1} f_i(h_i) \]");
+        let gradient = terminal_math_text(
+            r"\nabla_{h_L}\mathcal{E} = \nabla_{h_L}\mathcal{E} + \nabla_{h_L}\mathcal{E}\left(\frac{\partial}{\partial h_i}\sum_{i=1}^{L-1} f_i(h_i)\right)",
+        );
+        let prose = terminal_math_text(r"The hidden state \(h_L\) carries earlier information.");
+
+        assert_eq!(state, " h_(L) = hₗ + ∑ᵢ₌₁ᴸ⁻¹ fᵢ(hᵢ) ");
+        assert!(gradient.contains("∇_(h_(L))ℰ"));
+        assert!(gradient.contains("(∂)/(∂ hᵢ)"));
+        assert!(!gradient.contains("\\frac"));
+        assert_eq!(prose, "The hidden state h_(L) carries earlier information.");
+
+        let inline_code = rendered_text(&Text::from(message_body_line(r"`\sum_{i=1}`")));
+        assert!(inline_code.contains(r"\sum_{i=1}"));
+    }
+
+    #[test]
     fn completed_turn_retains_recent_parallel_activity() {
         let mut app = test_app();
         app.submitting = true;
@@ -4535,10 +6029,9 @@ mod tui_tests {
         clear_live_turn_display(&mut app);
         app.submitting = false;
 
-        let rendered = rendered_text(&activity_panel_text(&app));
+        let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
         assert!(!rendered.contains("ordinary tool trace"));
-        assert!(rendered.contains("Recent parallel run"));
-        assert!(rendered.contains("2/2 complete"));
+        assert!(rendered.contains("✓ 2 agents finished"));
         assert!(rendered.contains("architecture"));
     }
 
@@ -4559,11 +6052,13 @@ mod tui_tests {
                 role: String::from("user"),
                 content: String::from("inspect the project"),
                 created_at: String::from("now"),
+                attachments: Vec::new(),
             },
             BridgeMessage {
                 role: String::from("assistant"),
                 content: String::from("Here is the result."),
                 created_at: String::from("now"),
+                attachments: Vec::new(),
             },
         ];
 
@@ -4668,22 +6163,36 @@ mod tui_tests {
     }
 
     #[test]
-    fn wide_layout_keeps_live_tool_trace_in_activity_panel_only() {
+    fn useful_live_trace_is_inline_at_every_layout_width() {
         let mut app = test_app();
         app.submitting = true;
         app.running_prompt = Some(String::from("inspect the project"));
+        app.reasoning_text = String::from("Checking the relevant modules");
+        app.streaming_text = String::from("I found the issue.");
         app.activity.push(ActivityLine {
             kind: String::from("tool"),
             text: String::from("Reading files"),
         });
+        push_notice(&mut app, "Old setup notice", "No longer blocking", false);
 
-        let wide_transcript = rendered_text(&transcript_text(&app.snapshot, &app, false));
+        let wide_transcript = rendered_text(&transcript_text(&app.snapshot, &app, true));
         let narrow_transcript = rendered_text(&transcript_text(&app.snapshot, &app, true));
-        let activity_panel = rendered_text(&activity_panel_text(&app));
-
-        assert!(!wide_transcript.contains("Reading files"));
+        assert!(wide_transcript.contains("Reading files"));
         assert!(narrow_transcript.contains("Reading files"));
-        assert!(activity_panel.contains("Reading files"));
+
+        for rendered in [&wide_transcript, &narrow_transcript] {
+            let prompt = rendered.find("inspect the project").expect("prompt");
+            let reasoning = rendered
+                .find("Checking the relevant modules")
+                .expect("reasoning summary");
+            let tool = rendered.find("Reading files").expect("tool progress");
+            let answer = rendered.find("I found the issue.").expect("draft answer");
+            let notice = rendered.find("Old setup notice").expect("notice");
+            assert!(prompt < reasoning);
+            assert!(reasoning < tool);
+            assert!(tool < answer);
+            assert!(answer < notice);
+        }
     }
 
     #[test]
@@ -4726,14 +6235,14 @@ mod tui_tests {
     }
 
     #[test]
-    fn compatible_provider_endpoint_requirement_is_not_an_api_key_requirement() {
+    fn compatible_provider_endpoint_requirement_is_preserved_in_snapshot() {
         let mut session = anthropic_session();
         session.provider = String::from("openai-compatible");
         session.configuration = String::from(
             "OpenAI-compatible provider is not configured. Set AGENT_OPENAI_COMPAT_BASE_URL.",
         );
         session.configuration_state = String::from("endpoint_required");
-        assert!(!configuration_needs_api_key(&session));
+        assert_eq!(session.configuration_state, "endpoint_required");
     }
 
     #[test]
@@ -4741,6 +6250,95 @@ mod tui_tests {
         assert_eq!(palette_visible_start(30, 0, 8), 0);
         assert_eq!(palette_visible_start(30, 12, 8), 5);
         assert_eq!(palette_visible_start(30, 29, 8), 22);
+    }
+
+    #[test]
+    fn palette_requests_follow_input_and_non_commands_clear_results() {
+        let mut app = test_app();
+        let (tx, mut rx) = watch::channel(None::<Arc<str>>);
+
+        app.input = String::from("/mo");
+        request_palette_refresh(&tx, &mut app);
+        let request = rx
+            .borrow_and_update()
+            .clone()
+            .expect("slash command request");
+        assert_eq!(request.as_ref(), "/");
+
+        app.palette.entries.push(test_palette_entry("model", true));
+        app.input = String::from("ordinary prompt");
+        request_palette_refresh(&tx, &mut app);
+        assert!(app.palette.entries.is_empty());
+        assert!(!rx.has_changed().expect("palette sender remains available"));
+
+        app.input = String::from("/");
+        request_palette_refresh(&tx, &mut app);
+        assert_eq!(
+            rx.borrow_and_update().as_deref().expect("new root request"),
+            "/"
+        );
+    }
+
+    #[test]
+    fn palette_reuses_a_source_and_filters_entries_without_new_requests() {
+        let mut app = test_app();
+        let (tx, mut rx) = watch::channel(None::<Arc<str>>);
+
+        app.input = String::from("/model ");
+        request_palette_refresh(&tx, &mut app);
+        assert_eq!(
+            rx.borrow_and_update().as_deref().expect("model request"),
+            "/model "
+        );
+
+        app.palette.entries = vec![
+            BridgeCompletionEntry {
+                value: String::from("openai/gpt-small"),
+                label: String::from("gpt-small"),
+                description: String::new(),
+                complete_to: String::from("/model openai gpt-small"),
+                execute: true,
+            },
+            BridgeCompletionEntry {
+                value: String::from("anthropic/claude-small"),
+                label: String::from("claude-small"),
+                description: String::new(),
+                complete_to: String::from("/model anthropic claude-small"),
+                execute: true,
+            },
+        ];
+        app.input = String::from("/model gpt");
+        request_palette_refresh(&tx, &mut app);
+
+        assert!(!rx.has_changed().expect("palette sender remains available"));
+        let context = palette_context(&app.input).expect("palette context");
+        assert_eq!(
+            visible_palette_indices(&app.palette, context.query).collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn palette_context_does_not_request_completion_for_complete_commands() {
+        assert!(palette_context("/model openai gpt").is_none());
+        assert!(palette_context("plain text").is_none());
+        assert!(matches!(
+            palette_context("/model ").map(|context| context.source),
+            Some(PaletteSource::Command("/model"))
+        ));
+    }
+
+    #[test]
+    fn stale_palette_results_cannot_replace_current_input_results() {
+        let mut app = test_app();
+        app.input = String::from("/current");
+        app.palette
+            .entries
+            .push(test_palette_entry("current", true));
+
+        apply_palette_result(&mut app, "/stale", Err(anyhow::anyhow!("stale")));
+
+        assert_eq!(app.palette.entries[0].label, "current");
     }
 
     #[test]
@@ -4760,11 +6358,32 @@ mod tui_tests {
             });
         }
 
-        let title = palette_title(&palette, 12, 8);
+        let title = palette_title(&palette, "", 12, 8);
 
         assert!(title.contains("Models · 6-13/30"));
         assert!(title.contains("PgUp/PgDn"));
         assert!(title.contains("wheel"));
+    }
+
+    #[test]
+    fn model_palette_keeps_full_long_model_names_visible() {
+        let model = "Qwen/Qwen2.5-Coder-32B-Instruct";
+        let palette = BridgeCompletions {
+            title: String::from("Models"),
+            selected_index: Some(0),
+            entries: vec![BridgeCompletionEntry {
+                value: format!("vllm/{model}"),
+                label: String::from(model),
+                description: String::from("vLLM · Ready · 32.5B params · ~65 GB · 128K ctx"),
+                complete_to: format!("/model vllm {model}"),
+                execute: true,
+            }],
+        };
+
+        let rendered = rendered_text(&palette_text(&palette, "", 0, 1, 24));
+
+        assert!(rendered.contains(model));
+        assert!(!rendered.contains("..."));
     }
 
     #[test]
@@ -4781,11 +6400,11 @@ mod tui_tests {
             ],
         };
 
-        assert_eq!(closest_selectable_palette_index(&palette, 0), Some(1));
-        assert_eq!(previous_palette_index(&palette, 4), 2);
-        assert_eq!(next_palette_index(&palette, 2), 4);
-        assert_eq!(move_palette_index(&palette, 0, 3), 4);
-        assert_eq!(last_selectable_palette_index(&palette), Some(4));
+        assert_eq!(closest_selectable_palette_index(&palette, "", 0), Some(1));
+        assert_eq!(previous_palette_index(&palette, "", 4), 2);
+        assert_eq!(next_palette_index(&palette, "", 2), 4);
+        assert_eq!(move_palette_index(&palette, "", 0, 3), 4);
+        assert_eq!(last_selectable_palette_index(&palette, ""), Some(4));
     }
 
     #[test]
@@ -4797,15 +6416,15 @@ mod tui_tests {
                 test_palette_entry("/model", false),
                 test_palette_entry("/install", false),
                 test_palette_entry("/reasoning", false),
-                test_palette_entry("/tools", true),
+                test_palette_entry("/skills", true),
             ],
         };
 
-        assert_eq!(closest_selectable_palette_index(&palette, 0), Some(0));
-        assert_eq!(next_palette_index(&palette, 0), 1);
-        assert_eq!(next_palette_index(&palette, 1), 2);
-        assert_eq!(next_palette_index(&palette, 2), 3);
-        assert_eq!(previous_palette_index(&palette, 3), 2);
+        assert_eq!(closest_selectable_palette_index(&palette, "", 0), Some(0));
+        assert_eq!(next_palette_index(&palette, "", 0), 1);
+        assert_eq!(next_palette_index(&palette, "", 1), 2);
+        assert_eq!(next_palette_index(&palette, "", 2), 3);
+        assert_eq!(previous_palette_index(&palette, "", 3), 2);
     }
 
     #[test]
@@ -4835,6 +6454,98 @@ mod tui_tests {
             footer_help_text(false, true, true),
             "Enter/Y approve  N/Esc deny  Ctrl+N/P select"
         );
+    }
+
+    #[test]
+    fn attachment_control_is_icon_click_target_with_keyboard_shortcut_in_footer() {
+        let text = rendered_text(&attachment_button_text(true));
+
+        assert!(text.contains("+"));
+        assert!(!text.contains("Add file"));
+        assert!(!text.contains("F4"));
+        assert!(footer_help_text(false, false, false).contains("click +/Ctrl+O/F4"));
+    }
+
+    #[test]
+    fn pending_attachment_renders_as_clickable_file_chip() {
+        let attachment = BridgeAttachment {
+            filename: String::from("quarterly-report.pdf"),
+            mime: String::from("application/pdf"),
+            size_bytes: 123,
+            storage_path: Some(String::from("/private/attachments/report")),
+        };
+
+        let (line, targets) = attachment_chip_line(&[attachment], 10, 20, 40);
+        let rendered = rendered_text(&Text::from(line));
+
+        assert!(rendered.contains("quarterly-report.pdf"));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].area.x, 10);
+        assert_eq!(targets[0].area.y, 20);
+        assert_eq!(
+            targets[0].storage_path.as_deref(),
+            Some("/private/attachments/report")
+        );
+    }
+
+    #[test]
+    fn sent_attachment_remains_clickable_in_visible_transcript() {
+        let mut app = test_app();
+        app.snapshot.messages.push(BridgeMessage {
+            role: String::from("user"),
+            content: String::from("Review this"),
+            created_at: String::from("now"),
+            attachments: vec![BridgeAttachment {
+                filename: String::from("report.pdf"),
+                mime: String::from("application/pdf"),
+                size_bytes: 123,
+                storage_path: Some(String::from("/private/attachments/report")),
+            }],
+        });
+        let text = transcript_text(&app.snapshot, &app, true);
+
+        let targets =
+            transcript_attachment_hit_areas(&text, &app.snapshot, Rect::new(0, 0, 80, 12), 0);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].filename, "report.pdf");
+        assert_eq!(targets[0].area.y, 3);
+    }
+
+    #[test]
+    fn attachment_click_opens_inline_text_preview_without_launching_viewer() {
+        let path = std::env::temp_dir().join(format!(
+            "nym-attachment-preview-{}-{}.txt",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "first line\nsecond line").expect("write preview fixture");
+        let mut app = test_app();
+        app.attachment_hit_areas.push(AttachmentHitArea {
+            area: Rect::new(5, 6, 20, 1),
+            filename: String::from("notes.txt"),
+            mime: String::from("text/plain"),
+            size_bytes: 22,
+            storage_path: Some(path.to_string_lossy().into_owned()),
+        });
+
+        open_clicked_attachment(&mut app, 8, 6);
+
+        let preview = app.attachment_preview.as_ref().expect("inline preview");
+        assert_eq!(preview.filename, "notes.txt");
+        assert!(preview
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("second line")));
+        assert_eq!(app.status, "Previewing notes.txt");
+        std::fs::remove_file(path).expect("remove preview fixture");
+    }
+
+    #[test]
+    fn attachment_preview_file_sizes_are_human_readable() {
+        assert_eq!(human_file_size(12), "12 B");
+        assert_eq!(human_file_size(1536), "1.5 KiB");
+        assert_eq!(human_file_size(2 * 1024 * 1024), "2.0 MiB");
     }
 
     #[test]
@@ -4961,5 +6672,32 @@ mod tui_tests {
         assert!(!app.submitting);
         assert_eq!(app.input, "/install ollama qwen3 --yes");
         assert!(app.status.contains("press Enter to install"));
+    }
+
+    #[test]
+    fn footer_cost_text_formats_session_cost_for_corner_status() {
+        assert_eq!(footer_cost_text(0.0), "cost $0");
+        assert_eq!(footer_cost_text(0.0042), "cost $0.0042");
+        assert_eq!(footer_cost_text(1.234), "cost $1.23");
+    }
+
+    #[test]
+    fn sidebar_is_reserved_only_for_pending_approvals() {
+        let mut app = test_app();
+
+        assert!(!should_show_sidebar(120, &app));
+
+        app.snapshot.approvals.push(BridgeApproval {
+            id: String::from("req-1"),
+            tool: String::from("delete_path"),
+            reason: String::from("needs approval"),
+            requested_path: Some(String::from("/tmp/example.txt")),
+            display_path: None,
+            translated_path: None,
+            resolved_path: None,
+        });
+
+        assert!(should_show_sidebar(120, &app));
+        assert!(!should_show_sidebar(80, &app));
     }
 }

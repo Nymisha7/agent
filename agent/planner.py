@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 LOCAL_AGENT_PROMPT = """You are Agent, a local coding and desktop agent. Use tools for all live workspace, file, device, process, and desktop facts or actions. Never invent tool results.
 Resolve a user's named project or path with inspect_target before broader inspection. Pass the target words as the user wrote them; do not invent a normalized path or add suffixes such as _project. Do not recursively inspect the workspace root when it contains multiple projects unless the user explicitly requested the whole workspace. Ask when multiple target candidates remain.
 Treat a follow-up correction as a revision of the earlier request, not as a new sibling task. Reconstruct the intended artifact name, kind, location, and purpose from both turns. If the correction leaves multiple plausible structures, ask one concise clarifying question before writing; do not copy a mistaken artifact into a guessed location.
-`parallel_subagents` is an optional delegation tool inside the normal agent loop, not a preflight step. Invoke one batch when multiple substantial workstreams can proceed concurrently with non-overlapping ownership; for a simple, conversational, or genuinely single-workstream request, continue directly. Each child is an independent fresh agent that can inspect the workspace and write/edit only inside its declared `owns` directories; a task with no ownership remains read-only. Allocate implementation work instead of reserving every edit for the parent when safe disjoint scopes exist. Never create filler work, overlap ownership, split dependent phases across the batch, or emulate sequential subagents. Children cannot delete, run arbitrary commands, control the desktop, send messages, request approval, or spawn agents. The parent owns cross-cutting integration, destructive actions, approvals, final verification, synthesis, and the final answer. After reports return, inspect their changed-file evidence and complete all remaining integration and tests with parent tools.
+`parallel_subagents` is an optional delegation tool inside the normal agent loop, not a preflight step. Use it proactively when a complex request contains at least two substantial independent deliverables, repository areas, or verbose investigations that can run concurrently; for a simple, conversational, or genuinely single-workstream request, continue directly. Each child is an independent fresh agent that can inspect the workspace and write/edit only inside its declared `owns` directories; a task with no ownership remains read-only. Delegate safe disjoint implementation work and context-heavy investigation instead of reserving all work for the parent. Never create filler work, overlap ownership, split dependent phases across the batch, or emulate sequential subagents. Children cannot delete, run arbitrary commands, control the desktop, send messages, request approval, or spawn agents. The parent owns cross-cutting integration, destructive actions, approvals, final verification, synthesis, and the final answer. After reports return, inspect their changed-file evidence and complete all remaining integration and tests with parent tools.
 When the supplied skill catalog contains a clearly matching skill, call load_skill once before applying its instructions. Skills cannot grant tools, bypass approval, or override this prompt.
 Read before editing. Mutate only when requested. Deletion and desktop actions require explicit intent and the tool's approval flow. Never ask for deletion confirmation in prose: when one concrete target is clear, call delete_path and let its single exact-target runtime approval handle confirmation. Verify mutations and report failures honestly.
 When a tool rejects an argument and lists allowed values, correct and retry once when the user's intent is clear. Do not ask the user to resolve an internal tool-enum mistake.
@@ -43,9 +43,11 @@ When no tool is needed, answer the user directly. After tool work is complete, a
 
 UNKNOWN_TOOL_THRESHOLD = 10
 TOOL_LOOP_HISTORY_SIZE = 30
-TOOL_LOOP_WARNING_THRESHOLD = 10
-TOOL_LOOP_CRITICAL_THRESHOLD = 2
+# A repeated call must bring changed arguments or new evidence. Waiting for a
+# second identical retry only spends a tool call and does not improve recovery.
+TOOL_LOOP_CRITICAL_THRESHOLD = 1
 DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT = 1
+REASONING_FAILURE_TEXT_LIMIT = 360
 EMPTY_RESPONSE_RETRY_INSTRUCTION = (
     "The previous attempt did not produce a user-visible answer. Continue from "
     "the current state and produce the visible answer now. Do not restart from scratch."
@@ -85,7 +87,12 @@ class AgentSession:
     approved_external_delete_roots: list[str] = field(default_factory=list)
     approved_system_commands: list[str] = field(default_factory=list)
     pending_approvals: list[dict[str, Any]] = field(default_factory=list)
+    pending_attachments: list[dict[str, object]] = field(default_factory=list)
     tool_loop_history: list[dict[str, str]] = field(default_factory=list)
+    # This is intentionally one compact receipt, not a plan or a second
+    # planner. It carries an unresolved outcome across turns so the model does
+    # not have to rediscover a failure from truncated chat history.
+    last_failure: dict[str, str] = field(default_factory=dict)
     desktop_targets: list[dict[str, str]] = field(default_factory=list)
     last_desktop_snapshot: dict[str, str] = field(default_factory=dict)
 
@@ -101,6 +108,7 @@ def run_agent(
     session: AgentSession | None = None,
     stored_context: str | None = None,
     conversation_history: list[dict[str, Any]] | None = None,
+    current_attachments: list[dict[str, Any]] | None = None,
     record_event: Callable[..., None] | None = None,
     stream_event: Callable[[dict[str, Any]], None] | None = None,
     approval_requester: Callable[[dict[str, Any]], str] | None = None,
@@ -112,8 +120,20 @@ def run_agent(
 ) -> str:
     effective_search_roots = search_roots if search_roots is not None else []
     compact_local_context = _prefers_compact_local_context(llm)
-    system_prompt = LOCAL_AGENT_PROMPT if compact_local_context else load_system_prompt()
+    system_prompt = (
+        LOCAL_AGENT_PROMPT
+        if compact_local_context
+        else load_system_prompt(
+            provider=getattr(llm, "provider", None),
+            model=getattr(llm, "model", None),
+        )
+    )
     active_session = session or AgentSession()
+    if active_session.last_failure.get("scope") == "turn":
+        # A prior turn already reported this partial outcome. Keep durable hard
+        # failures, but do not make an incomplete aggregate result poison every
+        # later request after relaunch.
+        active_session.last_failure.clear()
     workspace_root_path = Path(workspace_root)
     rust_bin = getattr(rust, "rust_bin", None)
     parallel_runner = (
@@ -147,7 +167,9 @@ def run_agent(
         skill_catalog=skill_catalog,
     )
     tool_registry = build_tool_registry(tool_ctx)
-    if tool_allowlist is not None:
+    if tool_allowlist is None:
+        tool_registry = tool_registry.defaults()
+    else:
         tool_registry = tool_registry.restricted(set(tool_allowlist))
     tools = tool_registry.schemas()
     if compact_local_context:
@@ -164,6 +186,7 @@ def run_agent(
         context_text=context_text,
         session=active_session,
         user_prompt=visible_prompt,
+        current_attachments=current_attachments,
         conversation_history=(
             _bounded_recent_history(conversation_history, max_messages=4, max_chars=2_000)
             if compact_local_context
@@ -179,6 +202,9 @@ def run_agent(
     available_tool_names = _tool_names_from_schemas(tools)
     unknown_tool_streak = 0
     empty_response_retries = 0
+    unresolved_failure_this_run = False
+    unresolved_failure_step: int | None = None
+    completion_recovery_used = False
     run_id = uuid.uuid4().hex
     tool_loop_history = active_session.tool_loop_history
     for step in range(max_steps):
@@ -232,6 +258,14 @@ def run_agent(
                         "Call one of the available native tools now, or answer in normal text "
                         "if no tool is needed."
                     ),
+                })
+                continue
+            if unresolved_failure_this_run and not completion_recovery_used:
+                completion_recovery_used = True
+                msg_history.extend(_response_output_items(response))
+                msg_history.append({
+                    "role": "user",
+                    "content": _completion_recovery_instruction(active_session),
                 })
                 continue
             return policy.redact_text(response_text)
@@ -381,6 +415,24 @@ def run_agent(
                 observation=observation,
                 workspace_root=workspace_root_path,
             )
+            if _observation_requires_recovery(observation):
+                unresolved_failure_this_run = True
+                unresolved_failure_step = step
+            elif (
+                unresolved_failure_this_run
+                and unresolved_failure_step is not None
+                and step > unresolved_failure_step
+                and _observation_is_recovery_evidence(observation)
+            ):
+                # A later model turn chose and successfully executed a different
+                # evidence-based action. The earlier receipt remains in the
+                # message history, but it must not permanently poison completion.
+                active_session.last_failure.clear()
+                unresolved_failure_this_run = False
+                unresolved_failure_step = None
+            elif not active_session.last_failure:
+                unresolved_failure_this_run = False
+                unresolved_failure_step = None
             if call.name in {"desktop_action", "desktop_send_message", "desktop_clipboard_files"} and not (
                 isinstance(observation, dict) and observation.get("blocked") is True
             ):
@@ -449,6 +501,11 @@ def run_agent(
             return policy.redact_text(_response_text(final_response))
         msg_history.extend(_response_output_items(response))
         msg_history.extend(tool_outputs)
+        if unresolved_failure_this_run:
+            msg_history.append({
+                "role": "user",
+                "content": _recovery_instruction(active_session),
+            })
 
     final_response = llm.respond(
         instructions=system_prompt,
@@ -459,7 +516,8 @@ def run_agent(
                 "content": (
                     "Stop using tools now. Answer the user's request from the evidence "
                     "already gathered. Be explicit about any gaps caused by the tool "
-                    "budget being exhausted."
+                    "budget being exhausted. "
+                    + _unresolved_completion_constraint(active_session)
                 ),
             },
         ],
@@ -477,6 +535,7 @@ def _build_initial_messages(
     session: AgentSession,
     user_prompt: str,
     conversation_history: list[dict[str, Any]] | None,
+    current_attachments: list[dict[str, Any]] | None = None,
     skill_index_text: str = "",
 ) -> list[dict[str, Any]]:
     session_context = _session_context_text(session)
@@ -495,7 +554,7 @@ def _build_initial_messages(
         return (
             [{"role": "user", "content": "\n".join(parts)}]
             + _normalize_history(conversation_history)
-            + [{"role": "user", "content": user_prompt}]
+            + [_user_message_with_attachments(user_prompt, current_attachments)]
         )
 
     parts = [f"Workspace root: {workspace_root}"]
@@ -508,7 +567,23 @@ def _build_initial_messages(
     if skill_index_text:
         parts += ["", skill_index_text]
     parts += ["", f"User request: {user_prompt}"]
-    return [{"role": "user", "content": "\n".join(parts)}]
+    return [_user_message_with_attachments("\n".join(parts), current_attachments)]
+
+
+def _user_message_with_attachments(
+    content: str, attachments: list[dict[str, Any]] | None
+) -> dict[str, Any]:
+    if attachments:
+        content = (
+            f"{content}\n\n"
+            "Attachment note: attached files and images are part of this message. "
+            "Use supplied attachment content or image input; do not search the workspace "
+            "by filename unless the user explicitly asks you to."
+        )
+    message: dict[str, Any] = {"role": "user", "content": content}
+    if attachments:
+        message["attachments"] = attachments
+    return message
 
 
 def _prefers_compact_local_context(llm: LLMClient) -> bool:
@@ -571,17 +646,24 @@ def _bounded_recent_history(
     *,
     max_messages: int,
     max_chars: int,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     normalized = _normalize_history(history)
     selected = normalized[-max_messages:]
     if not selected:
         return []
     per_message = max_chars // len(selected)
-    return [
-        {"role": item["role"], "content": _truncate_text(item["content"], per_message)}
-        for item in selected
-        if item["content"]
-    ]
+    result: list[dict[str, Any]] = []
+    for item in selected:
+        if not item["content"]:
+            continue
+        message = {
+            "role": item["role"],
+            "content": _truncate_text(item["content"], per_message),
+        }
+        if attachments := item.get("attachments"):
+            message["attachments"] = attachments
+        result.append(message)
+    return result
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -607,7 +689,9 @@ def agent_session_from_dict(value: dict[str, Any] | None) -> AgentSession:
         approved_external_delete_roots=_string_list(value.get("approved_external_delete_roots")),
         approved_system_commands=_string_list(value.get("approved_system_commands")),
         pending_approvals=_pending_approval_dicts(value.get("pending_approvals")),
+        pending_attachments=_attachment_dicts(value.get("pending_attachments")),
         tool_loop_history=_tool_loop_history_dicts(value.get("tool_loop_history")),
+        last_failure=_reasoning_failure_dict(value.get("last_failure")),
         desktop_targets=_desktop_target_dicts(value.get("desktop_targets")),
         last_desktop_snapshot=_string_dict(value.get("last_desktop_snapshot")),
     )
@@ -625,7 +709,9 @@ def agent_session_to_dict(session: AgentSession) -> dict[str, Any]:
         "approved_external_delete_roots": session.approved_external_delete_roots,
         "approved_system_commands": session.approved_system_commands,
         "pending_approvals": session.pending_approvals,
+        "pending_attachments": session.pending_attachments,
         "tool_loop_history": session.tool_loop_history,
+        "last_failure": session.last_failure,
         "desktop_targets": session.desktop_targets,
         "last_desktop_snapshot": session.last_desktop_snapshot,
     }
@@ -651,6 +737,16 @@ def _pending_approval_dicts(value: Any) -> list[dict[str, Any]]:
     return approvals
 
 
+def _attachment_dicts(value: Any) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    attachments: list[dict[str, object]] = []
+    for item in value:
+        if isinstance(item, dict):
+            attachments.append(dict(item))
+    return attachments
+
+
 def _tool_loop_history_dicts(value: Any) -> list[dict[str, str]]:
     if not isinstance(value, list):
         return []
@@ -666,6 +762,17 @@ def _tool_loop_history_dicts(value: Any) -> list[dict[str, str]]:
         if {"tool", "args_hash"} <= set(record):
             history.append(record)
     return history
+
+
+def _reasoning_failure_dict(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key in ("tool", "reason", "guidance"):
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            result[key] = _compact_reasoning_text(item)
+    return result if "tool" in result and "reason" in result else {}
 
 
 def _string_dict(value: Any) -> dict[str, str]:
@@ -1427,6 +1534,14 @@ def _normalize_desktop_window_id(value: str) -> str | None:
 
 def _session_context_text(session: AgentSession) -> str:
     lines: list[str] = []
+    if session.last_failure:
+        tool = session.last_failure.get("tool", "tool")
+        reason = session.last_failure.get("reason", "an unresolved outcome")
+        lines.append("Unresolved prior tool outcome:")
+        lines.append(f"- {tool}: {reason}")
+        guidance = session.last_failure.get("guidance")
+        if guidance:
+            lines.append(f"- next step: {guidance}")
     if session.active_root:
         lines.append(f"Active root: {session.active_root}")
     if session.focus_paths:
@@ -1498,8 +1613,13 @@ def _update_session_from_tool_result(
     observation: Any,
     workspace_root: Path,
 ) -> None:
-    if not isinstance(observation, dict) or observation.get("ok") is False:
+    if not isinstance(observation, dict):
         return
+    if _observation_requires_recovery(observation):
+        _remember_reasoning_failure(session, tool, observation)
+        return
+    if session.last_failure.get("tool") == tool:
+        session.last_failure.clear()
 
     if tool == "glob":
         _apply_candidates(session, _candidates_from_items(observation.get("matches")))
@@ -1535,6 +1655,75 @@ def _update_session_from_tool_result(
     if tool == "desktop_resolve":
         _apply_desktop_resolve(session, observation)
         return
+
+
+def _observation_requires_recovery(observation: dict[str, Any]) -> bool:
+    return observation.get("ok") is False or observation.get("complete") is False
+
+
+def _observation_is_recovery_evidence(observation: Any) -> bool:
+    return (
+        isinstance(observation, dict)
+        and observation.get("ok") is True
+        and observation.get("blocked") is not True
+    )
+
+
+def _remember_reasoning_failure(
+    session: AgentSession,
+    tool: str,
+    observation: dict[str, Any],
+) -> None:
+    reason = (
+        _optional_str(observation.get("error"))
+        or _optional_str(observation.get("reason"))
+        or "the operation did not complete"
+    )
+    session.last_failure = {
+        "tool": tool,
+        "reason": _compact_reasoning_text(reason),
+    }
+    if observation.get("ok") is True and observation.get("complete") is False:
+        session.last_failure["scope"] = "turn"
+    guidance = _optional_str(observation.get("guidance"))
+    if guidance:
+        session.last_failure["guidance"] = _compact_reasoning_text(guidance)
+
+
+def _compact_reasoning_text(value: str) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= REASONING_FAILURE_TEXT_LIMIT:
+        return normalized
+    return normalized[: REASONING_FAILURE_TEXT_LIMIT - 3] + "..."
+
+
+def _recovery_instruction(session: AgentSession) -> str:
+    if not session.last_failure:
+        return "Continue from the latest tool evidence."
+    tool = session.last_failure.get("tool", "the previous tool")
+    reason = session.last_failure.get("reason", "an unresolved outcome")
+    guidance = session.last_failure.get("guidance")
+    parts = [
+        f"Recovery requirement: {tool} did not complete: {reason}",
+        "Do not repeat that exact call without new evidence or changed arguments.",
+        "Use a different evidence-based action, or report a concrete blocker.",
+    ]
+    if guidance:
+        parts.insert(1, f"Tool guidance: {guidance}")
+    return " ".join(parts)
+
+
+def _completion_recovery_instruction(session: AgentSession) -> str:
+    return (
+        _recovery_instruction(session)
+        + " Do not claim completion while this outcome is unresolved."
+    )
+
+
+def _unresolved_completion_constraint(session: AgentSession) -> str:
+    if not session.last_failure:
+        return ""
+    return "Do not claim completion while an unresolved tool outcome remains."
 
 
 def _apply_candidates(session: AgentSession, candidates: list[dict[str, str]]) -> None:
@@ -1938,11 +2127,11 @@ def _absolute_path_text(path: str, workspace_root: Path) -> str:
     return str(workspace_root / candidate)
 
 
-def _normalize_history(history: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+def _normalize_history(history: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     if not history:
         return []
     policy = PolicyEngine()
-    result: list[dict[str, str]] = []
+    result: list[dict[str, Any]] = []
     for item in history:
         if not isinstance(item, dict):
             continue
@@ -1955,7 +2144,10 @@ def _normalize_history(history: list[dict[str, Any]] | None) -> list[dict[str, s
         content = _strip_model_artifacts(policy.redact_text(content))
         if not content:
             continue
-        result.append({"role": role, "content": content})
+        message = {"role": role, "content": content}
+        if isinstance(item.get("attachments"), list) and item["attachments"]:
+            message["attachments"] = item["attachments"]
+        result.append(message)
     return result
 
 
@@ -2206,29 +2398,9 @@ def _detect_generic_tool_loop(
             "args_hash": args_hash,
             "result_hash": latest_result_hash,
             "message": (
-                f"CRITICAL: Called {call.name} with identical arguments and identical "
-                f"outcomes {no_progress_streak} times. Session execution blocked "
-                "to prevent runaway loops."
-            ),
-        }
-    recent_count = sum(
-        1
-        for record in history
-        if record.get("run_id") == run_id
-        and record.get("tool") == call.name
-        and record.get("args_hash") == args_hash
-    )
-    if recent_count >= TOOL_LOOP_WARNING_THRESHOLD:
-        return {
-            "level": "warning",
-            "detector": "generic_repeat",
-            "count": recent_count,
-            "args_hash": args_hash,
-            "result_hash": latest_result_hash,
-            "message": (
-                f"WARNING: You have called {call.name} {recent_count} times with "
-                "identical arguments. If this is not making progress, stop retrying "
-                "and report the task as failed."
+                f"CRITICAL: {call.name} already produced the same outcome for these "
+                "arguments. The identical retry is blocked; use changed arguments or "
+                "a different evidence-gathering action."
             ),
         }
     return None
@@ -2416,6 +2588,13 @@ def _normalize_stream_event(event: Any) -> dict[str, Any] | None:
     if not isinstance(event_type, str):
         return None
 
+    if event_type == "response.reasoning_summary_text.delta":
+        return {
+            "kind": "reasoning_summary_delta",
+            "delta": _get(event, "delta", ""),
+            "item_id": _get(event, "item_id"),
+            "sequence_number": _get(event, "sequence_number"),
+        }
     if event_type == "response.reasoning_text.delta":
         # Do not forward private chain-of-thought to UI clients. They receive
         # a state transition and the inspectable tool/result trace instead.

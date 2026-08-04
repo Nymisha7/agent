@@ -16,6 +16,7 @@ class ToolSpec:
     name: str
     schema: dict[str, Any]
     handler: ToolHandler
+    default_enabled: bool = True
 
 
 class ToolRegistry:
@@ -29,6 +30,13 @@ class ToolRegistry:
 
     def schemas(self) -> list[dict[str, Any]]:
         return [tool.schema for tool in self._tools.values()]
+
+    def defaults(self) -> "ToolRegistry":
+        defaults = ToolRegistry()
+        for tool in self._tools.values():
+            if tool.default_enabled:
+                defaults.register(tool)
+        return defaults
 
     def restricted(self, allowed_names: set[str]) -> "ToolRegistry":
         restricted = ToolRegistry()

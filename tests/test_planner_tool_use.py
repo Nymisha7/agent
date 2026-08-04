@@ -23,7 +23,9 @@ from agent.planner import (
     _summarize_approval_request,
     _prepare_tool_output,
     _preflight_tool_call,
+    _session_context_text,
     _looks_like_unexecuted_action,
+    _normalize_stream_event,
     _verify_mutation_observation,
     _update_session_from_tool_result,
     agent_session_from_dict,
@@ -37,6 +39,25 @@ from agent.tools import ToolContext, _context_file_paths, build_tool_registry
 
 
 class PlannerToolUseTests(unittest.TestCase):
+    def test_reasoning_summary_delta_is_forwarded_without_raw_thoughts(self) -> None:
+        summary = _normalize_stream_event(SimpleNamespace(
+            type="response.reasoning_summary_text.delta",
+            delta="Checking the affected files",
+            item_id="reasoning-1",
+            sequence_number=3,
+        ))
+        raw = _normalize_stream_event(SimpleNamespace(
+            type="response.reasoning_text.delta",
+            delta="private token-by-token reasoning",
+            item_id="reasoning-1",
+            sequence_number=2,
+        ))
+
+        self.assertEqual(summary["kind"], "reasoning_summary_delta")
+        self.assertEqual(summary["delta"], "Checking the affected files")
+        self.assertEqual(raw["kind"], "reasoning_started")
+        self.assertNotIn("delta", raw)
+
     def test_system_prompt_mentions_write_file_tool(self) -> None:
         prompt = load_system_prompt()
         self.assertIn("write_file", prompt)
@@ -64,6 +85,33 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertNotIn("does not need discovery", LOCAL_AGENT_PROMPT)
         self.assertIn("When no tool is needed, answer directly", prompt)
         self.assertIn("A partial inspection", prompt)
+
+    def test_gpt_prompt_uses_model_specific_outcome_guidance(self) -> None:
+        prompt = load_system_prompt(provider="openai", model="gpt-5.5")
+
+        self.assertIn("# GPT-family guidance", prompt)
+        self.assertIn("Balance concision with the detail required", prompt)
+        self.assertIn("important positive evidence", prompt)
+        self.assertIn("quantitative facts", prompt)
+        self.assertIn("attachment-only questions", prompt)
+
+    def test_non_gpt_prompt_does_not_receive_gpt_overlay(self) -> None:
+        prompt = load_system_prompt(provider="anthropic", model="claude-sonnet-4")
+
+        self.assertNotIn("# GPT-family guidance", prompt)
+        self.assertIn("# Agent", prompt)
+        self.assertIn("# Nym execution policy", prompt)
+
+    def test_system_prompt_override_replaces_composed_prompts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "override.txt"
+            path.write_text("Custom system prompt.", encoding="utf-8")
+            with patch.dict(
+                "os.environ", {"AGENT_SYSTEM_PROMPT_PATH": str(path)}, clear=False
+            ):
+                prompt = load_system_prompt(provider="openai", model="gpt-5.5")
+
+        self.assertEqual(prompt, "Custom system prompt.")
 
     def test_build_initial_messages_appends_current_prompt_after_history(self) -> None:
         messages = _build_initial_messages(
@@ -131,6 +179,32 @@ class PlannerToolUseTests(unittest.TestCase):
             {tool["name"] for tool in llm.requests[0]["tools"]},
         )
         self.assertFalse(any(event["kind"].startswith("subagent_") for event in events))
+
+    def test_run_agent_selects_prompt_overlay_from_model(self) -> None:
+        class FakeLLM:
+            provider = "openai"
+            model = "gpt-5.5"
+            reasoning_effort = None
+            reasoning_summary = None
+
+            def __init__(self) -> None:
+                self.instructions = ""
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.instructions = kwargs["instructions"]
+                return SimpleNamespace(output=[], output_text="Done.")
+
+        llm = FakeLLM()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=SimpleNamespace(),  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="Explain the attached report.",
+        )
+
+        self.assertEqual(answer, "Done.")
+        self.assertIn("# GPT-family guidance", llm.instructions)
+        self.assertIn("# Nym execution policy", llm.instructions)
 
     def test_run_agent_executes_model_invoked_parallel_batch(self) -> None:
         class FakeLLM:
@@ -210,6 +284,87 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("parallel_subagents", json.dumps(llm.requests[1]["messages"]))
         self.assertFalse(any(event["kind"].startswith("subagent_plan") for event in events))
 
+    def test_parent_can_complete_after_successful_alternative_recovery(self) -> None:
+        class FakeLLM:
+            provider = "openai"
+            model = "test-model"
+            reasoning_effort = None
+            reasoning_summary = None
+
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.requests.append(kwargs)
+                if len(self.requests) == 1:
+                    return SimpleNamespace(output=[{
+                        "type": "function_call",
+                        "name": "parallel_subagents",
+                        "call_id": "delegate-1",
+                        "arguments": json.dumps({"tasks": [
+                            {"id": "client", "task": "implement client", "owns": ["app/client"]},
+                            {"id": "styles", "task": "implement styles", "owns": ["app/styles"]},
+                        ]}),
+                    }], output_text="")
+                if len(self.requests) == 2:
+                    return SimpleNamespace(output=[{
+                        "type": "function_call",
+                        "name": "write_file",
+                        "call_id": "recover-1",
+                        "arguments": json.dumps({
+                            "path": "app/index.html",
+                            "content": "<!doctype html><title>Task manager</title>",
+                        }),
+                    }], output_text="")
+                return SimpleNamespace(
+                    output=[],
+                    output_text="Created and verified the task manager entry point.",
+                )
+
+        class FakeRust:
+            rust_bin = Path("/tmp/agent-rust")
+
+            def write_file(self, **kwargs: Any) -> dict[str, Any]:
+                path = Path(kwargs["path"])
+                content = str(kwargs["content"])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                return {
+                    "ok": True,
+                    "tool": "write_file",
+                    "path": str(path),
+                    "created": True,
+                    "after_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                }
+
+        parallel_result = {
+            "ok": True,
+            "execution_mode": "parallel",
+            "complete": False,
+            "work_file": "/workspace/.agent/parallel-work.md",
+            "tasks": [
+                {"task_id": "client", "ok": True, "complete": False},
+                {"task_id": "styles", "ok": True, "complete": True},
+            ],
+        }
+        session = AgentSession()
+        llm = FakeLLM()
+        with TemporaryDirectory() as tmp, patch(
+            "agent.planner.ParallelSubagentRunner.run",
+            return_value=parallel_result,
+        ):
+            answer = run_agent(
+                llm=llm,  # type: ignore[arg-type]
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=tmp,
+                user_prompt="build a task manager using subagents",
+                session=session,
+            )
+
+        self.assertEqual(answer, "Created and verified the task manager entry point.")
+        self.assertEqual(len(llm.requests), 3)
+        self.assertEqual(session.last_failure, {})
+
     def test_tool_registry_exposes_edit_and_delete_tools(self) -> None:
         ctx = ToolContext(
             rust=RustTools(Path("/tmp/agent-rust")),
@@ -234,6 +389,11 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("desktop_action", tool_names)
         self.assertIn("desktop_send_message", tool_names)
         self.assertIn("desktop_clipboard_files", tool_names)
+        default_tool_names = {
+            schema["name"] for schema in registry.defaults().schemas()
+        }
+        self.assertNotIn("language_server", default_tool_names)
+        self.assertIn("read_path", default_tool_names)
         desktop_action = next(schema for schema in registry.schemas() if schema["name"] == "desktop_action")
         actions = desktop_action["parameters"]["properties"]["action"]["enum"]
         self.assertIn("focus_window", actions)
@@ -243,6 +403,40 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("type_text", actions)
         self.assertIn("mouse_click", actions)
         self.assertIn("scroll", actions)
+
+    def test_language_server_requires_explicit_profile_tool_enablement(self) -> None:
+        class FakeLLM:
+            provider = "openai"
+            model = "test-model"
+            reasoning_effort = None
+            reasoning_summary = None
+
+            def __init__(self) -> None:
+                self.tool_names: set[str] = set()
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.tool_names = {tool["name"] for tool in kwargs["tools"]}
+                return SimpleNamespace(output=[], output_text="Done.")
+
+        default_llm = FakeLLM()
+        run_agent(
+            llm=default_llm,  # type: ignore[arg-type]
+            rust=SimpleNamespace(),  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="inspect the code",
+        )
+        self.assertNotIn("language_server", default_llm.tool_names)
+        self.assertIn("read_path", default_llm.tool_names)
+
+        code_intelligence_llm = FakeLLM()
+        run_agent(
+            llm=code_intelligence_llm,  # type: ignore[arg-type]
+            rust=SimpleNamespace(),  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="find this symbol",
+            tool_allowlist=("language_server",),
+        )
+        self.assertEqual(code_intelligence_llm.tool_names, {"language_server"})
 
     def test_device_tool_schema_accepts_runtime_discovered_categories(self) -> None:
         ctx = ToolContext(
@@ -1712,8 +1906,36 @@ class PlannerToolUseTests(unittest.TestCase):
             script.write_text("#!/bin/sh\nsleep 2\n")
             os.chmod(script, 0o755)
 
-            with self.assertRaises(TimeoutError):
-                RustTools(script).run_json([], timeout=0.05)
+            sensitive = "private timeout payload"
+            with self.assertRaises(TimeoutError) as raised:
+                RustTools(script).run_json(
+                    ["write-file", "--content", sensitive],
+                    timeout=0.05,
+                )
+
+            self.assertNotIn(sensitive, str(raised.exception))
+
+    def test_rust_worker_fallback_keeps_payload_out_of_process_arguments(self) -> None:
+        with TemporaryDirectory() as tmp:
+            script = Path(tmp) / "fake-rust-tool"
+            argv_log = Path(tmp) / "argv.json"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"pathlib.Path({str(argv_log)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+                "request = json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'id': request['id'], 'ok': True, 'result': request['args']}), flush=True)\n",
+                encoding="utf-8",
+            )
+            os.chmod(script, 0o755)
+            rust = RustTools(script)
+            sensitive = "private file contents"
+
+            with patch.object(rust, "_run_worker_json", side_effect=BrokenPipeError):
+                result = rust.run_json(["write-file", "--content", sensitive], timeout=1)
+
+            self.assertEqual(result, ["write-file", "--content", sensitive])
+            self.assertEqual(json.loads(argv_log.read_text(encoding="utf-8")), ["serve"])
 
     def test_rust_worker_demuxes_concurrent_out_of_order_responses(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2748,6 +2970,75 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(restored.desktop_targets, session.desktop_targets)
         self.assertEqual(restored.last_desktop_snapshot, session.last_desktop_snapshot)
 
+    def test_session_keeps_compact_unresolved_tool_outcome(self) -> None:
+        session = AgentSession()
+
+        _update_session_from_tool_result(
+            session,
+            tool="run_system_command",
+            args={"command": "build"},
+            observation={
+                "ok": False,
+                "error": "release executable was not found",
+                "guidance": "inspect the launch target before retrying",
+            },
+            workspace_root=Path("/workspace"),
+        )
+
+        self.assertEqual(session.last_failure["tool"], "run_system_command")
+        self.assertIn("release executable", session.last_failure["reason"])
+        self.assertIn("Unresolved prior tool outcome", _session_context_text(session))
+        restored = agent_session_from_dict(agent_session_to_dict(session))
+        self.assertEqual(restored.last_failure, session.last_failure)
+
+    def test_successful_retry_clears_matching_unresolved_tool_outcome(self) -> None:
+        session = AgentSession(last_failure={
+            "tool": "run_system_command",
+            "reason": "build failed",
+        })
+
+        _update_session_from_tool_result(
+            session,
+            tool="run_system_command",
+            args={"command": "build"},
+            observation={"ok": True, "status": "completed"},
+            workspace_root=Path("/workspace"),
+        )
+
+        self.assertEqual(session.last_failure, {})
+
+    def test_incomplete_aggregate_receipt_does_not_poison_the_next_turn(self) -> None:
+        session = AgentSession()
+        _update_session_from_tool_result(
+            session,
+            tool="delegated_operation",
+            args={},
+            observation={"ok": True, "complete": False},
+            workspace_root=Path("/workspace"),
+        )
+        self.assertEqual(session.last_failure["scope"], "turn")
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.messages: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.messages = list(kwargs["messages"])
+                return SimpleNamespace(output=[], output_text="Hello.")
+
+        llm = FakeLLM()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=object(),
+            workspace_root="/workspace",
+            user_prompt="say hello",
+            session=session,
+        )
+
+        self.assertEqual(answer, "Hello.")
+        self.assertEqual(session.last_failure, {})
+        self.assertNotIn("Unresolved prior tool outcome", json.dumps(llm.messages))
+
     def test_system_command_mutation_requires_approval(self) -> None:
         ctx = ToolContext(
             rust=RustTools(Path("/tmp/agent-rust")),
@@ -3056,6 +3347,48 @@ class PlannerToolUseTests(unittest.TestCase):
 
         self.assertEqual(answer, "A few things stood out.")
         self.assertEqual(llm.calls, 1)
+
+    def test_run_agent_requires_one_recovery_response_after_failed_tool(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.requests.append(kwargs)
+                if len(self.requests) == 1:
+                    return SimpleNamespace(
+                        output=[{
+                            "type": "function_call",
+                            "name": "not_available",
+                            "call_id": "call-1",
+                            "arguments": "{}",
+                        }],
+                        output_text="",
+                    )
+                if len(self.requests) == 2:
+                    return SimpleNamespace(output=[], output_text="Done.")
+                return SimpleNamespace(
+                    output=[],
+                    output_text="Blocked: the requested action needs a supported tool.",
+                )
+
+        session = AgentSession()
+        llm = FakeLLM()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=object(),
+            workspace_root="/workspace",
+            user_prompt="perform the unavailable action",
+            session=session,
+        )
+
+        self.assertEqual(answer, "Blocked: the requested action needs a supported tool.")
+        self.assertEqual(len(llm.requests), 3)
+        recovery_messages = json.dumps(llm.requests[1]["messages"])
+        self.assertIn("Recovery requirement", recovery_messages)
+        completion_messages = json.dumps(llm.requests[2]["messages"])
+        self.assertIn("Do not claim completion", completion_messages)
+        self.assertEqual(session.last_failure["tool"], "not_available")
 
     def test_local_host_prompt_requires_desktop_observation_before_answer(self) -> None:
         class FakeLLM:
@@ -3568,7 +3901,7 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertEqual(answer, "Stopped after loop block.")
-        self.assertEqual(rust.calls, 2)
+        self.assertEqual(rust.calls, 1)
         self.assertTrue(session.tool_loop_history)
         self.assertTrue(all(record.get("run_id") for record in session.tool_loop_history))
 
@@ -3583,7 +3916,7 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertEqual(second_answer, "Stopped after loop block.")
-        self.assertEqual(rust.calls, 4)
+        self.assertEqual(rust.calls, 2)
 
 
 if __name__ == "__main__":

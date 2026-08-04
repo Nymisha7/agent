@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
 from openai import OpenAI
+
+
+DEFAULT_MAX_TEXT_ATTACHMENT_BYTES = 512 * 1024
+DEFAULT_MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
 
 SUPPORTED_PROVIDERS = {
@@ -31,6 +37,14 @@ SUPPORTED_PROVIDERS = {
     "deepseek",
     "glm",
 }
+UNAVAILABLE_PROVIDER_TRANSPORTS = frozenset({
+    "copilot",
+    "gemini",
+    "bedrock",
+    "azure",
+    "vertexai",
+})
+AVAILABLE_PROVIDERS = frozenset(SUPPORTED_PROVIDERS) - UNAVAILABLE_PROVIDER_TRANSPORTS
 
 
 @dataclass
@@ -277,7 +291,7 @@ class LLMClient:
         request_args = {
             "model": self.model,
             "instructions": instructions,
-            "input": messages,
+            "input": _responses_input_messages(messages, provider=self.provider),
             "tools": tools,
             "previous_response_id": previous_response_id,
         }
@@ -318,7 +332,7 @@ class LLMClient:
     ) -> Any:
         request_args: dict[str, Any] = {
             "model": self.model,
-            "messages": _responses_messages_to_chat(messages, instructions),
+            "messages": _responses_messages_to_chat(messages, instructions, provider=self.provider),
         }
         chat_tools = _responses_tools_to_chat(tools)
         allowed_text_tool_names = {
@@ -688,7 +702,7 @@ def _default_reasoning_summary(provider: str, model: str | None) -> str | None:
     raw = (os.environ.get("AGENT_REASONING_SUMMARY") or "").strip().casefold()
     if raw in {"auto", "concise", "detailed"}:
         return raw
-    return None
+    return "auto"
 
 
 def _model_supports_reasoning(provider: str | None, model: str | None) -> bool:
@@ -823,7 +837,28 @@ def _ollama_base_url() -> str:
     return f"{raw}/v1"
 
 
-def _responses_messages_to_chat(messages: list[dict[str, Any]], instructions: str) -> list[dict[str, Any]]:
+def _responses_input_messages(messages: list[dict[str, Any]], *, provider: str) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for item in messages:
+        role = item.get("role")
+        attachments = _attachment_items(item)
+        if attachments and role == "user":
+            converted.append({
+                "role": role,
+                "content": _openai_content_parts(item, provider=provider),
+            })
+        else:
+            # Keep ordinary Responses input byte-for-byte compatible with the
+            # previous working transport. `input_text` is specifically for a
+            # user multimodal content part, not a blanket replacement for
+            # assistant/system history accepted by every Responses model.
+            converted.append(item)
+    return converted
+
+
+def _responses_messages_to_chat(
+    messages: list[dict[str, Any]], instructions: str, *, provider: str = "openai-compatible",
+) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     if instructions.strip():
         converted.append({"role": "system", "content": instructions})
@@ -855,7 +890,12 @@ def _responses_messages_to_chat(messages: list[dict[str, Any]], instructions: st
         role = item.get("role")
         content = item.get("content")
         if role in {"user", "assistant", "system"}:
-            converted.append({"role": role, "content": _message_content_text(content)})
+            text = _message_content_text(content)
+            attachments = _attachment_items(item)
+            if attachments and role == "user":
+                converted.append({"role": role, "content": _chat_content_parts(text, attachments, provider)})
+            else:
+                converted.append({"role": role, "content": text})
     return converted
 
 
@@ -892,8 +932,146 @@ def _responses_messages_to_anthropic(messages: list[dict[str, Any]]) -> list[dic
         if role == "system":
             role = "user"
         if role in {"user", "assistant"}:
-            converted.append({"role": role, "content": _message_content_text(item.get("content"))})
+            text = _message_content_text(item.get("content"))
+            attachments = _attachment_items(item)
+            if attachments and role == "user":
+                converted.append({"role": role, "content": _anthropic_content_parts(text, attachments)})
+            else:
+                converted.append({"role": role, "content": text})
     return converted
+
+
+def _attachment_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    value = message.get("attachments")
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _attachment_manifest(attachments: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        f"Attached file: {item.get('filename', 'file')} ({item.get('mime', 'application/octet-stream')}, {item.get('size_bytes', 0)} bytes)"
+        for item in attachments
+    )
+
+
+def _non_image_attachment_content(attachments: list[dict[str, Any]]) -> str:
+    return "\n".join(_attachment_content(item) for item in attachments)
+
+
+def _attachment_content(item: dict[str, Any]) -> str:
+    filename = str(item.get("filename") or "file")
+    mime = item.get("mime")
+    path = item.get("storage_path")
+    if not _is_text_attachment(mime, filename) or not isinstance(path, str):
+        return _attachment_manifest([item])
+    try:
+        limit = _max_text_attachment_bytes()
+        with Path(path).open("rb") as source:
+            raw = source.read(limit + 1)
+    except OSError:
+        return f"Attached file is unavailable: {filename}."
+
+    truncated = len(raw) > limit
+    text = raw[:limit].decode("utf-8", errors="replace")
+    suffix = "\n[Attachment content truncated at configured limit.]" if truncated else ""
+    return (
+        f"<attached_file name={filename!r} mime={mime!r}>\n"
+        f"{text}{suffix}\n"
+        "</attached_file>"
+    )
+
+
+def _is_text_attachment(mime: object, filename: str) -> bool:
+    if isinstance(mime, str) and (
+        mime.startswith("text/")
+        or mime in {"application/json", "application/xml", "application/javascript"}
+    ):
+        return True
+    return Path(filename).suffix.casefold() in {
+        ".txt", ".md", ".rst", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml", ".toml", ".xml",
+    }
+
+
+def _max_text_attachment_bytes() -> int:
+    raw = os.environ.get("AGENT_MAX_TEXT_ATTACHMENT_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TEXT_ATTACHMENT_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_TEXT_ATTACHMENT_BYTES
+    return value if value > 0 else DEFAULT_MAX_TEXT_ATTACHMENT_BYTES
+
+
+def _image_data_url(item: dict[str, Any]) -> str:
+    mime = item.get("mime")
+    path = item.get("storage_path")
+    if not isinstance(mime, str) or not mime.startswith("image/") or not isinstance(path, str):
+        raise ValueError("Only image attachments can be converted to visual model input.")
+    try:
+        image_path = Path(path)
+        size = image_path.stat().st_size
+        limit = _max_image_attachment_bytes()
+        if size > limit:
+            raise RuntimeError(
+                f"Image attachment exceeds the configured model-input limit of {limit} bytes: "
+                f"{item.get('filename', image_path.name)}"
+            )
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    except OSError as exc:
+        raise RuntimeError(f"Attachment is no longer available: {item.get('filename', path)}") from exc
+    return f"data:{mime};base64,{encoded}"
+
+
+def _max_image_attachment_bytes() -> int:
+    raw = os.environ.get("AGENT_MAX_IMAGE_ATTACHMENT_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_IMAGE_ATTACHMENT_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_IMAGE_ATTACHMENT_BYTES
+    return value if value > 0 else DEFAULT_MAX_IMAGE_ATTACHMENT_BYTES
+
+
+def _openai_content_parts(message: dict[str, Any], *, provider: str) -> list[dict[str, Any]]:
+    attachments = _attachment_items(message)
+    parts: list[dict[str, Any]] = [{"type": "input_text", "text": _message_content_text(message.get("content"))}]
+    images = [item for item in attachments if isinstance(item.get("mime"), str) and item["mime"].startswith("image/")]
+    if images and provider != "openai":
+        raise RuntimeError(f"{provider} does not support image attachments through this transport yet.")
+    for image in images:
+        parts.append({"type": "input_image", "image_url": _image_data_url(image), "detail": "auto"})
+    non_images = [item for item in attachments if item not in images]
+    if non_images:
+        parts[0]["text"] += "\n" + _non_image_attachment_content(non_images)
+    return parts
+
+
+def _chat_content_parts(text: str, attachments: list[dict[str, Any]], provider: str) -> list[dict[str, Any]]:
+    images = [item for item in attachments if isinstance(item.get("mime"), str) and item["mime"].startswith("image/")]
+    if images and provider not in {"openrouter", "openai-compatible"}:
+        raise RuntimeError(f"{provider} does not support image attachments through this transport yet.")
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for image in images:
+        parts.append({"type": "image_url", "image_url": {"url": _image_data_url(image)}})
+    non_images = [item for item in attachments if item not in images]
+    if non_images:
+        parts[0]["text"] += "\n" + _non_image_attachment_content(non_images)
+    return parts
+
+
+def _anthropic_content_parts(text: str, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for item in attachments:
+        mime = item.get("mime")
+        if isinstance(mime, str) and mime.startswith("image/"):
+            data_url = _image_data_url(item)
+            encoded = data_url.split(",", 1)[1]
+            parts.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": encoded}})
+    non_images = [item for item in attachments if not (isinstance(item.get("mime"), str) and item["mime"].startswith("image/"))]
+    if non_images:
+        parts[0]["text"] += "\n" + _non_image_attachment_content(non_images)
+    return parts
 
 
 def _responses_tools_to_chat(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

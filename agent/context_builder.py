@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .language_servers import language_server_context_text
 from .project_identity import identity_text
 from .session_store import SessionInfo, SessionStore
 
@@ -39,10 +38,6 @@ def build_stored_context(
     workspace_identity = identity_text(Path(session.workspace_root))
     if workspace_identity:
         sections.extend(["", workspace_identity])
-
-    server_context = language_server_context_text()
-    if server_context:
-        sections.extend(["", server_context])
 
     if session.last_prompt:
         sections.append(f"  last prompt: {_truncate(session.last_prompt, 200)}")

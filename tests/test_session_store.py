@@ -9,9 +9,70 @@ from unittest.mock import patch
 
 from agent.main import _selected_model, _workspace_root_key, create_new_session
 from agent.session_store import SessionStore
+from agent.sqlx_session_store import _resolve_rust_binary
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_session_database_and_created_directory_are_private(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "private-data"
+            database = data_dir / "sessions.sqlite3"
+
+            store = SessionStore(database)
+            store.create_session(workspace_root=Path(tmp))
+
+            self.assertEqual(data_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(database.stat().st_mode & 0o777, 0o600)
+            for sidecar in data_dir.glob("sessions.sqlite3-*"):
+                self.assertEqual(sidecar.stat().st_mode & 0o777, 0o600)
+
+    def test_rust_store_resolver_prefers_release_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_root = root / "repo"
+            module_path = repo_root / "agent" / "sqlx_session_store.py"
+            release = repo_root / "agent-rust" / "target" / "release" / "agent-rust"
+            debug = repo_root / "agent-rust" / "target" / "debug" / "agent-rust"
+            release.parent.mkdir(parents=True)
+            debug.parent.mkdir(parents=True)
+            release.write_text("release", encoding="utf-8")
+            debug.write_text("debug", encoding="utf-8")
+
+            with patch("agent.sqlx_session_store.__file__", str(module_path)), patch(
+                "agent.sqlx_session_store.bundled_rust_binary", return_value=None
+            ):
+                resolved = _resolve_rust_binary(root / "data")
+
+        self.assertEqual(resolved, release.resolve())
+
+    def test_message_attachment_round_trips_through_session_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stored = root / "attachment.txt"
+            stored.write_text("document body", encoding="utf-8")
+            store = SessionStore(root / "sessions.sqlite3")
+            session = store.create_session(workspace_root=root)
+
+            message = store.add_message_with_attachments(
+                session.id,
+                "user",
+                "summarize this",
+                [{
+                    "id": "attachment-1",
+                    "filename": "report.txt",
+                    "mime": "text/plain",
+                    "size_bytes": stored.stat().st_size,
+                    "sha256": "a" * 64,
+                    "storage_path": str(stored),
+                    "source": "user_file",
+                }],
+            )
+
+            restored = store.list_messages(session.id, limit=None)[0]
+
+        self.assertEqual(message.attachments[0].filename, "report.txt")
+        self.assertEqual(restored.attachments[0].storage_path, str(stored))
+
     def test_session_store_write_lock_timeout_is_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

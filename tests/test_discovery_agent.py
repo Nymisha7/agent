@@ -174,6 +174,58 @@ class DiscoveryAgentTests(unittest.TestCase):
             "tool_not_allowed_for_independent_subagent",
         )
 
+    def test_task_agent_does_not_stream_model_prose_into_lifecycle_events(self) -> None:
+        llm = ScriptedLLM([
+            SimpleNamespace(output=[], output_text="No issue found."),
+        ])
+        events: list[dict[str, Any]] = []
+
+        with TemporaryDirectory() as tmp:
+            run_task_agent(
+                llm=llm,  # type: ignore[arg-type]
+                rust=SimpleNamespace(),  # type: ignore[arg-type]
+                workspace_root=Path(tmp),
+                task="Inspect the tests",
+                progress_handler=events.append,
+            )
+
+        self.assertFalse(llm.requests[0]["stream"])
+        self.assertIsNone(llm.requests[0]["event_handler"])
+        self.assertEqual(events, [])
+
+    def test_step_budget_reserves_a_final_completion_decision(self) -> None:
+        llm = ScriptedLLM([
+            tool_call(
+                "write_file",
+                {"path": "frontend/app.js", "content": "export const ready = true;"},
+                "write-1",
+            ),
+            tool_call(
+                "finish_subagent",
+                {"report": "Implemented frontend/app.js.", "complete": True},
+                "finish-1",
+            ),
+        ])
+
+        with TemporaryDirectory() as tmp:
+            result = run_task_agent(
+                llm=llm,  # type: ignore[arg-type]
+                rust=FileRust(),  # type: ignore[arg-type]
+                workspace_root=Path(tmp),
+                task="Implement the frontend module",
+                owns=["frontend"],
+                max_steps=1,
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["changed_count"], 1)
+        self.assertEqual(llm.requests[1]["tool_choice"], "required")
+        self.assertEqual(
+            [tool["name"] for tool in llm.requests[1]["tools"]],
+            ["finish_subagent"],
+        )
+
     def test_task_agent_can_write_and_edit_only_inside_owned_scope(self) -> None:
         llm = ScriptedLLM([
             tool_call("write_file", {

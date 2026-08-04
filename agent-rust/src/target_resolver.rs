@@ -274,11 +274,15 @@ fn search_scope_staged(
     hint: &SearchHint,
     attempts: &mut Vec<ResolveAttempt>,
 ) -> Result<Option<ResolveTargetResult>> {
-    let root_list = roots
-        .iter()
-        .map(|root| root.display().to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+    use std::fmt::Write as _;
+
+    let mut root_list = String::new();
+    for root in &roots {
+        if !root_list.is_empty() {
+            root_list.push(',');
+        }
+        let _ = write!(&mut root_list, "{}", root.display());
+    }
 
     let mut options = FileSearchOptions::new(query.to_string());
     options.roots = roots;
@@ -312,25 +316,23 @@ fn search_scope_staged(
             continue;
         }
 
-        if staged.matches.len() == 1 && !matches!(stage.confidence, ResolveConfidence::FuzzySearch)
-        {
-            let item = &staged.matches[0];
-
-            return Ok(Some(ResolveTargetResult::Resolved {
-                target: ResolvedTarget {
-                    path: item.root.join(&item.path),
-                    kind: match_type_to_resolved_kind(&item.match_type),
-                    source: stage.source.clone(),
-                    confidence: stage.confidence.clone(),
-                },
-                attempts: attempts.clone(),
-            }));
+        if !matches!(stage.confidence, ResolveConfidence::FuzzySearch) {
+            if let [item] = staged.matches.as_slice() {
+                return Ok(Some(ResolveTargetResult::Resolved {
+                    target: ResolvedTarget {
+                        path: item.root.join(&item.path),
+                        kind: match_type_to_resolved_kind(&item.match_type),
+                        source: stage.source.clone(),
+                        confidence: stage.confidence.clone(),
+                    },
+                    attempts: attempts.clone(),
+                }));
+            }
         }
 
-        let reason = if staged.matches.len() == 1 {
-            "single low-confidence fuzzy target found"
-        } else {
-            "multiple matching targets found"
+        let reason = match staged.matches.as_slice() {
+            [_] => "single low-confidence fuzzy target found",
+            _ => "multiple matching targets found",
         };
         return Ok(Some(ResolveTargetResult::Candidates {
             query: query.to_string(),
@@ -422,12 +424,10 @@ fn clean_target(raw: &str) -> String {
 }
 
 fn looks_like_windows_drive_path(value: &str) -> bool {
-    let bytes = value.as_bytes();
-
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    matches!(
+        value.as_bytes(),
+        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()
+    )
 }
 
 fn platform_translate_windows_path(value: &str) -> Result<PathBuf> {

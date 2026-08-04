@@ -1306,8 +1306,7 @@ class GatewayRoutingTests(unittest.TestCase):
             ],
         )
         self.assertEqual(commands["install"]["textAliases"], ["/install"])
-        self.assertEqual(commands["tools"]["textAliases"], ["/tools"])
-        self.assertIn("approval policy", commands["tools"]["description"])
+        self.assertNotIn("tools", commands)
         self.assertNotIn("devices", commands)
         self.assertNotIn("capabilities", commands)
         self.assertEqual(commands["apikey"]["textAliases"], ["/apikey", "/key"])

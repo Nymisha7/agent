@@ -177,10 +177,7 @@ class ParallelSubagentRunner:
                     "run_id": run_id,
                     "task_id": safe_tasks[index]["id"],
                     "owned_paths": safe_tasks[index]["owns"],
-                    "summary": (
-                        f"{safe_tasks[index]['id']} · running — "
-                        f"{_bounded_line(safe_tasks[index]['task'])}"
-                    ),
+                    "summary": _bounded_line(safe_tasks[index]["task"]),
                 })
             for index, (child, task) in enumerate(zip(children, normalized, strict=True)):
                 future = executor.submit(
@@ -230,10 +227,8 @@ class ParallelSubagentRunner:
                     "changed_count": len(result.get("changed_files", []))
                     if isinstance(result.get("changed_files"), list)
                     else 0,
-                    "summary": (
-                        f"{safe_tasks[index]['id']} · "
-                        f"{task_status} — "
-                        f"{_bounded_line(self._policy.redact_text(str(report)))}"
+                    "summary": _bounded_line(
+                        self._policy.redact_text(str(report))
                     ),
                 })
 
@@ -298,14 +293,36 @@ class ParallelSubagentRunner:
             task=task["task"],
             owns=task.get("owns", []),
             max_steps=self.max_steps,
-            progress_handler=lambda event: self._emit({
-                "kind": "subagent_task_progress",
-                "run_id": run_id,
-                "task_id": task_id,
-                "owned_paths": task.get("owns", []),
-                **event,
-            }),
+            progress_handler=lambda event: self._emit_task_progress(
+                event,
+                run_id=run_id,
+                task_id=task_id,
+                owned_paths=task.get("owns", []),
+            ),
         )
+
+    def _emit_task_progress(
+        self,
+        event: dict[str, Any],
+        *,
+        run_id: str,
+        task_id: str,
+        owned_paths: list[str],
+    ) -> None:
+        summary = event.get("summary")
+        payload = {
+            key: value
+            for key, value in event.items()
+            if key not in {"kind", "run_id", "task_id", "owned_paths", "summary"}
+        }
+        self._emit({
+            "kind": "subagent_task_progress",
+            "run_id": run_id,
+            "task_id": task_id,
+            "owned_paths": owned_paths,
+            "summary": self._policy.redact_text(summary) if isinstance(summary, str) else "Working",
+            **payload,
+        })
 
     def _normalize_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(tasks, list):
@@ -562,6 +579,41 @@ def run_task_agent(
             )
         messages.extend(_response_items(response))
         messages.extend(outputs)
+
+    messages.append({
+        "role": "user",
+        "content": (
+            "The bounded tool budget is exhausted. Do not do more workspace work. "
+            "Call finish_subagent now with a concise evidence-backed report and set "
+            "complete to whether the assigned task is actually complete from the "
+            "tool results already present."
+        ),
+    })
+    final_response = llm.respond(
+        instructions=TASK_AGENT_SYSTEM_PROMPT,
+        messages=messages,
+        tools=[TASK_AGENT_FINISH_TOOL],
+        previous_response_id=None,
+        tool_choice="required",
+        stream=False,
+        event_handler=None,
+    )
+    final_calls = _tool_calls(final_response)
+    if len(final_calls) == 1 and final_calls[0]["name"] == "finish_subagent":
+        arguments = final_calls[0]["arguments"]
+        report = arguments.get("report")
+        if isinstance(report, str) and report.strip():
+            return _task_result(
+                session_id=isolated_session_id,
+                report=policy.redact_text(report.strip()),
+                evidence=evidence,
+                owned_paths=owned_paths,
+                changed_files=changed_files,
+                complete=(
+                    arguments.get("complete") is not False
+                    and not blocked_by_policy
+                ),
+            )
 
     return _task_result(
         session_id=isolated_session_id,

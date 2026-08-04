@@ -179,40 +179,37 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn string_replace(content: &str, before: &str, after: &str) -> std::result::Result<String, String> {
-    let matches = content.match_indices(before).collect::<Vec<_>>();
-
-    match matches.len() {
-        0 => {
-            let suggestion = find_similar_context(content, before);
-            let mut message = "No match found for the specified text.".to_string();
-            if let Some(hint) = suggestion {
-                message.push_str(&format!("\n\nDid you mean:\n```\n{hint}\n```"));
-            }
-            let preview = build_file_preview(content, NO_MATCH_PREVIEW_LINES);
-            message.push_str(&format!("\n\nFile preview:\n```\n{preview}\n```"));
-            Err(message)
+    let mut matches = content.match_indices(before);
+    let Some((first_position, _)) = matches.next() else {
+        let suggestion = find_similar_context(content, before);
+        let mut message = "No match found for the specified text.".to_string();
+        if let Some(hint) = suggestion {
+            message.push_str(&format!("\n\nDid you mean:\n```\n{hint}\n```"));
         }
-        1 => Ok(content.replacen(before, after, 1)),
-        count => {
-            let mut message = format!(
-                "Found {count} matches. Please provide more context to identify a unique match:\n"
-            );
-            for (index, (position, _)) in matches.iter().enumerate().take(2) {
-                let line_number = count_lines_before(content, *position);
-                let context = get_line_context(content, line_number, 1);
-                message.push_str(&format!(
-                    "\nMatch {} (line {}):\n```\n{}\n```",
-                    index + 1,
-                    line_number,
-                    context
-                ));
-            }
-            if count > 2 {
-                message.push_str(&format!("\n\n...and {} more", count - 2));
-            }
-            Err(message)
-        }
+        let preview = build_file_preview(content, NO_MATCH_PREVIEW_LINES);
+        message.push_str(&format!("\n\nFile preview:\n```\n{preview}\n```"));
+        return Err(message);
+    };
+    let Some((second_position, _)) = matches.next() else {
+        return Ok(content.replacen(before, after, 1));
+    };
+    let count = 2 + matches.count();
+    let mut message =
+        format!("Found {count} matches. Please provide more context to identify a unique match:\n");
+    for (index, position) in [first_position, second_position].into_iter().enumerate() {
+        let line_number = count_lines_before(content, position);
+        let context = get_line_context(content, line_number, 1);
+        message.push_str(&format!(
+            "\nMatch {} (line {}):\n```\n{}\n```",
+            index + 1,
+            line_number,
+            context
+        ));
     }
+    if count > 2 {
+        message.push_str(&format!("\n\n...and {} more", count - 2));
+    }
+    Err(message)
 }
 
 fn count_lines_before(content: &str, byte_position: usize) -> usize {
@@ -225,10 +222,16 @@ fn count_lines_before(content: &str, byte_position: usize) -> usize {
 }
 
 fn get_line_context(content: &str, target_line: usize, context: usize) -> String {
-    let lines = content.lines().collect::<Vec<_>>();
     let start = target_line.saturating_sub(context + 1);
-    let end = (target_line + context).min(lines.len());
-    lines[start..end].join("\n")
+    let count = target_line.saturating_add(context).saturating_sub(start);
+    let mut output = String::new();
+    for line in content.lines().skip(start).take(count) {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(line);
+    }
+    output
 }
 
 fn find_similar_context(content: &str, search: &str) -> Option<String> {
@@ -250,16 +253,25 @@ fn build_file_preview(content: &str, max_lines: usize) -> String {
         return "(file is empty)".to_string();
     }
 
-    let lines = content.lines().collect::<Vec<_>>();
-    let preview_end = lines.len().min(max_lines);
-    let mut preview = lines[..preview_end]
-        .iter()
-        .enumerate()
-        .map(|(index, line)| format!("{:>4}: {}", index + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if lines.len() > preview_end {
-        preview.push_str(&format!("\n... ({} more lines)", lines.len() - preview_end));
+    use std::fmt::Write as _;
+
+    let mut preview = String::new();
+    let mut total_lines = 0;
+    for (index, line) in content.lines().enumerate() {
+        if index < max_lines {
+            if !preview.is_empty() {
+                preview.push('\n');
+            }
+            let _ = write!(&mut preview, "{:>4}: {}", index + 1, line);
+        }
+        total_lines = index + 1;
+    }
+    if total_lines > max_lines {
+        let _ = write!(
+            &mut preview,
+            "\n... ({} more lines)",
+            total_lines - max_lines
+        );
     }
     preview
 }

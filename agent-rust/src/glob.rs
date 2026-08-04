@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use globset::GlobBuilder;
 use serde::Serialize;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 
 use crate::ripgrep::{ripgrep_paths, RipgrepFilesOptions, RipgrepPathKind};
@@ -54,7 +56,10 @@ pub fn glob_files(options: GlobOptions) -> Result<GlobResult> {
         .with_context(|| format!("Invalid glob pattern: {pattern}"))?
         .compile_matcher();
 
-    let mut matches = ripgrep_paths(
+    let limit = options.limit.max(1);
+    let mut matches = BinaryHeap::new();
+    let mut truncated = false;
+    for item in ripgrep_paths(
         &root,
         RipgrepFilesOptions {
             include_hidden: options.include_hidden,
@@ -62,33 +67,71 @@ pub fn glob_files(options: GlobOptions) -> Result<GlobResult> {
             include_ignored: options.include_generated,
             threads: None,
         },
-    )?
-    .into_iter()
-    .filter_map(|item| {
+    )? {
         let kind = match item.kind {
             RipgrepPathKind::File => GlobKind::File,
             RipgrepPathKind::Directory => GlobKind::Directory,
         };
         if !matches_kind(options.kind, kind) || !matcher.is_match(&item.relative) {
-            return None;
+            continue;
         }
-        Some(GlobMatch {
+        let candidate = RankedGlobMatch(GlobMatch {
             path: root.join(item.relative),
             kind,
-        })
-    })
-    .collect::<Vec<_>>();
-
-    matches.sort_by(|a, b| a.path.cmp(&b.path));
-    let limit = options.limit.max(1);
-    let truncated = matches.len() > limit;
-    matches.truncate(limit);
+        });
+        if matches.len() < limit {
+            matches.push(candidate);
+        } else {
+            truncated = true;
+            if matches.peek().is_some_and(|worst| candidate < *worst) {
+                matches.pop();
+                matches.push(candidate);
+            }
+        }
+    }
+    let mut matches = matches.into_vec();
+    matches.sort();
+    let matches = matches.into_iter().map(|item| item.0).collect();
 
     Ok(GlobResult {
         matches,
         truncated,
         backend: "ripgrep+globset".to_string(),
     })
+}
+
+#[derive(Debug)]
+struct RankedGlobMatch(GlobMatch);
+
+impl Ord for RankedGlobMatch {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .path
+            .cmp(&other.0.path)
+            .then_with(|| glob_kind_rank(self.0.kind).cmp(&glob_kind_rank(other.0.kind)))
+    }
+}
+
+impl PartialOrd for RankedGlobMatch {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedGlobMatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedGlobMatch {}
+
+fn glob_kind_rank(kind: GlobKind) -> u8 {
+    match kind {
+        GlobKind::Any => 0,
+        GlobKind::File => 1,
+        GlobKind::Directory => 2,
+    }
 }
 
 fn normalize_root(root: &Path) -> Result<PathBuf> {

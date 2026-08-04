@@ -20,16 +20,13 @@ pub(crate) fn connected_devices(scope: &str) -> Result<Value> {
         (String::from("power"), power_devices()),
     ]);
 
-    let local_source = if is_wsl_runtime() {
-        "wsl"
-    } else {
-        std::env::consts::OS
-    };
+    let wsl = is_wsl_runtime();
+    let local_source = if wsl { "wsl" } else { std::env::consts::OS };
     for records in categories.values_mut() {
         tag_device_source(records, local_source);
     }
 
-    let windows_host = if is_wsl_runtime() {
+    let windows_host = if wsl {
         windows_host_devices().ok()
     } else {
         None
@@ -95,9 +92,9 @@ pub(crate) fn connected_devices(scope: &str) -> Result<Value> {
         "schema_version": 3,
         "scope": normalized_scope,
         "checked_at_unix_ms": unix_time_ms(),
-        "visibility": if is_wsl_runtime() { "wsl_visible" } else { "current_os" },
-        "runtime": if is_wsl_runtime() { "wsl" } else { std::env::consts::OS },
-        "windows_host_bridge": if !is_wsl_runtime() { "not_applicable" } else if windows_host.is_some() { "available" } else { "unavailable" },
+        "visibility": if wsl { "wsl_visible" } else { "current_os" },
+        "runtime": if wsl { "wsl" } else { std::env::consts::OS },
+        "windows_host_bridge": if !wsl { "not_applicable" } else if windows_host.is_some() { "available" } else { "unavailable" },
         "counts": counts,
         "availability": availability,
         "categories": category_payload,
@@ -127,14 +124,19 @@ fn base_device_availability() -> serde_json::Map<String, Value> {
 }
 
 fn normalize_category(value: &str) -> String {
-    let normalized = value
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_string();
+    let mut normalized = String::with_capacity(value.len());
+    let mut pending_separator = false;
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            if pending_separator && !normalized.is_empty() {
+                normalized.push('_');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            pending_separator = false;
+        } else {
+            pending_separator = !normalized.is_empty();
+        }
+    }
     if normalized.is_empty() {
         String::from("all")
     } else {
@@ -360,9 +362,7 @@ fn network_interfaces() -> Vec<Value> {
             let operstate =
                 read_trimmed(path.join("operstate")).unwrap_or_else(|| String::from("unknown"));
             let carrier = read_trimmed(path.join("carrier")).as_deref() == Some("1");
-            let interface_type = if path.join("wireless").exists() {
-                "wifi"
-            } else if name.starts_with("wl") {
+            let interface_type = if path.join("wireless").exists() || name.starts_with("wl") {
                 "wifi"
             } else if name.starts_with("en") || name.starts_with("eth") {
                 "ethernet"
@@ -477,18 +477,20 @@ fn audio_devices() -> Vec<Value> {
                 .stdout
                 .lines()
                 .filter_map(|line| {
-                    let fields: Vec<&str> = line.split('\t').collect();
-                    if fields.len() < 2 {
-                        return None;
-                    }
+                    let mut fields = line.split('\t');
+                    let _index = fields.next()?;
+                    let name = fields.next()?;
+                    let driver = fields.next();
+                    let sample_spec = fields.next();
+                    let state = fields.next();
                     Some(json!({
-                        "id": fields[1],
+                        "id": name,
                         "category": "audio",
                         "kind": "output",
-                        "status": if fields.get(4).copied() == Some("SUSPENDED") { "idle" } else { "available" },
-                        "name": fields[1],
-                        "driver": fields.get(2),
-                        "sample_spec": fields.get(3),
+                        "status": if state == Some("SUSPENDED") { "idle" } else { "available" },
+                        "name": name,
+                        "driver": driver,
+                        "sample_spec": sample_spec,
                     }))
                 })
                 .collect();
@@ -573,11 +575,12 @@ fn printer_devices() -> Vec<Value> {
                 .stdout
                 .lines()
                 .filter_map(|line| {
-                    let fields: Vec<&str> = line.split_whitespace().collect();
-                    if fields.first().copied() != Some("printer") || fields.len() < 3 {
+                    let mut fields = line.split_whitespace();
+                    if fields.next() != Some("printer") {
                         return None;
                     }
-                    let name = fields[1];
+                    let name = fields.next()?;
+                    fields.next()?;
                     Some(json!({
                         "id": name,
                         "category": "printer",
@@ -619,12 +622,12 @@ fn mounted_block_devices() -> HashMap<String, Vec<String>> {
         let Some((before, after)) = line.split_once(" - ") else {
             continue;
         };
-        let fields: Vec<&str> = before.split_whitespace().collect();
-        let after_fields: Vec<&str> = after.split_whitespace().collect();
-        if fields.len() < 5 || after_fields.len() < 2 {
+        let Some(mountpoint) = before.split_whitespace().nth(4) else {
             continue;
-        }
-        let source = after_fields[1];
+        };
+        let Some(source) = after.split_whitespace().nth(1) else {
+            continue;
+        };
         let Some(device) = source.strip_prefix("/dev/") else {
             continue;
         };
@@ -634,7 +637,7 @@ fn mounted_block_devices() -> HashMap<String, Vec<String>> {
         mounts
             .entry(base.to_string())
             .or_default()
-            .push(fields[4].replace("\\040", " "));
+            .push(mountpoint.replace("\\040", " "));
     }
     mounts
 }

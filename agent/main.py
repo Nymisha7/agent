@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import uuid
@@ -27,12 +28,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from cryptography.fernet import Fernet, InvalidToken
+
 from .context_builder import build_stored_context
 from .bundle import bundled_rust_binary
+from .attachments import (
+    Attachment,
+    attachment_from_store,
+    import_attachment,
+    maintain_attachment_store,
+)
 from .config import AgentConfig, load_agent_config
 from .gateway import create_inbound_address, start_gateway
 from .language_servers import LanguageServerManager
-from .llm import LLMClient, SUPPORTED_PROVIDERS, _normalize_provider
+from .llm import (
+    AVAILABLE_PROVIDERS,
+    LLMClient,
+    UNAVAILABLE_PROVIDER_TRANSPORTS,
+    _normalize_provider,
+)
 from .planner import (
     AgentSession,
     agent_session_from_dict,
@@ -43,8 +57,6 @@ from .rust_tools import RustTools
 from .session_store import SessionInfo, SessionStore, TokenUsage
 from .skills import SkillCatalog, discover_skill_catalog
 from .system_events import drain_system_events, resolve_main_system_event_session_key
-from .tool_groups import grouped_tool_names
-from .tools import ToolContext, build_tool_registry
 
 if TYPE_CHECKING:
     from .gateway_impl import AgentGateway
@@ -110,11 +122,10 @@ LOCAL_COMMANDS = (
     ("/model", "Choose a model or local runtime"),
     ("/install", "Install an open-source/open-weight model locally"),
     ("/reasoning", "Set reasoning effort for supported models"),
-    ("/tools", "Show enabled tools grouped by purpose and approval policy"),
     ("/skills", "Show layered workspace and personal skills"),
     ("/gateway", "Show control-plane routing and session status"),
     ("/status", "Show model, context, and session usage"),
-    ("/setup", "Set up local runtimes or hosted providers"),
+    ("/setup", "Connect a model"),
     ("/help", "Show commands and keyboard shortcuts"),
     ("/exit", "Close Agent"),
 )
@@ -137,17 +148,19 @@ def _credentials_path() -> Path:
     config_home = Path(
         os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
     ).expanduser()
-    return config_home / "agent" / "credentials.json"
+    return config_home / "agent" / "credentials.enc"
+
+
+def _legacy_credentials_path() -> Path:
+    return _credentials_path().with_name("credentials.json")
+
+
+def _credential_key_path() -> Path:
+    return _credentials_path().with_name("credentials.key")
 
 
 def _load_persisted_api_keys() -> None:
-    path = _credentials_path()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return
-    if not isinstance(payload, dict):
-        return
+    payload, migrated = _read_persisted_credentials()
     for env_name, api_key in payload.items():
         if (
             env_name in _CREDENTIAL_ENV_NAMES
@@ -156,34 +169,87 @@ def _load_persisted_api_keys() -> None:
             and not os.environ.get(env_name)
         ):
             os.environ[env_name] = api_key
+    if migrated and payload:
+        try:
+            _write_persisted_credentials(payload)
+            _legacy_credentials_path().unlink()
+        except OSError:
+            pass
 
 
 def _persist_api_key(env_name: str, api_key: str) -> None:
     if env_name not in _CREDENTIAL_ENV_NAMES:
         raise ValueError(f"Unsupported credential environment variable: {env_name}")
-    path = _credentials_path()
-    credentials: dict[str, str] = {}
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(existing, dict):
-            credentials = {
-                key: value
-                for key, value in existing.items()
-                if key in _CREDENTIAL_ENV_NAMES
-                and isinstance(value, str)
-                and value
-            }
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        pass
+    credentials, _migrated = _read_persisted_credentials()
     credentials[env_name] = api_key
+    _write_persisted_credentials(credentials)
+
+
+def _read_persisted_credentials() -> tuple[dict[str, str], bool]:
+    path = _credentials_path()
+    try:
+        encrypted = path.read_bytes()
+        decrypted = _credential_cipher().decrypt(encrypted)
+        payload = json.loads(decrypted.decode("utf-8"))
+        return _validated_credentials(payload), False
+    except (FileNotFoundError, OSError, InvalidToken, UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    try:
+        payload = json.loads(_legacy_credentials_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}, False
+    return _validated_credentials(payload), True
+
+
+def _validated_credentials(payload: object) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        key: value
+        for key, value in payload.items()
+        if key in _CREDENTIAL_ENV_NAMES and isinstance(value, str) and value
+    }
+
+
+def _credential_cipher() -> Fernet:
+    configured_key = os.environ.get("AGENT_CREDENTIAL_ENCRYPTION_KEY", "").strip()
+    if configured_key:
+        return Fernet(configured_key.encode("ascii"))
+    key_path = _credential_key_path()
+    try:
+        key = key_path.read_bytes()
+    except FileNotFoundError:
+        key = Fernet.generate_key()
+        key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(key_path.parent, 0o700)
+        try:
+            descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            key = key_path.read_bytes()
+        else:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(key)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(key_path, 0o600)
+    return Fernet(key)
+
+
+def _write_persisted_credentials(credentials: dict[str, str]) -> None:
+    serialized = json.dumps(credentials, separators=(",", ":")).encode("utf-8")
+    _atomic_private_write(_credentials_path(), _credential_cipher().encrypt(serialized))
+
+
+def _atomic_private_write(path: Path, content: bytes) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
     temp_path = path.with_suffix(".tmp")
     descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(credentials, handle)
-            handle.write("\n")
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
     except Exception:
         try:
             temp_path.unlink()
@@ -229,7 +295,7 @@ PROVIDER_DISPLAY_NAMES = {
 }
 PROVIDER_ARGUMENT_COMMANDS = {"/provider", "/login", "/auth", "/apikey", "/key"}
 LOCAL_PROVIDERS = {"ollama", "lmstudio", "llamacpp", "vllm", "localai"}
-UNIMPLEMENTED_PROVIDER_TRANSPORTS = {"copilot", "gemini", "bedrock", "azure", "vertexai"}
+UNIMPLEMENTED_PROVIDER_TRANSPORTS = UNAVAILABLE_PROVIDER_TRANSPORTS
 PROVIDER_SORT_ORDER = {
     "copilot": 0,
     "anthropic": 1,
@@ -422,6 +488,7 @@ class AppContext:
     pending_provider: str | None = None
     pending_model: str | None = None
     last_local_command_result: dict[str, Any] | None = None
+    pending_attachments: list[Attachment] = field(default_factory=list)
 
 
 class LocalCommandText(str):
@@ -695,8 +762,8 @@ class LiveTurnState:
             elif isinstance(kind, str) and kind.startswith("subagent_"):
                 self._flush_reasoning()
                 self._flush_text()
-                summary = event.get("summary")
-                if isinstance(summary, str) and summary:
+                summary = _subagent_activity_label(event)
+                if summary:
                     self.feed.append(("subagent", summary))
                 self.phase = "subagents"
             elif kind == "approval_request":
@@ -806,6 +873,21 @@ def _live_tool_result_feed_item(event: dict[str, Any]) -> tuple[str, str]:
     return ("tool_result", str(summary or f"{label} completed"))
 
 
+def _subagent_activity_label(event: dict[str, Any]) -> str:
+    """Render lifecycle fields without requiring display text in the protocol."""
+    summary = event.get("summary")
+    detail = str(summary) if isinstance(summary, str) and summary else ""
+    kind = event.get("kind")
+    task_id = event.get("task_id")
+    if isinstance(task_id, str) and task_id:
+        status = event.get("status")
+        if kind in {"subagent_task_started", "subagent_task_progress"}:
+            status = "running"
+        state = str(status) if isinstance(status, str) and status else "working"
+        return f"{task_id} · {state}" + (f" — {detail}" if detail else "")
+    return detail
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent",
@@ -873,7 +955,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         default=None,
-        choices=sorted(SUPPORTED_PROVIDERS),
+        choices=sorted(AVAILABLE_PROVIDERS),
         help=(
             "LLM provider. Defaults to AGENT_LLM_PROVIDER or openai. "
             "Use ollama, lmstudio, llamacpp, vllm, or localai for no-login local models."
@@ -976,6 +1058,7 @@ def build_context(
     store: SessionStore,
     session_info: SessionInfo,
 ) -> AppContext:
+    maintain_attachment_store()
     workspace_root = Path(session_info.workspace_root).expanduser().resolve()
     explicit_config = getattr(args, "config", None)
     config_path = (
@@ -1020,6 +1103,11 @@ def build_context(
         session=session,
         session_id=session_info.id,
         store=store,
+        pending_attachments=[
+            attachment
+            for item in session.pending_attachments
+            if (attachment := attachment_from_store(item)) is not None
+        ],
         stored_context=stored_context,
         debug=args.debug,
         config=config,
@@ -1076,10 +1164,21 @@ def parse_search_roots(_workspace_root: Path) -> list[Path]:
     return []
 
 
-def load_session_messages(store: SessionStore, session_id: str) -> list[dict[str, str]]:
+def load_session_messages(store: SessionStore, session_id: str) -> list[dict[str, Any]]:
     messages = store.list_messages(session_id, limit=20)
     return [
-        {"role": message.role, "content": message.content}
+        {
+            "role": message.role,
+            "content": message.content,
+            "attachments": [
+                {
+                    "id": item.id, "filename": item.filename, "mime": item.mime,
+                    "size_bytes": item.size_bytes, "storage_path": item.storage_path,
+                    "source": item.source,
+                }
+                for item in message.attachments
+            ],
+        }
         for message in messages
         if message.role in {"user", "assistant"}
     ]
@@ -1117,12 +1216,23 @@ def _run_prompt_turn(
     conversation_history = load_session_messages(ctx.store, ctx.session_id)
     route_key = getattr(ctx, "route_key", None)
     write_guard = {"expected_route_key": route_key} if route_key else {}
-    user_messages = ctx.store.add_messages(
-        ctx.session_id,
-        [("user", prompt)],
-        last_prompt=prompt,
-        **write_guard,
-    )
+    pending_attachments = getattr(ctx, "pending_attachments", None)
+    current_attachments = list(pending_attachments or ())
+    if pending_attachments is not None:
+        pending_attachments.clear()
+    ctx.session.pending_attachments.clear()
+    if current_attachments:
+        user_messages = [ctx.store.add_message_with_attachments(
+            ctx.session_id, "user", prompt,
+            [item.to_store_input() for item in current_attachments],
+            last_prompt=prompt,
+            **write_guard,
+        )]
+    else:
+        user_messages = ctx.store.add_messages(
+            ctx.session_id, [("user", prompt)], last_prompt=prompt, **write_guard,
+        )
+    persist_agent_state(ctx)
     _emit_transcript_update(ctx, user_messages)
     ctx.store.add_event(
         ctx.session_id,
@@ -1155,6 +1265,7 @@ def _run_prompt_turn(
                 session=ctx.session,
                 stored_context=ctx.stored_context,
                 conversation_history=conversation_history,
+                current_attachments=[item.to_store_input() for item in current_attachments],
                 record_event=lambda **kwargs: ctx.store.add_event(ctx.session_id, **kwargs),
                 stream_event=stream_event,
                 approval_requester=approval_requester,
@@ -1240,14 +1351,18 @@ def _emit_transcript_update(ctx: AppContext, messages: list[Any]) -> None:
     message = messages[-1]
     route_key = getattr(ctx, "route_key", None)
     agent_id = getattr(ctx, "agent_id", "main")
+    attachment_items = tuple(getattr(message, "attachments", ()) or ())
+    message_payload = {"role": message.role, "content": message.content}
+    if attachment_items:
+        message_payload["attachments"] = [
+            {"filename": item.filename, "mime": item.mime, "size_bytes": item.size_bytes}
+            for item in attachment_items
+        ]
     payload = {
         "session_id": ctx.session_id,
         "route_key": route_key,
         "agent_id": agent_id,
-        "message": {
-            "role": message.role,
-            "content": message.content,
-        },
+        "message": message_payload,
         "message_id": str(message.id),
         "message_seq": message.seq,
     }
@@ -1262,6 +1377,11 @@ def _emit_transcript_update(ctx: AppContext, messages: list[Any]) -> None:
 
 def _record_local_command_exchange(ctx: AppContext, prompt: str, answer: str) -> None:
     """Persist slash-command output so every UI sees the same transcript."""
+    # Composer controls use these commands as a private bridge protocol.  They
+    # should update the pending-attachment state without making a command
+    # exchange look like part of the user's conversation.
+    if _is_attachment_bridge_command(prompt):
+        return
     logged_prompt = _redact_local_command(prompt)
     route_key = getattr(ctx, "route_key", None)
     write_guard = {"expected_route_key": route_key} if route_key else {}
@@ -1275,6 +1395,26 @@ def _record_local_command_exchange(ctx: AppContext, prompt: str, answer: str) ->
         **write_guard,
     )
     _emit_transcript_update(ctx, messages)
+
+
+def _is_attachment_bridge_command(prompt: str) -> bool:
+    try:
+        parts = shlex.split(prompt)
+    except ValueError:
+        return False
+    return bool(parts) and parts[0].casefold() == "/__nym_attach"
+
+
+def _cli_approval_requester(request: dict[str, Any]) -> str:
+    operation = _approval_text(request.get("operation")).strip().replace("_", " ")
+    target = _approval_display_text(request) or "requested target"
+    action = operation or _approval_text(request.get("tool")).strip() or "action"
+    try:
+        decision = input(f"Allow {action} on {target!r} once? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "denied"
+    return "approved" if decision.strip().casefold() in {"y", "yes"} else "denied"
 
 
 def repl(ctx: AppContext) -> int:
@@ -1300,7 +1440,11 @@ def repl(ctx: AppContext) -> int:
             try:
                 answer = _handle_local_command(ctx, user_input)
                 if answer is None:
-                    answer = handle_prompt(ctx, user_input)
+                    answer = handle_prompt(
+                        ctx,
+                        user_input,
+                        approval_requester=_cli_approval_requester,
+                    )
                 else:
                     _record_local_command_exchange(ctx, user_input, answer)
                 print(answer)
@@ -1499,8 +1643,23 @@ def _dispatch_local_command(
         return None
     if text == "/":
         return _slash_help_text()
-    parts = text.split()
+    try:
+        parts = shlex.split(text)
+    except ValueError as exc:
+        return f"Invalid command quoting: {exc}"
     command = parts[0].casefold()
+
+    if command == "/__nym_attach":
+        if len(parts) != 2:
+            return "The selected file could not be added."
+        try:
+            attachment = import_attachment(parts[1], source="user_file")
+        except ValueError as exc:
+            return str(exc)
+        ctx.pending_attachments.append(attachment)
+        ctx.session.pending_attachments.append(attachment.to_store_input())
+        persist_agent_state(ctx)
+        return f"Attached for next message: {attachment.filename} ({attachment.mime}, {attachment.size_bytes} bytes)."
 
     if command in {"/login", "/auth"}:
         provider = parts[1] if len(parts) >= 2 else _active_provider(ctx)
@@ -1579,7 +1738,7 @@ def _dispatch_local_command(
         return _status_text(ctx)
 
     if command == "/tools":
-        return _tools_text(ctx)
+        return "Tools are managed automatically. Describe what you need; Agent selects the right capability and asks before sensitive actions."
 
     if command == "/skills":
         return ctx.skills.status_text()
@@ -1588,7 +1747,7 @@ def _dispatch_local_command(
         return _gateway_text(ctx)
 
     if command in {"/setup", "/connect"}:
-        return _connect_text()
+        return _setup_text(ctx, parts[1] if len(parts) == 2 else None)
 
     if command == "/help":
         return _slash_help_text()
@@ -1648,7 +1807,7 @@ def _provider_switch_text(ctx: AppContext) -> str:
 
 def _providers_text(ctx: AppContext) -> str:
     provider = _active_provider(ctx)
-    providers = ", ".join(sorted(SUPPORTED_PROVIDERS))
+    providers = ", ".join(sorted(AVAILABLE_PROVIDERS))
     return (
         f"Active model: {ctx.llm.model}\n"
         f"Model source: {_model_source_label(provider)}\n"
@@ -1663,14 +1822,6 @@ def _providers_text(ctx: AppContext) -> str:
 def _models_text(ctx: AppContext) -> str:
     active_provider = _active_provider(ctx)
     options = _model_options_for_display(ctx)
-    ready_options = [
-        option for option in options
-        if option.get("state") == ModelState.READY
-    ]
-    setup_options = [
-        option for option in options
-        if option.get("state") != ModelState.READY
-    ]
 
     lines = [
         f"Active model: {ctx.llm.model}",
@@ -1681,8 +1832,7 @@ def _models_text(ctx: AppContext) -> str:
         "Open-source models use a local runtime and are installed on this computer; they never require login.",
     ]
 
-    _append_model_text_section(lines, "Ready / installed", ready_options, ctx)
-    _append_model_text_section(lines, "Needs setup / not installed", setup_options, ctx)
+    _append_provider_model_text(lines, options, ctx)
 
     lines.extend([
         "",
@@ -1696,9 +1846,8 @@ def _models_text(ctx: AppContext) -> str:
     return "\n".join(lines)
 
 
-def _append_model_text_section(
+def _append_provider_model_text(
     lines: list[str],
-    heading: str,
     options: list[dict[str, Any]],
     ctx: Any,
 ) -> None:
@@ -1707,12 +1856,12 @@ def _append_model_text_section(
     active_provider = _active_provider(ctx)
     active_model = getattr(getattr(ctx, "llm", None), "model", None)
     lines.append("")
-    lines.append(f"{heading}:")
     current_provider: str | None = None
     for option in options:
         provider = option["provider"]
         if provider != current_provider:
             current_provider = provider
+            lines.append("")
             lines.append(
                 f"{_model_source_label(provider)} - {_provider_access_label(provider)}"
             )
@@ -3006,7 +3155,7 @@ def _providers_for_model(model: str) -> list[str]:
     normalized = model.casefold()
     providers: list[str] = []
     for provider in sorted(
-        SUPPORTED_PROVIDERS,
+        AVAILABLE_PROVIDERS,
         key=lambda item: PROVIDER_SORT_ORDER.get(item, 99),
     ):
         hints = PROVIDER_MODEL_HINTS.get(provider, ())
@@ -3019,7 +3168,7 @@ def _discovered_model_options(ctx: Any,) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
 
     for provider in sorted(
-        SUPPORTED_PROVIDERS,
+        AVAILABLE_PROVIDERS,
         key=lambda item: PROVIDER_SORT_ORDER.get(item, 99),
     ):
         discovered, discovery_error = _discover_provider_models(
@@ -3077,7 +3226,7 @@ def _model_options() -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
 
     for provider in sorted(
-        SUPPORTED_PROVIDERS,
+        AVAILABLE_PROVIDERS,
         key=lambda item: MODEL_PICKER_SORT_ORDER.get(
             item,
             99,
@@ -3146,7 +3295,7 @@ def _model_options_for_display(ctx: Any) -> list[dict[str, Any]]:
     return sorted(options, key=_model_display_sort_key)
 
 
-def _model_display_sort_key(option: dict[str, Any]) -> tuple[int, int, int, int, str]:
+def _model_display_sort_key(option: dict[str, Any]) -> tuple[Any, ...]:
     provider = str(option.get("provider") or "")
     model = str(option.get("model") or "")
     state = option.get("state")
@@ -3162,15 +3311,25 @@ def _model_display_sort_key(option: dict[str, Any]) -> tuple[int, int, int, int,
         ModelState.UNAVAILABLE: 5,
         ModelState.INCOMPATIBLE: 5,
     }
-    local_order = 0 if provider in LOCAL_PROVIDERS else 1
-    active_order = 0 if option.get("active") is True else 1
+    model_rank = _provider_model_rank(provider, model)
     return (
-        active_order,
-        state_order.get(state, 6),
-        local_order,
         MODEL_PICKER_SORT_ORDER.get(provider, 99),
-        model.casefold(),
+        model_rank,
+        _descending_text_key(model),
+        state_order.get(state, 6),
     )
+
+
+def _provider_model_rank(provider: str, model: str) -> int:
+    normalized = model.casefold()
+    for index, hinted_model in enumerate(PROVIDER_MODEL_HINTS.get(provider, ())):
+        if hinted_model.casefold() == normalized:
+            return index
+    return len(PROVIDER_MODEL_HINTS.get(provider, ()))
+
+
+def _descending_text_key(value: str) -> tuple[int, ...]:
+    return tuple(-ord(character) for character in value.casefold())
 
 
 def _discover_local_provider_availability(
@@ -3245,25 +3404,8 @@ def _model_source_label(provider: str) -> str:
 
 
 def _status_text(ctx: AppContext) -> str:
-    pending_approvals = [
-        item
-        for item in getattr(ctx.session, "pending_approvals", [])
-        if isinstance(item, dict) and item.get("status") == "pending"
-    ]
-    lines = [
-        f"Session: {ctx.session_id}",
-        f"Root: {ctx.workspace_root}",
-        f"Agent profile: {getattr(ctx, 'agent_id', 'main')}",
-        f"Model: {ctx.llm.model}",
-        f"Model source: {_model_source_label(_active_provider(ctx))}",
-        f"Mode: {_llm_mode(ctx)}",
-        f"Configuration: {_llm_configuration(ctx)}",
-        f"Reasoning effort: {getattr(ctx.llm, 'reasoning_effort', None) or 'provider controlled'}",
-        f"Skills: {len(getattr(getattr(ctx, 'skills', None), 'skills', {}))}",
-    ]
+    lines = ["Status", "", "Session:", str(ctx.session_id), ""]
     lines.extend(_status_context_lines(ctx))
-    lines.extend(_local_runtime_status_lines(ctx))
-    lines.append(f"Pending approvals: {len(pending_approvals)}")
     return "\n".join(lines)
 
 
@@ -3343,105 +3485,6 @@ def _format_loaded_local_model(item: dict[str, Any]) -> str:
 
 
 
-def _tools_text(ctx: AppContext) -> str:
-    workspace_root = Path(getattr(ctx, "workspace_root", Path.cwd())).expanduser().resolve()
-    search_roots = [
-        Path(root).expanduser().resolve()
-        for root in getattr(ctx, "search_roots", [workspace_root])
-    ]
-    tool_ctx = ToolContext(
-        rust=ctx.rust,
-        workspace_root=workspace_root,
-        search_roots=search_roots,
-        skill_catalog=getattr(ctx, "skills", None),
-    )
-    schemas = build_tool_registry(tool_ctx).schemas()
-    allowlist = getattr(ctx, "tool_allowlist", None)
-    allowed = set(allowlist) if allowlist is not None else None
-    by_name = {
-        str(schema.get("name")): schema
-        for schema in schemas
-        if isinstance(schema.get("name"), str)
-    }
-    enabled_names = {
-        name for name in by_name
-        if allowed is None or name in allowed
-    }
-    lines = [
-        "Agent tools",
-        f"Profile: {getattr(ctx, 'agent_id', 'main')}",
-        f"Enabled: {len(enabled_names)} of {len(by_name)}",
-    ]
-    if allowed is not None:
-        lines.append(f"Disabled by profile allowlist: {len(set(by_name) - enabled_names)}")
-    lines.append("")
-
-    for group, names in grouped_tool_names(set(by_name)):
-        visible = [name for name in names if name in enabled_names]
-        hidden = [name for name in names if name not in enabled_names]
-        if not visible and not hidden:
-            continue
-        suffix = f" ({len(visible)} enabled"
-        if hidden:
-            suffix += f", {len(hidden)} disabled"
-        suffix += ")"
-        lines.append(f"{group.label}{suffix}")
-        lines.append(group.summary)
-        for name in visible:
-            schema = by_name[name]
-            description = _tool_schema_description(schema)
-            signature = _tool_schema_signature(schema)
-            policy = _tool_policy_label(name)
-            lines.append(f"- {name}{signature} [{policy}] - {description}")
-        if hidden:
-            lines.append(f"- disabled: {', '.join(hidden)}")
-        lines.append("")
-
-    lines.append("Use /status for session/model state. Ask natural questions for live host or desktop inspection.")
-    return "\n".join(lines).rstrip()
-
-
-def _tool_schema_description(schema: dict[str, Any]) -> str:
-    description = str(schema.get("description") or "").strip()
-    return truncate(" ".join(description.split()), 120) if description else "No description."
-
-
-def _tool_schema_signature(schema: dict[str, Any]) -> str:
-    parameters = schema.get("parameters")
-    parameters = parameters if isinstance(parameters, dict) else {}
-    properties = parameters.get("properties")
-    properties = properties if isinstance(properties, dict) else {}
-    required = set(parameters.get("required") or [])
-    if not properties:
-        return ""
-    names = list(properties)[:3]
-    parts = [
-        name if name in required else f"{name}?"
-        for name in names
-    ]
-    if len(properties) > len(names):
-        parts.append("...")
-    return f"({', '.join(parts)})"
-
-
-def _tool_policy_label(name: str) -> str:
-    if name in {"write_file", "edit_file"}:
-        return "writes files"
-    if name == "delete_path":
-        return "requires explicit delete request"
-    if name in {"desktop_action", "desktop_send_message", "desktop_clipboard_files"}:
-        return "requires approval"
-    if name == "run_system_command":
-        return "allowlisted; service changes require approval"
-    if name == "language_server":
-        return "read-mostly; lifecycle actions scoped"
-    if name == "load_skill":
-        return "instructions/read-only"
-    if name == "parallel_subagents":
-        return "parallel agents; scoped writes"
-    return "read-only"
-
-
 def _gateway_text(ctx: AppContext) -> str:
     gateway = getattr(ctx, "gateway", None)
     if gateway is None:
@@ -3496,20 +3539,27 @@ def _status_context_lines(ctx: Any) -> list[str]:
     session_info = _ctx_session_info(ctx)
     if session_info is None:
         total_tokens = 0
-        cost_usd = 0.0
     else:
         total_tokens = _billable_token_total(session_info.tokens)
-        cost_usd = session_info.cost_usd
 
-    lines = [f"Tokens used: {_format_count(total_tokens)}"]
+    lines = ["Context:"]
     if context_limit is None:
-        lines.append("Context left: n/a")
+        lines.append("  Limit is not reported for this model")
     else:
         context_left = max(0, context_limit - total_tokens)
-        lines.append(f"Context left: {_format_count(context_left)} / {_format_count(context_limit)}")
-        lines.append(f"Context used: {_format_percent(_usage_percent(total_tokens, context_limit))}")
-    lines.append(f"Cost: {_format_cost(cost_usd)}")
+        percent_left = 100.0 - (_usage_percent(total_tokens, context_limit) or 0.0)
+        lines.append(
+            f"  {_format_percent(percent_left)} left "
+            f"({_format_count(total_tokens)} used / {_format_count(context_limit)})"
+        )
+        lines.append(f"  {_context_meter(percent_left)}")
     return lines
+
+
+def _context_meter(percent_left: float, width: int = 40) -> str:
+    width = max(1, width)
+    filled = min(width, max(0, round((percent_left / 100.0) * width)))
+    return "█" * filled + "░" * (width - filled)
 
 
 def _ctx_session_info(ctx: Any) -> SessionInfo | None:
@@ -3523,34 +3573,91 @@ def _ctx_session_info(ctx: Any) -> SessionInfo | None:
         return None
 
 
-def _connect_text() -> str:
-    return "\n".join([
-        "Model setup",
-        "",
-        "Open-source · local · no Agent login",
-        "Ollama local: `ollama pull <model>`, then /model ollama <model>",
-        "LM Studio local: load a model and start Local Server, then /model lmstudio <model>",
-        "llama.cpp: start llama-server (port 8080), then /model llamacpp <model>",
-        "vLLM: start its OpenAI API server (port 8000), then /model vllm <model>",
-        "LocalAI: start its API server (port 8080), then /model localai <model>",
-        "Set AGENT_LLAMACPP_BASE_URL, AGENT_VLLM_BASE_URL, or AGENT_LOCALAI_BASE_URL to override endpoints.",
-        "",
-        "Hosted · API key or cloud credentials",
-        "GitHub Copilot: /login copilot, then /model copilot <model>",
-        "OpenAI: /login openai, then /apikey openai (OPENAI_API_KEY)",
-        "Anthropic: /login anthropic, then /apikey anthropic (ANTHROPIC_API_KEY)",
-        "Google Gemini: /login gemini, then /apikey gemini (GOOGLE_API_KEY)",
-        "Groq: /login groq, then /apikey groq (GROQ_API_KEY)",
-        "OpenRouter: /login openrouter, then /apikey openrouter (OPENROUTER_API_KEY)",
-        "AWS Bedrock: /login bedrock, configure AWS_PROFILE or AWS credentials, then /model bedrock <model>",
-        "Azure OpenAI: /login azure, set AZURE_OPENAI_ENDPOINT and /apikey azure (AZURE_OPENAI_API_KEY)",
-        "Google Cloud Vertex AI: /login vertexai, set GOOGLE_CLOUD_PROJECT and run gcloud application-default auth",
-        "DeepSeek hosted: /login deepseek, then /apikey deepseek (DEEPSEEK_API_KEY)",
-        "GLM hosted: /login glm, then /apikey glm (GLM_API_KEY)",
-        "",
-        "Local models live in their runtime, not in this workspace; Agent never asks them to log in.",
-        "Keys entered with /apikey are saved in the private user credential store.",
-    ])
+def _setup_text(ctx: AppContext, selection: str | None) -> str:
+    if selection is None:
+        return "\n".join([
+            "Connect a model",
+            "",
+            "Choose one in the menu above:",
+            "• Ollama — run a private local model, no account needed",
+            "• OpenAI, Anthropic, or Groq — connect with an API key",
+            "",
+            "You can change models any time with /model.",
+        ])
+
+    normalized = selection.casefold()
+    if normalized in {"status", "check"}:
+        provider = _active_provider(ctx)
+        state = _llm_configuration_state(ctx)
+        next_step = "You are ready to chat." if state == "ready" else "Choose a provider from /setup to continue."
+        return "\n".join([
+            "Connection status",
+            f"Model: {_model_source_label(provider)} · {ctx.llm.model}",
+            f"State: {'Ready' if state == 'ready' else 'Needs setup'}",
+            next_step,
+        ])
+    if normalized == "local":
+        normalized = "ollama"
+    if normalized in LOCAL_PROVIDERS:
+        runtime = _model_source_label(normalized)
+        return "\n".join([
+            f"Run a local model with {runtime}",
+            "",
+            f"Install and start {runtime}, then choose a model from /model.",
+            "No account or API key is needed.",
+            "",
+            "Need another local runtime? Use /setup more.",
+        ])
+    if normalized in {"more", "other"}:
+        providers = _setup_available_providers(include_local=True)
+        names = ", ".join(_model_source_label(provider) for provider in providers)
+        return f"More connection options\n\n{names}\n\nType /setup followed by the provider name."
+    try:
+        provider = _normalize_provider(normalized)
+    except ValueError:
+        return "That connection option is not available. Type /setup and choose one from the menu."
+    if provider in LOCAL_PROVIDERS:
+        return _setup_text(ctx, "ollama")
+    if provider not in PROVIDER_API_KEY_ENVS or provider in UNIMPLEMENTED_PROVIDER_TRANSPORTS:
+        return "That provider is not available in this build. Choose another option from /setup."
+
+    model = PROVIDER_MODEL_HINTS.get(provider, (ctx.llm.model,))[0]
+    previous_llm = ctx.llm
+    try:
+        ctx.llm = LLMClient(model=model, provider=provider)
+        _apply_saved_reasoning_effort(ctx, ctx.llm)
+        _persist_llm_config(ctx)
+    except Exception as exc:
+        ctx.llm = previous_llm
+        return _command_text(
+            f"Could not prepare {_model_source_label(provider)}: {exc}",
+            code="unavailable",
+            setup_required=True,
+            error=True,
+        )
+    return _command_text(
+        "\n".join([
+            f"Connect {_model_source_label(provider)}",
+            "Paste your API key in the protected field below.",
+            "It is never shown in the conversation.",
+            f"Need a key first? Use /login {provider}.",
+        ]),
+        code="api_key_required",
+        setup_required=True,
+        secret_provider=provider,
+    )
+
+
+def _setup_available_providers(*, include_local: bool = False) -> list[str]:
+    providers = [
+        provider
+        for provider in AVAILABLE_PROVIDERS
+        if provider in PROVIDER_API_KEY_ENVS
+        and provider not in UNIMPLEMENTED_PROVIDER_TRANSPORTS
+    ]
+    if include_local:
+        providers.extend(sorted(LOCAL_PROVIDERS))
+    return sorted(set(providers), key=lambda provider: PROVIDER_SORT_ORDER.get(provider, 99))
 
 
 def _llm_mode(ctx: AppContext) -> str:
@@ -4126,13 +4233,25 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             "provider": _active_provider(ctx),
             "model": ctx.llm.model,
             "mode": _llm_mode(ctx),
-            "reasoning_effort": getattr(ctx.llm, "reasoning_effort", None) or "provider controlled",
             "configuration": _llm_configuration(ctx),
             "configuration_state": _llm_configuration_state(ctx),
+            "context_limit": _context_window_for_model(ctx.llm.model),
             "cost_usd": session.cost_usd,
+            "pending_attachments": [
+                {
+                    "filename": attachment.filename,
+                    "mime": attachment.mime,
+                    "size_bytes": attachment.size_bytes,
+                    "storage_path": attachment.storage_path,
+                }
+                for attachment in getattr(ctx, "pending_attachments", ())
+            ],
             "tokens": {
                 "input": session.tokens.input,
                 "output": session.tokens.output,
+                # Keep the TUI bridge token schema compatible with both current
+                # and previously built Rust front ends.  Older binaries require
+                # these counters even when no reasoning or cache tokens exist.
                 "reasoning": session.tokens.reasoning,
                 "cache_read": session.tokens.cache_read,
                 "cache_write": session.tokens.cache_write,
@@ -4148,6 +4267,15 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
                 "role": item.role,
                 "content": item.content,
                 "created_at": item.created_at,
+                "attachments": [
+                    {
+                        "filename": attachment.filename,
+                        "mime": attachment.mime,
+                        "size_bytes": attachment.size_bytes,
+                        "storage_path": attachment.storage_path,
+                    }
+                    for attachment in getattr(item, "attachments", ())
+                ],
             }
             for item in messages
         ],
@@ -4158,7 +4286,7 @@ def _tui_bridge_completions(prompt: str, *, ctx: Any | None = None) -> dict[str,
     entries = _slash_palette_entries(prompt, ctx=ctx)
     return {
         "title": _slash_palette_title(prompt) if entries else "",
-        "selected_index": _palette_selected_index(prompt, entries),
+        "selected_index": _palette_selected_index(prompt, entries, ctx=ctx),
         "entries": [
             {
                 "value": entry.value,
@@ -4172,10 +4300,22 @@ def _tui_bridge_completions(prompt: str, *, ctx: Any | None = None) -> dict[str,
     }
 
 
-def _palette_selected_index(prompt: str, entries: list[PaletteEntry]) -> int:
+def _palette_selected_index(
+    prompt: str,
+    entries: list[PaletteEntry],
+    *,
+    ctx: Any | None = None,
+) -> int:
     if not entries:
         return 0
     if _normalized_command_prompt(prompt).startswith("/model"):
+        if ctx is not None:
+            provider = _active_provider(ctx)
+            model = str(getattr(getattr(ctx, "llm", None), "model", "") or "")
+            active_value = f"{provider}/{model}"
+            for index, entry in enumerate(entries):
+                if entry.value == active_value and _palette_entry_selectable(entry):
+                    return index
         for index, entry in enumerate(entries):
             if _palette_entry_selectable(entry):
                 return index
@@ -4755,7 +4895,12 @@ def _slash_command_lines(prompt: str, width: int, *, selected_index: int = 0) ->
     )
     for index, entry in enumerate(entries[start : start + visible_count], start=start):
         marker = ">" if index == selected_index else " "
-        lines.append(_clip_line(f"{marker} {entry.label:<16} {entry.description}", width))
+        if _palette_entry_is_model(entry):
+            lines.append(f"{marker} {entry.label}")
+            if entry.description:
+                lines.append(f"    {entry.description}")
+        else:
+            lines.append(_clip_line(f"{marker} {entry.label:<16} {entry.description}", width))
     return lines
 
 
@@ -4775,6 +4920,8 @@ def _slash_palette_entries(prompt: str, *, ctx: Any | None = None) -> list[Palet
         return _model_palette_entries(parts[1] if len(parts) >= 2 else "", ctx=ctx)
     if _is_reasoning_palette_prompt(prompt, parts):
         return _reasoning_palette_entries(parts[1] if len(parts) >= 2 else "")
+    if _is_setup_palette_prompt(prompt, parts):
+        return _setup_palette_entries(parts[1] if len(parts) >= 2 else "")
 
     query = parts[0].casefold() if parts else "/"
     matches = [
@@ -4804,19 +4951,52 @@ def _slash_palette_entries(prompt: str, *, ctx: Any | None = None) -> list[Palet
 
 
 def _slash_command_complete_to(name: str) -> str:
-    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install", "/reasoning"}:
+    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install", "/reasoning", "/setup"}:
         return f"{name} "
     return name
 
 
 def _slash_command_executes(name: str) -> bool:
-    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install", "/reasoning"}
+    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install", "/reasoning", "/setup"}
+
+
+def _is_setup_palette_prompt(prompt: str, parts: list[str]) -> bool:
+    return (
+        len(parts) <= 2
+        and bool(parts)
+        and parts[0].casefold() in {"/setup", "/connect"}
+        and (prompt.endswith(" ") or len(parts) == 2)
+    )
+
+
+def _setup_palette_entries(query: str) -> list[PaletteEntry]:
+    choices = [
+        ("ollama", "Ollama", "private local model · no account"),
+        *[
+            (provider, _model_source_label(provider), "connect with an API key")
+            for provider in _setup_available_providers()[:3]
+        ],
+        ("more", "More options", "other providers and local runtimes"),
+        ("status", "Connection status", "check the active model")
+    ]
+    normalized = query.casefold()
+    matches = [choice for choice in choices if choice[0].startswith(normalized) or choice[1].casefold().startswith(normalized)]
+    return [
+        PaletteEntry(
+            value=value,
+            label=label,
+            description=description,
+            complete_to=f"/setup {value}",
+            execute=True,
+        )
+        for value, label, description in (matches or choices)
+    ]
 
 
 def _provider_palette_entries(command: str, query: str) -> list[PaletteEntry]:
     normalized = query.casefold()
     providers = sorted(
-        SUPPORTED_PROVIDERS,
+        AVAILABLE_PROVIDERS,
         key=lambda item: PROVIDER_SORT_ORDER.get(item, 99),
     )
     matches = [provider for provider in providers if provider.casefold().startswith(normalized)]
@@ -4862,15 +5042,17 @@ def _model_palette_entries(
     if ctx is None:
         return entries
 
-    ready = [entry for entry, option in zip(entries, matches) if option.get("state") == ModelState.READY]
-    rest = [entry for entry, option in zip(entries, matches) if option.get("state") != ModelState.READY]
+    if normalized:
+        return entries
+
     grouped: list[PaletteEntry] = []
-    if ready:
-        grouped.append(_palette_section("Ready / installed", "/model "))
-        grouped.extend(ready)
-    if rest:
-        grouped.append(_palette_section("Needs setup / not installed", "/model "))
-        grouped.extend(rest)
+    current_provider: str | None = None
+    for entry, option in zip(entries, matches):
+        provider = option["provider"]
+        if provider != current_provider:
+            current_provider = provider
+            grouped.append(_palette_section(_model_source_label(provider), "/model "))
+        grouped.append(entry)
     return grouped
 
 
@@ -5038,6 +5220,10 @@ def _selectable_palette_index(entries: list[PaletteEntry], selected_index: int) 
 
 def _palette_entry_selectable(entry: PaletteEntry) -> bool:
     return not entry.value.startswith("section:")
+
+
+def _palette_entry_is_model(entry: PaletteEntry) -> bool:
+    return entry.execute and entry.complete_to.startswith("/model ")
 
 
 def _complete_slash_command(prompt: str) -> str | None:
@@ -5408,6 +5594,12 @@ def _render_messages(messages: list[Any], width: int) -> list[str]:
                 lines.extend(f"  {line}" for line in wrapped)
             else:
                 lines.append("")
+        for attachment in getattr(message, "attachments", ()):
+            lines.extend(_wrap_lines(
+                f"Attachment: {attachment.filename} ({attachment.mime}, {attachment.size_bytes} bytes)",
+                width,
+                indent="  ",
+            ))
         lines.append("")
     return lines or ["No messages yet."]
 

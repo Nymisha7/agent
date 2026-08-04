@@ -6,6 +6,7 @@ mod grep;
 mod read_path;
 mod ripgrep;
 mod target_resolver;
+mod text;
 mod write_file;
 
 pub use glob::{glob_files, GlobKind, GlobMatch, GlobOptions, GlobResult};
@@ -30,4 +31,5 @@ pub use target_resolver::{
     resolve_target, ResolveConfidence, ResolveSource, ResolveTargetOptions, ResolveTargetResult,
     ResolvedKind, TargetKind,
 };
+pub use text::compact_whitespace;
 pub use write_file::{write_file, WriteFileOptions, WriteFileResult};

@@ -100,6 +100,9 @@ pub fn grep_files(options: GrepOptions) -> Result<GrepResult> {
             line_number: line_number as usize,
             line: text.trim_end_matches(['\r', '\n']).to_string(),
         });
+        if matches.len() > limit {
+            break;
+        }
     }
 
     let truncated = matches.len() > limit;

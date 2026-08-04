@@ -16,6 +16,7 @@ from agent.main import (
     _api_key_prompt_provider,
     _approval_panel_lines,
     _approval_display_text,
+    _cli_approval_requester,
     _compact_usage_text,
     _complete_slash_command,
     _ensure_ollama_running,
@@ -23,6 +24,7 @@ from agent.main import (
     _exclusive_bridge_turn,
     _handle_local_command,
     _is_exit_command,
+    _local_runtime_status_lines,
     _provider_api_key_needed,
     _load_persisted_api_keys,
     _persist_api_key,
@@ -34,7 +36,6 @@ from agent.main import (
     _slash_command_lines,
     _slash_palette_entries,
     _selectable_palette_index,
-    _tools_text,
     _tui_bridge_completions,
     _tui_bridge_apply_approval_decision,
     _tui_bridge_snapshot,
@@ -42,6 +43,7 @@ from agent.main import (
     build_parser,
     handle_prompt,
     main,
+    repl,
     run_tui,
 )
 from agent.planner import AgentSession
@@ -50,6 +52,45 @@ from agent.system_events import enqueue_system_event, reset_system_events_for_te
 
 
 class TuiExitTests(unittest.TestCase):
+    def test_plain_cli_approval_asks_once_for_exact_target(self) -> None:
+        request = {
+            "tool": "delete_path",
+            "operation": "delete",
+            "resolved_path": "/home/nymisha/test78.py",
+        }
+
+        with patch("builtins.input", return_value="yes") as read_input:
+            decision = _cli_approval_requester(request)
+
+        self.assertEqual(decision, "approved")
+        read_input.assert_called_once()
+        self.assertIn("delete", read_input.call_args.args[0])
+        self.assertIn("/home/nymisha/test78.py", read_input.call_args.args[0])
+
+    def test_plain_repl_connects_structured_approval_requester(self) -> None:
+        ctx = SimpleNamespace(
+            debug=False,
+            language_servers=None,
+            session_id="plain-cli-test",
+        )
+        captured: list[object] = []
+
+        def handle(_ctx: object, _prompt: str, **kwargs: object) -> str:
+            captured.append(kwargs.get("approval_requester"))
+            return "Deleted."
+
+        with (
+            patch("builtins.input", side_effect=["delete that project", "/exit"]),
+            patch("agent.main._handle_local_command", return_value=None),
+            patch("agent.main.handle_prompt", side_effect=handle),
+            patch("agent.main._stop_language_servers"),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = repl(ctx)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(captured, [_cli_approval_requester])
+
     def test_api_key_credentials_persist_with_private_permissions(self) -> None:
         with TemporaryDirectory() as config_home:
             with patch.dict(
@@ -58,13 +99,31 @@ class TuiExitTests(unittest.TestCase):
                 clear=True,
             ):
                 _persist_api_key("OPENAI_API_KEY", "sk-persisted")
-                credential_path = Path(config_home) / "agent" / "credentials.json"
+                credential_path = Path(config_home) / "agent" / "credentials.enc"
+                key_path = Path(config_home) / "agent" / "credentials.key"
                 self.assertEqual(credential_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+                self.assertNotIn(b"sk-persisted", credential_path.read_bytes())
                 self.assertNotIn("OPENAI_API_KEY", os.environ)
 
                 _load_persisted_api_keys()
 
                 self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-persisted")
+
+    def test_plaintext_credentials_are_migrated_to_encrypted_storage(self) -> None:
+        with TemporaryDirectory() as config_home:
+            credential_dir = Path(config_home) / "agent"
+            credential_dir.mkdir()
+            legacy = credential_dir / "credentials.json"
+            legacy.write_text('{"OPENAI_API_KEY":"sk-legacy"}', encoding="utf-8")
+            with patch.dict("os.environ", {"XDG_CONFIG_HOME": config_home}, clear=True):
+                _load_persisted_api_keys()
+
+                encrypted = credential_dir / "credentials.enc"
+                self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-legacy")
+                self.assertTrue(encrypted.is_file())
+                self.assertNotIn(b"sk-legacy", encrypted.read_bytes())
+                self.assertFalse(legacy.exists())
 
     def test_bridge_turn_lock_rejects_second_active_turn_for_same_session(self) -> None:
         with _exclusive_bridge_turn("single-active-session"):
@@ -119,26 +178,13 @@ class TuiExitTests(unittest.TestCase):
 
 
 class TuiRenderingTests(unittest.TestCase):
-    def test_tools_command_groups_tools_by_purpose_and_policy(self) -> None:
-        ctx = SimpleNamespace(
-            rust=SimpleNamespace(),
-            workspace_root=Path("/workspace"),
-            search_roots=[Path("/workspace")],
-            skills=None,
-            tool_allowlist={"read_path", "grep", "desktop_send_message"},
-            agent_id="main",
-        )
+    def test_tools_are_agent_managed_and_not_selectable(self) -> None:
+        ctx = SimpleNamespace()
 
-        text = _tools_text(ctx)
+        text = _handle_local_command(ctx, "/tools")
 
-        self.assertIn("Agent tools", text)
-        self.assertIn("Workspace", text)
-        self.assertIn("read_path", text)
-        self.assertIn("Desktop Control", text)
-        self.assertIn("desktop_send_message", text)
-        self.assertIn("requires approval", text)
-        self.assertIn("Disabled by profile allowlist", text)
-        self.assertNotIn("discovery_subagent", text)
+        self.assertIn("managed automatically", text)
+        self.assertFalse(any(entry.value == "/tools" for entry in _slash_palette_entries("/")))
 
     def test_devices_and_capabilities_are_not_slash_commands(self) -> None:
         ctx = SimpleNamespace()
@@ -148,6 +194,35 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertNotIn("/devices", "\n".join(_slash_command_lines("/", 80)))
         self.assertNotIn("/capabilities", "\n".join(_slash_command_lines("/", 80)))
         self.assertFalse(any(entry.value in {"/devices", "/capabilities"} for entry in _slash_palette_entries("/")))
+
+    def test_attachments_are_composer_actions_not_slash_commands(self) -> None:
+        hidden = {"/attach", "/attachments", "/screenshot"}
+
+        for command in hidden:
+            self.assertEqual(
+                _handle_local_command(SimpleNamespace(), command),
+                f"Unknown local command: {command}",
+            )
+        self.assertTrue(hidden.isdisjoint({entry.value for entry in _slash_palette_entries("/")}))
+        help_text = "\n".join(_slash_command_lines("/", 100))
+        self.assertTrue(all(command not in help_text for command in hidden))
+
+    def test_private_composer_bridge_still_adds_selected_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "notes.txt"
+            source.write_text("attachment content", encoding="utf-8")
+            ctx = SimpleNamespace(
+                session_id="attachment-session",
+                pending_attachments=[],
+                session=AgentSession(),
+                store=SimpleNamespace(save_agent_state=Mock()),
+            )
+            with patch.dict("os.environ", {"XDG_DATA_HOME": tmp}):
+                result = _handle_local_command(ctx, f'/__nym_attach "{source}"')
+
+        self.assertIn("Attached for next message: notes.txt", result)
+        self.assertEqual([item.filename for item in ctx.pending_attachments], ["notes.txt"])
+        self.assertEqual(len(ctx.session.pending_attachments), 1)
 
     def test_bridge_local_command_round_trip_includes_prompt_and_answer(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -521,15 +596,19 @@ class TuiRenderingTests(unittest.TestCase):
             entries["ollama/llama3.3"]["description"],
             "Ollama · Not installed · 70B params · ~43 GB · 128K ctx",
         )
-        self.assertEqual(
-            entries["gemini/gemini-2.5-pro"]["description"],
-            "Google Gemini · Unavailable",
-        )
+        self.assertNotIn("gemini/gemini-2.5-pro", entries)
         labels = [entry["label"] for entry in payload["entries"]]
-        self.assertIn("── Ready / installed ──", labels)
-        self.assertIn("── Needs setup / not installed ──", labels)
+        self.assertIn("── OpenAI ──", labels)
+        self.assertIn("── Ollama ──", labels)
+        self.assertNotIn("── Ready / installed ──", labels)
+        self.assertNotIn("── Needs setup / not installed ──", labels)
+        ollama_section = labels.index("── Ollama ──")
+        self.assertEqual(
+            labels[ollama_section + 1 : ollama_section + 4],
+            ["qwen2.5-coder", "qwen3-coder", "qwen3"],
+        )
 
-    def test_model_completions_put_ready_installed_local_models_first(self) -> None:
+    def test_model_completions_are_grouped_by_provider_ranked_models_first(self) -> None:
         ctx = SimpleNamespace(
             llm=SimpleNamespace(
                 provider="openai",
@@ -551,24 +630,15 @@ class TuiRenderingTests(unittest.TestCase):
             payload = _tui_bridge_completions("/model ", ctx=ctx)
 
         values = [entry["value"] for entry in payload["entries"] if entry["execute"]]
-        ready_values = {
-            "openai/gpt-5.5",
-            "ollama/qwen3",
-            "ollama/qwen3:latest",
-            "ollama/custom-local:latest",
-            "llamacpp/qwen2.5-coder-7b-instruct",
-        }
-        first_non_ready = next(
-            index
-            for index, value in enumerate(values)
-            if value not in ready_values
-        )
-
-        self.assertEqual(set(values[:first_non_ready]), ready_values)
-        self.assertLess(values.index("ollama/qwen3"), values.index("ollama/qwen2.5-coder"))
+        self.assertLess(values.index("openai/gpt-5.5"), values.index("anthropic/claude-sonnet-4.5"))
+        self.assertLess(values.index("anthropic/claude-sonnet-4.5"), values.index("ollama/qwen2.5-coder"))
+        self.assertLess(values.index("ollama/qwen2.5-coder"), values.index("ollama/qwen3-coder"))
+        self.assertLess(values.index("ollama/qwen3-coder"), values.index("ollama/qwen3"))
+        self.assertLess(values.index("ollama/qwen3"), values.index("ollama/custom-local:latest"))
+        self.assertLess(values.index("ollama/qwen3:latest"), values.index("ollama/custom-local:latest"))
         self.assertLess(
-            values.index("llamacpp/qwen2.5-coder-7b-instruct"),
             values.index("llamacpp/gemma-3-1b-it"),
+            values.index("llamacpp/qwen2.5-coder-7b-instruct"),
         )
 
     def test_model_completions_select_current_model_first(self) -> None:
@@ -645,7 +715,7 @@ class TuiRenderingTests(unittest.TestCase):
                     title="Test",
                     workspace_root="/workspace",
                     updated_at="now",
-                    cost_usd=0.0,
+                    cost_usd=0.0123,
                     tokens=TokenUsage(),
                 ),
                 list_messages=lambda _session_id, limit=None: seen_limits.append(limit) or [],
@@ -659,7 +729,60 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual(snapshot["approvals"][0]["display_path"], "Example file")
         self.assertEqual(snapshot["session"]["configuration_state"], "ready")
         self.assertNotIn("credential_provider", snapshot["session"])
+        self.assertEqual(
+            snapshot["session"]["tokens"],
+            {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0},
+        )
+        self.assertEqual(snapshot["session"]["cost_usd"], 0.0123)
         self.assertEqual(seen_limits, [TUI_TRANSCRIPT_LIMIT])
+
+    def test_tui_bridge_snapshot_exposes_stored_attachment_for_ui_opening(self) -> None:
+        attachment = SimpleNamespace(
+            filename="report.pdf",
+            mime="application/pdf",
+            size_bytes=123,
+            storage_path="/private/attachments/report",
+        )
+        ctx = SimpleNamespace(
+            session_id="attachment-session",
+            llm=SimpleNamespace(
+                model="gpt-5.4-mini",
+                provider="openai",
+                mode="hosted",
+                configuration_error=None,
+            ),
+            session=SimpleNamespace(pending_approvals=[]),
+            pending_attachments=[attachment],
+            store=SimpleNamespace(
+                get_session=lambda _session_id: SimpleNamespace(
+                    id="attachment-session",
+                    title="Test",
+                    workspace_root="/workspace",
+                    updated_at="now",
+                    cost_usd=0.0,
+                    tokens=TokenUsage(),
+                ),
+                list_messages=lambda _session_id, limit=None: [
+                    SimpleNamespace(
+                        role="user",
+                        content="Review this",
+                        created_at="now",
+                        attachments=[attachment],
+                    )
+                ],
+            ),
+        )
+
+        snapshot = _tui_bridge_snapshot(ctx)
+
+        self.assertEqual(
+            snapshot["session"]["pending_attachments"][0]["storage_path"],
+            attachment.storage_path,
+        )
+        self.assertEqual(
+            snapshot["messages"][0]["attachments"][0]["storage_path"],
+            attachment.storage_path,
+        )
 
     def test_tui_bridge_approval_decision_persists_for_waiting_turn(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -860,11 +983,14 @@ class TuiRenderingTests(unittest.TestCase):
         })
         live_turn.update({
             "kind": "subagent_task_started",
-            "summary": "architecture · running — inspect architecture",
+            "task_id": "architecture",
+            "summary": "inspect architecture",
         })
         live_turn.update({
             "kind": "subagent_task_completed",
-            "summary": "architecture · complete — found planner entry point",
+            "task_id": "architecture",
+            "status": "complete",
+            "summary": "found planner entry point",
         })
 
         rendered = _render_tui_transcript([], live_turn.snapshot(), 100)
@@ -1056,6 +1182,14 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertIn("open source · local runtime/install · no login", entries[0].description)
         self.assertEqual(_complete_slash_command("/model llama"), "/model ollama llama3.3")
 
+    def test_model_palette_lines_keep_full_long_model_names(self) -> None:
+        model = "Qwen/Qwen2.5-Coder-32B-Instruct"
+        lines = _slash_command_lines(f"/model {model}", 24)
+        text = "\n".join(lines)
+
+        self.assertIn(model, text)
+        self.assertNotIn("...", text)
+
     def test_install_palette_offers_explicit_ollama_download_action(self) -> None:
         entries = _slash_palette_entries("/install ollama")
 
@@ -1173,7 +1307,7 @@ class LocalCommandTests(unittest.TestCase):
                 "quantization": "Q4_K_M",
             }]),
         ):
-            result = _handle_local_command(ctx, "/status")
+            result = "\n".join(_local_runtime_status_lines(ctx))
 
         self.assertIn("Local runtime:", result)
         self.assertIn("- Server: reachable", result)
@@ -1201,7 +1335,7 @@ class LocalCommandTests(unittest.TestCase):
             patch("agent.main._discover_provider_models", return_value=(["qwen2.5-coder:7b"], None)),
             patch("agent.main._discover_ollama_loaded_models", return_value=[]),
         ):
-            result = _handle_local_command(ctx, "/status")
+            result = "\n".join(_local_runtime_status_lines(ctx))
 
         self.assertIn("- Loaded/warm models: none", result)
         self.assertIn("first prompt may be slow", result)
@@ -1226,7 +1360,7 @@ class LocalCommandTests(unittest.TestCase):
             "agent.main._discover_provider_models",
             return_value=([], "connection refused"),
         ):
-            result = _handle_local_command(ctx, "/status")
+            result = "\n".join(_local_runtime_status_lines(ctx))
 
         self.assertIn("- Server: unreachable", result)
         self.assertIn("- Details: connection refused", result)
@@ -1901,7 +2035,7 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("/install <provider> <model>", result)
         self.assertIn("Ollama, LM Studio, llama.cpp, vLLM, and LocalAI", result)
 
-    def test_status_command_shows_configuration_and_approvals(self) -> None:
+    def test_status_command_shows_session_and_context_only(self) -> None:
         ctx = SimpleNamespace(
             session_id="abc123",
             workspace_root="/workspace",
@@ -1917,20 +2051,30 @@ class LocalCommandTests(unittest.TestCase):
 
         result = _handle_local_command(ctx, "/status")
 
-        self.assertIn("Session: abc123", result)
-        self.assertIn("Configuration: OPENAI_API_KEY is missing", result)
-        self.assertIn("Context left:", result)
-        self.assertNotIn("Endpoint:", result)
-        self.assertIn("Pending approvals: 1", result)
+        self.assertIn("Status", result)
+        self.assertIn("Session:\nabc123", result)
+        self.assertIn("Context:", result)
+        self.assertIn("left (", result)
+        self.assertIn("█", result)
+        self.assertNotIn("Configuration:", result)
+        self.assertNotIn("Pending approvals:", result)
 
-    def test_connect_command_shows_setup_paths(self) -> None:
+    def test_connect_command_shows_a_short_guided_setup(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
         result = _handle_local_command(ctx, "/connect")
 
-        self.assertIn("OPENAI_API_KEY", result)
-        self.assertIn("Ollama local", result)
-        self.assertIn("not in this workspace", result)
+        self.assertIn("Connect a model", result)
+        self.assertIn("Ollama", result)
+        self.assertNotIn("OPENAI_API_KEY", result)
+        self.assertNotIn("AGENT_LLAMACPP_BASE_URL", result)
+
+    def test_setup_palette_uses_guided_provider_choices(self) -> None:
+        entries = _slash_palette_entries("/setup ")
+
+        self.assertTrue(any(entry.value == "ollama" for entry in entries))
+        self.assertTrue(any(entry.value == "status" for entry in entries))
+        self.assertFalse(any(entry.value == "/tools" for entry in entries))
 
     def test_local_open_source_provider_never_opens_login(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="llamacpp", model="local-model"))

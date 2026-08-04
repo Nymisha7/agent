@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
@@ -68,10 +69,9 @@ pub struct StagedSearchResult {
 }
 
 #[derive(Debug, Clone)]
-struct Candidate {
-    root: PathBuf,
+struct Candidate<'a> {
+    root: &'a Path,
     relative_path: PathBuf,
-    display_path: String,
     match_type: MatchType,
 }
 
@@ -190,7 +190,7 @@ impl SearchCollector {
         Self { inner }
     }
 
-    fn observe(&mut self, candidate: &Candidate) {
+    fn observe(&mut self, candidate: &Candidate<'_>) {
         match &mut self.inner {
             SearchCollectorInner::Exact(collector) => collector.observe(candidate),
             SearchCollectorInner::Contains(collector) => collector.observe(candidate),
@@ -210,7 +210,8 @@ impl SearchCollector {
 struct ExactCollector {
     query: String,
     limit: NonZeroUsize,
-    matches: Vec<FileMatch>,
+    heap: BinaryHeap<ExactCandidate>,
+    next_order: usize,
 }
 
 impl ExactCollector {
@@ -218,29 +219,71 @@ impl ExactCollector {
         Self {
             query,
             limit,
-            matches: Vec::new(),
+            heap: BinaryHeap::new(),
+            next_order: 0,
         }
     }
 
-    fn observe(&mut self, candidate: &Candidate) {
+    fn observe(&mut self, candidate: &Candidate<'_>) {
         if candidate_name(candidate).to_lowercase() != self.query {
             return;
         }
 
-        self.matches.push(FileMatch {
-            score: 1_000,
-            path: candidate.relative_path.clone(),
-            match_type: candidate.match_type,
-            root: candidate.root.clone(),
-        });
+        let item = ExactCandidate {
+            file_match: FileMatch {
+                score: 1_000,
+                path: candidate.relative_path.clone(),
+                match_type: candidate.match_type,
+                root: candidate.root.to_path_buf(),
+            },
+            order: self.next_order,
+        };
+        self.next_order = self.next_order.saturating_add(1);
+
+        if self.heap.len() < self.limit.get() {
+            self.heap.push(item);
+        } else if self.heap.peek().is_some_and(|worst| item < *worst) {
+            self.heap.pop();
+            self.heap.push(item);
+        }
     }
 
-    fn finish(mut self) -> Vec<FileMatch> {
-        self.matches.sort_by(|a, b| a.path.cmp(&b.path));
-        self.matches.truncate(self.limit.get());
-        self.matches
+    fn finish(self) -> Vec<FileMatch> {
+        let mut matches = self.heap.into_vec();
+        matches.sort();
+        matches.into_iter().map(|item| item.file_match).collect()
     }
 }
+
+#[derive(Debug)]
+struct ExactCandidate {
+    file_match: FileMatch,
+    // Retains the prior stable ordering when two roots contain the same relative path.
+    order: usize,
+}
+
+impl Ord for ExactCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.file_match
+            .path
+            .cmp(&other.file_match.path)
+            .then_with(|| self.order.cmp(&other.order))
+    }
+}
+
+impl PartialOrd for ExactCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ExactCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ExactCandidate {}
 
 struct ScoredCollector {
     query: String,
@@ -257,7 +300,7 @@ impl ScoredCollector {
         }
     }
 
-    fn observe(&mut self, candidate: &Candidate) {
+    fn observe(&mut self, candidate: &Candidate<'_>) {
         let name = candidate_name(candidate);
         let name_lower = name.to_lowercase();
         let Some(position) = name_lower.find(&self.query) else {
@@ -303,8 +346,9 @@ impl FuzzyCollector {
         }
     }
 
-    fn observe(&mut self, candidate: &Candidate) {
-        let haystack = Utf32Str::new(candidate.display_path.as_str(), &mut self.buf);
+    fn observe(&mut self, candidate: &Candidate<'_>) {
+        let display_path = candidate_display_path(candidate);
+        let haystack = Utf32Str::new(display_path.as_ref(), &mut self.buf);
         let Some(score) = self.pattern.score(haystack, &mut self.matcher) else {
             return;
         };
@@ -330,12 +374,12 @@ struct ScoredCandidate {
 }
 
 impl ScoredCandidate {
-    fn new(score: u32, candidate: &Candidate) -> Self {
+    fn new(score: u32, candidate: &Candidate<'_>) -> Self {
         Self {
             score,
             path: candidate.relative_path.clone(),
             match_type: candidate.match_type,
-            root: candidate.root.clone(),
+            root: candidate.root.to_path_buf(),
         }
     }
 
@@ -397,7 +441,7 @@ fn collect_candidates<F>(
     mut on_candidate: F,
 ) -> Result<()>
 where
-    F: FnMut(Candidate),
+    F: FnMut(Candidate<'_>),
 {
     for path in ripgrep_paths(
         root,
@@ -420,11 +464,11 @@ where
     Ok(())
 }
 
-fn candidate_from_ripgrep_path(
-    root: &Path,
+fn candidate_from_ripgrep_path<'root>(
+    root: &'root Path,
     options: &FileSearchOptions,
     path: RipgrepPath,
-) -> Option<Candidate> {
+) -> Option<Candidate<'root>> {
     let match_type = match path.kind {
         RipgrepPathKind::File => MatchType::File,
         RipgrepPathKind::Directory => MatchType::Directory,
@@ -434,15 +478,13 @@ fn candidate_from_ripgrep_path(
         return None;
     }
 
-    let display_path = path.relative.to_string_lossy().replace('\\', "/");
-    if display_path.is_empty() {
+    if path.relative.as_os_str().is_empty() {
         return None;
     }
 
     Some(Candidate {
-        root: root.to_path_buf(),
+        root,
         relative_path: path.relative,
-        display_path,
         match_type,
     })
 }
@@ -455,10 +497,49 @@ fn matches_kind(kind: SearchKind, match_type: MatchType) -> bool {
     }
 }
 
-fn candidate_name(candidate: &Candidate) -> String {
+fn candidate_name<'candidate, 'root>(
+    candidate: &'candidate Candidate<'root>,
+) -> Cow<'candidate, str> {
     candidate
         .relative_path
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| candidate.display_path.clone())
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| candidate_display_path(candidate))
+}
+
+fn candidate_display_path<'candidate, 'root>(
+    candidate: &'candidate Candidate<'root>,
+) -> Cow<'candidate, str> {
+    let display_path = candidate.relative_path.to_string_lossy();
+    if display_path.contains('\\') {
+        Cow::Owned(display_path.replace('\\', "/"))
+    } else {
+        display_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_collector_keeps_only_the_sorted_limit() {
+        let root = Path::new("/workspace");
+        let mut collector = ExactCollector::new(
+            "report.md".to_owned(),
+            NonZeroUsize::new(2).expect("nonzero limit"),
+        );
+        for relative_path in ["z/report.md", "a/report.md", "m/report.md"] {
+            collector.observe(&Candidate {
+                root,
+                relative_path: PathBuf::from(relative_path),
+                match_type: MatchType::File,
+            });
+        }
+
+        let matches = collector.finish();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].path, Path::new("a/report.md"));
+        assert_eq!(matches[1].path, Path::new("m/report.md"));
+    }
 }

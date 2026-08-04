@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 use std::fs;
 use std::process::Command as ProcessCommand;
 
@@ -9,7 +10,10 @@ pub(crate) use desktop::desktop_action;
 pub(crate) use desktop::desktop_capabilities;
 pub(crate) use desktop::desktop_clipboard_files;
 pub(crate) use desktop::desktop_observe;
+pub(crate) use desktop::desktop_open_user_file;
+pub(crate) use desktop::desktop_pick_file;
 pub(crate) use desktop::desktop_resolve;
+pub(crate) use desktop::{desktop_clipboard_image_to_file, desktop_clipboard_read_text};
 #[cfg(test)]
 pub(crate) use desktop::{valid_bluetooth_address, valid_identifier, valid_path_token};
 pub(crate) use inventory::connected_devices;
@@ -24,11 +28,8 @@ pub(crate) fn system_info() -> Result<Value> {
     let uptime_seconds = read_uptime_seconds().unwrap_or(0.0);
     let meminfo = read_meminfo();
     let disk = root_disk_summary();
-    let runtime = if is_wsl_runtime() {
-        "wsl"
-    } else {
-        std::env::consts::OS
-    };
+    let wsl = is_wsl_runtime();
+    let runtime = if wsl { "wsl" } else { std::env::consts::OS };
 
     Ok(json!({
         "ok": true,
@@ -37,12 +38,92 @@ pub(crate) fn system_info() -> Result<Value> {
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "hostname": hostname,
-        "wsl": is_wsl_runtime(),
+        "wsl": wsl,
         "cpu_count": std::thread::available_parallelism().map(|value| value.get()).unwrap_or(1),
         "uptime_seconds": uptime_seconds,
         "memory": meminfo,
         "disk": disk,
     }))
+}
+
+pub(crate) fn desktop_screenshot() -> Result<Value> {
+    let directory = std::env::temp_dir().join("agent-screenshots");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("screenshot-{}.png", unix_millis()));
+    let path_text = path.to_string_lossy().to_string();
+    let (command, backend): (Vec<String>, &str) = if command_exists("grim") {
+        (vec!["grim".to_owned(), path_text.clone()], "grim")
+    } else if command_exists("gnome-screenshot") {
+        (
+            vec![
+                "gnome-screenshot".to_owned(),
+                "-f".to_owned(),
+                path_text.clone(),
+            ],
+            "gnome-screenshot",
+        )
+    } else if command_exists("scrot") {
+        (vec!["scrot".to_owned(), path_text.clone()], "scrot")
+    } else if is_wsl_runtime() && command_exists("powershell.exe") {
+        let windows_path = wsl_windows_path(&path)?;
+        let quoted_path = windows_path.replace('\'', "''");
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
+             $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
+             $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height; \
+             $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
+             $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size); \
+             $bitmap.Save('{quoted_path}', [System.Drawing.Imaging.ImageFormat]::Png); \
+             $graphics.Dispose(); $bitmap.Dispose()"
+        );
+        (
+            vec![
+                "powershell.exe".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-STA".to_owned(),
+                "-Command".to_owned(),
+                script,
+            ],
+            "powershell.exe",
+        )
+    } else {
+        return Ok(json!({
+            "ok": false,
+            "tool": "desktop_screenshot",
+            "reason": "screenshot_backend_unavailable",
+            "guidance": "Install grim, gnome-screenshot, or scrot in the desktop runtime.",
+        }));
+    };
+    let output = run_capture_dynamic(&command)?;
+    let exists = path.is_file();
+    Ok(json!({
+        "ok": output.status == 0 && exists,
+        "tool": "desktop_screenshot",
+        "path": if exists { Some(path_text) } else { None },
+        "backend": backend,
+        "exit_code": output.status,
+        "stderr": output.stderr,
+        "verification": if output.status == 0 && exists { "confirmed" } else { "not_confirmed" },
+    }))
+}
+
+fn wsl_windows_path(path: &std::path::Path) -> Result<String> {
+    let path_text = path.to_string_lossy();
+    let output = run_capture_dynamic(&["wslpath", "-w", path_text.as_ref()])?;
+    if output.status != 0 || output.stdout.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "Could not translate the screenshot path for Windows."
+        ));
+    }
+    Ok(output.stdout.trim().to_string())
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn command_exists(name: &str) -> bool {
@@ -65,17 +146,32 @@ pub(crate) fn process_list(limit: usize, sort_by: &str) -> Result<Value> {
     let output = run_capture(&command)?;
     let mut items = Vec::new();
     for line in output.stdout.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 6 {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next() else {
             continue;
-        }
+        };
+        let Some(ppid) = fields.next() else {
+            continue;
+        };
+        let Some(command) = fields.next() else {
+            continue;
+        };
+        let Some(cpu) = fields.next() else {
+            continue;
+        };
+        let Some(memory) = fields.next() else {
+            continue;
+        };
+        let Some(state) = fields.next() else {
+            continue;
+        };
         items.push(json!({
-            "pid": fields[0].parse::<u32>().ok(),
-            "ppid": fields[1].parse::<u32>().ok(),
-            "command": fields[2],
-            "cpu_percent": fields[3].parse::<f64>().ok(),
-            "memory_percent": fields[4].parse::<f64>().ok(),
-            "state": fields[5],
+            "pid": pid.parse::<u32>().ok(),
+            "ppid": ppid.parse::<u32>().ok(),
+            "command": command,
+            "cpu_percent": cpu.parse::<f64>().ok(),
+            "memory_percent": memory.parse::<f64>().ok(),
+            "state": state,
         }));
         if items.len() >= limit.max(1) {
             break;
@@ -200,12 +296,12 @@ fn run_capture<const N: usize>(argv: &[&str; N]) -> Result<CommandOutput> {
     run_capture_dynamic(argv)
 }
 
-fn run_capture_dynamic(argv: &[&str]) -> Result<CommandOutput> {
-    if argv.is_empty() {
+fn run_capture_dynamic<T: AsRef<OsStr>>(argv: &[T]) -> Result<CommandOutput> {
+    let Some((program, arguments)) = argv.split_first() else {
         return Err(anyhow::anyhow!("Cannot run an empty command"));
-    }
-    let mut command = ProcessCommand::new(argv[0]);
-    command.args(&argv[1..]);
+    };
+    let mut command = ProcessCommand::new(program.as_ref());
+    command.args(arguments.iter().map(AsRef::as_ref));
     let output = command.output()?;
     Ok(CommandOutput {
         status: output.status.code().unwrap_or(-1),
@@ -248,15 +344,29 @@ fn root_disk_summary() -> Value {
     match run_capture(&["df", "-kP", "/"]) {
         Ok(output) => {
             let line = output.stdout.lines().nth(1).unwrap_or("");
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 6 {
+            let mut fields = line.split_whitespace();
+            if let (
+                Some(filesystem),
+                Some(size),
+                Some(used),
+                Some(available),
+                Some(used_percent),
+                Some(mountpoint),
+            ) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) {
                 json!({
-                    "filesystem": fields[0],
-                    "size_kib": fields[1].parse::<u64>().ok(),
-                    "used_kib": fields[2].parse::<u64>().ok(),
-                    "available_kib": fields[3].parse::<u64>().ok(),
-                    "used_percent": fields[4],
-                    "mountpoint": fields[5],
+                    "filesystem": filesystem,
+                    "size_kib": size.parse::<u64>().ok(),
+                    "used_kib": used.parse::<u64>().ok(),
+                    "available_kib": available.parse::<u64>().ok(),
+                    "used_percent": used_percent,
+                    "mountpoint": mountpoint,
                 })
             } else {
                 json!({})

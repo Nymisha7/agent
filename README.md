@@ -33,9 +33,11 @@ Building a wheel runs `cargo build --release` and copies the executable into the
 package. Source-only development builds can set `AGENT_SKIP_RUST_BUILD=1`, but
 distributed wheels should not use that flag.
 
-Type `/` inside the TUI to open the command menu. The main commands are `/model`,
-`/install`, `/reasoning`, `/tools`, `/skills`, `/gateway`, `/status`, `/setup`,
-`/help`, and `/exit`.
+The TUI keeps file sharing in the composer: select the paperclip (or press F4) to
+add a photo or file, and use Ctrl+V to paste text or a clipboard image. Selected
+files appear beside the message and are sent with it. Type `/` to open the secondary
+command menu for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`,
+`/status`, `/setup`, `/help`, and `/exit`.
 
 ## Desktop and system capabilities
 
@@ -100,8 +102,24 @@ For models that expose configurable reasoning effort, use `/reasoning` and choos
 `minimal`, `low`, `medium`, or `high`. Agent shows concise activity and tool results;
 raw private chain-of-thought is not displayed.
 
-Hosted providers remain available and request an API key or cloud credentials only
-when their provider requires it.
+Implemented hosted providers appear in the model picker and request an API key only
+when required. Providers without a working transport are not advertised as selectable.
+
+## Local data and retention
+
+API keys entered through Agent are encrypted before being written to the private
+configuration directory. Existing `credentials.json` files are migrated on first use.
+For managed deployments, provide `AGENT_CREDENTIAL_ENCRYPTION_KEY` from the operating
+system credential service or company secret manager so the encryption key is not kept
+beside the encrypted data.
+
+Sessions and attachment snapshots are private to the current OS user. Attachment
+retention defaults to 30 days and a 1 GiB total cache. Configure these limits with
+`AGENT_ATTACHMENT_RETENTION_DAYS` and `AGENT_ATTACHMENT_STORE_MAX_BYTES`; individual
+file, text-input, and image-input limits use `AGENT_MAX_ATTACHMENT_BYTES`,
+`AGENT_MAX_TEXT_ATTACHMENT_BYTES`, and `AGENT_MAX_IMAGE_ATTACHMENT_BYTES`.
+`AGENT_PROTECTED_PATHS` can add platform- or company-specific filesystem roots that
+must never be used as broad external tool targets.
 
 ## Parallel subagent safety model
 
@@ -161,7 +179,9 @@ Configuration is strict JSON. Agent loads `~/.config/agent/config.json` first an
 `<workspace>/.agent/config.json`. `AGENT_CONFIG` or `--config` selects one explicit file.
 Agent profiles are routing and policy profiles, not concurrently editing workers. Their
 optional `skills` and `tools` arrays replace inherited defaults; an empty array disables
-that capability, and omitted fields inherit it.
+that capability, and omitted fields inherit it. Language-server access is opt-in because
+its current symbol-navigation API is most useful for focused code-intelligence profiles;
+include `language_server` in a profile's `tools` array to expose it to that model.
 
 ```json
 {

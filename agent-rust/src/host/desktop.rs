@@ -5,7 +5,7 @@ use super::{
 use anyhow::Result;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -13,6 +13,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -657,18 +658,21 @@ fn desktop_observation_limitations(linux_supported: bool, wsl: bool) -> Vec<&'st
 }
 
 fn windows_host_powershell_available() -> bool {
-    if !is_wsl_runtime() || !command_exists("powershell.exe") {
-        return false;
-    }
-    run_capture_dynamic(&[
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "$PSVersionTable.PSVersion.Major",
-    ])
-    .map(|output| output.status == 0 && !output.stdout.is_empty())
-    .unwrap_or(false)
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if !is_wsl_runtime() || !command_exists("powershell.exe") {
+            return false;
+        }
+        run_capture_dynamic(&[
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$PSVersionTable.PSVersion.Major",
+        ])
+        .map(|output| output.status == 0 && !output.stdout.is_empty())
+        .unwrap_or(false)
+    })
 }
 
 fn now_unix_millis() -> u128 {
@@ -907,7 +911,10 @@ fn desktop_command_receipt<F>(
 where
     F: Fn() -> Value,
 {
-    if argv.first().is_some_and(|command| !command_exists(command)) {
+    let Some((program, _)) = argv.split_first() else {
+        return Err(anyhow::anyhow!("Cannot run an empty desktop command"));
+    };
+    if !command_exists(program) {
         return Ok(json!({
             "ok": false,
             "tool": "desktop_action",
@@ -915,7 +922,7 @@ where
             "target": target,
             "value": value,
             "reason": "dependency_unavailable",
-            "error": format!("Required desktop command `{}` is not installed.", argv[0]),
+            "error": format!("Required desktop command `{program}` is not installed."),
         }));
     }
     let before = observe();
@@ -1185,7 +1192,7 @@ fn launch_window_summary() -> Result<Value> {
     let items = observed
         .get("items")
         .and_then(Value::as_array)
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
     let ids: Vec<Value> = items
         .iter()
@@ -1272,14 +1279,32 @@ fn windows_shortcut_focus_query(shortcut: &str) -> String {
 }
 
 fn clipboard_backend() -> &'static str {
-    if command_exists("wl-copy") && command_exists("wl-paste") {
-        "wl-clipboard"
-    } else if command_exists("xclip") {
-        "xclip"
-    } else if command_exists("xsel") {
-        "xsel"
-    } else if windows_host_powershell_available() {
+    // In WSL the interactive terminal and screenshot tools normally use the
+    // Windows host clipboard. Linux clipboard binaries may still be installed
+    // while their display socket is unreachable, so selecting them first makes
+    // Ctrl+V fail before the working host backend is attempted.
+    select_clipboard_backend(
+        is_wsl_runtime() && windows_host_powershell_available(),
+        command_exists("wl-copy") && command_exists("wl-paste"),
+        command_exists("xclip"),
+        command_exists("xsel"),
+    )
+}
+
+fn select_clipboard_backend(
+    windows_host: bool,
+    wayland: bool,
+    xclip: bool,
+    xsel: bool,
+) -> &'static str {
+    if windows_host {
         "windows_host_powershell"
+    } else if wayland {
+        "wl-clipboard"
+    } else if xclip {
+        "xclip"
+    } else if xsel {
+        "xsel"
     } else {
         "unavailable"
     }
@@ -1334,9 +1359,9 @@ fn display_inventory(limit: usize) -> Result<Value> {
     }
 
     let output = run_capture_dynamic(&["xrandr", "--query"])?;
-    let all_items = parse_xrandr_displays(&output.stdout);
-    let total = all_items.len();
-    let items: Vec<Value> = all_items.into_iter().take(limit).collect();
+    let mut items = parse_xrandr_displays(&output.stdout);
+    let total = items.len();
+    items.truncate(limit);
     Ok(json!({
         "ok": output.status == 0,
         "backend": "xrandr",
@@ -1352,17 +1377,23 @@ fn parse_xrandr_displays(output: &str) -> Vec<Value> {
 }
 
 fn parse_xrandr_display(line: &str) -> Option<Value> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    let status = *fields.get(1)?;
+    let mut fields = line.split_whitespace();
+    let name = fields.next()?;
+    let status = fields.next()?;
     if !matches!(status, "connected" | "disconnected") {
         return None;
     }
-    let geometry = fields.iter().find_map(|field| parse_xrandr_geometry(field));
+    let mut primary = false;
+    let mut geometry = None;
+    for field in fields {
+        primary |= field == "primary";
+        geometry = geometry.or_else(|| parse_xrandr_geometry(field));
+    }
     Some(json!({
-        "name": fields[0],
+        "name": name,
         "status": status,
         "connected": status == "connected",
-        "primary": fields.contains(&"primary"),
+        "primary": primary,
         "geometry": geometry.map(|(width, height, x, y)| json!({
             "width": width,
             "height": height,
@@ -1406,11 +1437,16 @@ fn audio_observation() -> Result<Value> {
         && sink.status == 0
         && volume_percent.is_some()
         && muted.is_some();
-    let stderr = [volume.stderr, mute.stderr, sink.stderr]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<String>>()
-        .join("\n");
+    let mut stderr = String::new();
+    for value in [volume.stderr, mute.stderr, sink.stderr] {
+        if value.is_empty() {
+            continue;
+        }
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&value);
+    }
     Ok(json!({
         "ok": ok,
         "backend": "pactl",
@@ -1445,20 +1481,18 @@ fn parse_pactl_mute(output: &str) -> Option<bool> {
 
 fn accessibility_tree(snapshot_id: &str, limit: usize) -> Result<Value> {
     match native_accessibility_tree(snapshot_id, limit) {
-        Ok(value) => return Ok(value),
+        Ok(value) => Ok(value),
         Err(native_error) if command_exists("busctl") => {
-            return accessibility_tree_fallback(limit, &native_error.to_string());
+            accessibility_tree_fallback(limit, &native_error.to_string())
         }
-        Err(error) => {
-            return Ok(json!({
-                "ok": false,
-                "backend": "unavailable",
-                "reason": "backend_unavailable",
-                "error": error.to_string(),
-                "items": [],
-                "count": 0,
-            }));
-        }
+        Err(error) => Ok(json!({
+            "ok": false,
+            "backend": "unavailable",
+            "reason": "backend_unavailable",
+            "error": error.to_string(),
+            "items": [],
+            "count": 0,
+        })),
     }
 }
 
@@ -1666,7 +1700,7 @@ fn dialog_inventory(snapshot_id: &str, limit: usize) -> Result<Value> {
             "count": 0,
         }));
     }
-    let dialogs = dialog_items(
+    let mut dialogs = dialog_items(
         tree.get("items")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
@@ -1674,12 +1708,13 @@ fn dialog_inventory(snapshot_id: &str, limit: usize) -> Result<Value> {
         limit,
     );
     let total = dialogs.len();
+    dialogs.truncate(limit);
     Ok(json!({
         "ok": true,
         "backend": tree.get("backend").cloned().unwrap_or(json!("atspi_dbus")),
         "snapshot_id": snapshot_id,
         "count": total.min(limit),
-        "items": dialogs.into_iter().take(limit).collect::<Vec<_>>(),
+        "items": dialogs,
         "truncated": total > limit,
         "tree_truncated": tree.get("truncated").cloned().unwrap_or(json!(false)),
     }))
@@ -1690,13 +1725,13 @@ fn dialog_items(items: &[Value], control_limit: usize) -> Vec<Value> {
         .iter()
         .filter_map(|item| {
             Some((
-                item.get("id")?.as_str()?.to_string(),
+                item.get("id")?.as_str()?,
                 item.get("parent_id")
                     .and_then(Value::as_str)
-                    .map(str::to_string),
+                    .filter(|parent_id| !parent_id.is_empty()),
             ))
         })
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect::<HashMap<_, _>>();
 
     items
         .iter()
@@ -1726,21 +1761,18 @@ fn dialog_items(items: &[Value], control_limit: usize) -> Vec<Value> {
 fn accessibility_descends_from(
     item: &Value,
     ancestor_id: &str,
-    parents: &std::collections::HashMap<String, Option<String>>,
+    parents: &HashMap<&str, Option<&str>>,
 ) -> bool {
-    let mut current = item
-        .get("parent_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let mut current = item.get("parent_id").and_then(Value::as_str);
     let mut visited = HashSet::new();
     while let Some(id) = current {
         if id == ancestor_id {
             return true;
         }
-        if !visited.insert(id.clone()) {
+        if !visited.insert(id) {
             return false;
         }
-        current = parents.get(&id).cloned().flatten();
+        current = parents.get(id).copied().flatten();
     }
     false
 }
@@ -2041,32 +2073,34 @@ fn pointer_action(action: &str, target: Option<&str>, value: Option<&str>) -> Re
         "mouse_click" => {
             let (x, y) = parse_pointer_coordinates(required_target(action, target)?)?;
             let button = pointer_button(value)?;
-            let argv = vec![
-                "xdotool".to_string(),
-                "mousemove".to_string(),
-                "--sync".to_string(),
-                x.to_string(),
-                y.to_string(),
-                "click".to_string(),
-                button.to_string(),
+            let x_arg = x.to_string();
+            let y_arg = y.to_string();
+            let button_arg = button.to_string();
+            let argv = [
+                "xdotool",
+                "mousemove",
+                "--sync",
+                x_arg.as_str(),
+                y_arg.as_str(),
+                "click",
+                button_arg.as_str(),
             ];
-            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            pointer_receipt(action, json!({ "x": x, "y": y, "button": button }), &refs)
+            pointer_receipt(action, json!({ "x": x, "y": y, "button": button }), &argv)
         }
         "scroll" => {
             let steps = parse_scroll_steps(value)?;
             let button = if steps < 0 { "5" } else { "4" };
             let repetitions = steps.unsigned_abs().min(25);
-            let mut argv = vec!["xdotool".to_string()];
+            let mut argv = Vec::with_capacity(1 + repetitions as usize * 2);
+            argv.push(String::from("xdotool"));
             for _ in 0..repetitions {
-                argv.push("click".to_string());
-                argv.push(button.to_string());
+                argv.push(String::from("click"));
+                argv.push(String::from(button));
             }
-            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
             pointer_receipt(
                 action,
                 json!({ "steps": steps, "button": button, "repetitions": repetitions }),
-                &refs,
+                &argv,
             )
         }
         _ => Ok(json!({
@@ -2079,8 +2113,12 @@ fn pointer_action(action: &str, target: Option<&str>, value: Option<&str>) -> Re
     }
 }
 
-fn pointer_receipt(action: &str, value: Value, argv: &[&str]) -> Result<Value> {
-    if argv.first().is_some_and(|command| !command_exists(command)) {
+fn pointer_receipt<T: AsRef<std::ffi::OsStr>>(
+    action: &str,
+    value: Value,
+    argv: &[T],
+) -> Result<Value> {
+    if !command_exists("xdotool") {
         return Ok(json!({
             "ok": false,
             "tool": "desktop_action",
@@ -2210,14 +2248,17 @@ fn keyboard_action(action: &str, value: Option<&str>) -> Result<Value> {
 }
 
 fn keyboard_receipt(action: &str, value: &str, backend: &str, argv: &[&str]) -> Result<Value> {
-    if argv.first().is_some_and(|command| !command_exists(command)) {
+    let Some((program, _)) = argv.split_first() else {
+        return Err(anyhow::anyhow!("Cannot run an empty keyboard command"));
+    };
+    if !command_exists(program) {
         return Ok(json!({
             "ok": false,
             "tool": "desktop_action",
             "action": action,
             "backend": backend,
             "reason": "dependency_unavailable",
-            "error": format!("Required keyboard command `{}` is not installed.", argv[0]),
+            "error": format!("Required keyboard command `{program}` is not installed."),
         }));
     }
     let before = active_window()?;
@@ -2243,7 +2284,7 @@ fn keyboard_receipt(action: &str, value: &str, backend: &str, argv: &[&str]) -> 
 fn keyboard_value_receipt(action: &str, value: &str) -> Value {
     if action == "type_text" {
         json!({
-            "byte_count": value.as_bytes().len(),
+            "byte_count": value.len(),
             "char_count": value.chars().count(),
             "content_returned": false,
         })
@@ -2321,7 +2362,7 @@ fn resolve_applications(query: &str, limit: usize) -> Result<Vec<Value>> {
             }
         }
     }
-    candidates.sort_by(|left, right| candidate_score(right).cmp(&candidate_score(left)));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate_score(candidate)));
     candidates.truncate(limit);
     Ok(candidates)
 }
@@ -2363,14 +2404,14 @@ fn resolve_windows(query: &str, limit: usize) -> Result<Vec<Value>> {
             }
         }
     }
-    candidates.sort_by(|left, right| candidate_score(right).cmp(&candidate_score(left)));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate_score(candidate)));
     candidates.truncate(limit);
     Ok(candidates)
 }
 
 fn match_score(query: &str, fields: &[&str]) -> i64 {
     let mut best = 0;
-    let query_tokens: Vec<&str> = query.split_whitespace().collect();
+    let query_token_count = query.split_whitespace().count().max(1);
     for field in fields {
         let normalized = normalize_match_text(field);
         if normalized.is_empty() {
@@ -2383,12 +2424,12 @@ fn match_score(query: &str, fields: &[&str]) -> i64 {
         } else if normalized.contains(query) {
             60
         } else {
-            let matched = query_tokens
-                .iter()
-                .filter(|token| normalized.contains(**token))
+            let matched = query
+                .split_whitespace()
+                .filter(|token| normalized.contains(token))
                 .count();
             if matched > 0 {
-                (matched as i64 * 40) / query_tokens.len().max(1) as i64
+                (matched as i64 * 40) / query_token_count as i64
             } else {
                 0
             }
@@ -2399,19 +2440,20 @@ fn match_score(query: &str, fields: &[&str]) -> i64 {
 }
 
 fn normalize_match_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
+    let mut normalized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
             }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .join(" ")
+            normalized.push(character.to_ascii_lowercase());
+            pending_space = false;
+        } else {
+            pending_space = !normalized.is_empty();
+        }
+    }
+    normalized
 }
 
 fn candidate_score(candidate: &Value) -> i64 {
@@ -2448,13 +2490,307 @@ fn clipboard_metadata() -> Result<Value> {
         "types": types,
         "text": {
             "available": readable,
-            "byte_count": if readable { Some(text.stdout.as_bytes().len()) } else { None },
+            "byte_count": if readable { Some(text.stdout.len()) } else { None },
             "char_count": if readable { Some(text.stdout.chars().count()) } else { None },
             "line_count": if readable { Some(text.stdout.lines().count()) } else { None },
             "utf8": readable,
             "preview_redacted": true,
             "stderr": if readable { None } else { Some(text.stderr) },
         },
+    }))
+}
+
+/// Open one stored attachment after an explicit click in the TUI.
+pub(crate) fn desktop_open_user_file(path: &str) -> Result<Value> {
+    let candidate = Path::new(path);
+    if !candidate.is_file() {
+        return Ok(json!({
+            "ok": false,
+            "reason": "attachment_unavailable",
+            "error": "The attached file is no longer available in local storage.",
+        }));
+    }
+
+    if is_wsl_runtime() && windows_host_powershell_available() {
+        let converted = run_desktop_capture(&["wslpath", "-w", path])?;
+        if converted.status != 0 || converted.stdout.is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "reason": "path_conversion_failed",
+                "error": converted.stderr,
+            }));
+        }
+        let output = ProcessCommand::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Process -FilePath $env:NYM_ATTACHMENT_PATH",
+            ])
+            .env("NYM_ATTACHMENT_PATH", &converted.stdout)
+            .stdin(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Ok(json!({
+                "ok": false,
+                "reason": "system_viewer_failed",
+                "error": String::from_utf8_lossy(&output.stderr).trim(),
+            }));
+        }
+        return Ok(json!({
+            "ok": true,
+            "backend": "windows_host",
+            "path": path,
+        }));
+    }
+    if command_exists("xdg-open") {
+        return launch_desktop_target("open_attachment", path, true);
+    }
+
+    Ok(json!({
+        "ok": false,
+        "reason": "opener_unavailable",
+        "error": "No desktop file opener is available. Install xdg-utils to open attachments.",
+    }))
+}
+
+/// Open the desktop's file chooser after an explicit click in the TUI.
+/// The returned path is never exposed to the model; it is immediately copied
+/// into Agent's attachment store by the caller.
+pub(crate) fn desktop_pick_file() -> Result<Value> {
+    let output = if command_exists("zenity") {
+        run_desktop_capture(&["zenity", "--file-selection", "--title=Add photos or files"])?
+    } else if command_exists("kdialog") {
+        run_desktop_capture(&[
+            "kdialog",
+            "--title",
+            "Add photos or files",
+            "--getopenfilename",
+        ])?
+    } else if is_wsl_runtime() && windows_host_powershell_available() {
+        let script = "Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.OpenFileDialog; $dialog.Title = 'Add photos or files'; $dialog.Filter = 'All files (*.*)|*.*|Images (*.png;*.jpg;*.jpeg;*.webp;*.gif)|*.png;*.jpg;*.jpeg;*.webp;*.gif'; $dialog.Multiselect = $false; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.FileName) }";
+        let selected = run_desktop_capture(&[
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-STA",
+            "-Command",
+            script,
+        ])?;
+        if selected.status != 0 {
+            return Ok(json!({
+                "ok": false,
+                "reason": "file_picker_failed",
+                "guidance": selected.stderr,
+            }));
+        }
+        if selected.stdout.trim().is_empty() {
+            return Ok(json!({"ok": false, "cancelled": true}));
+        }
+        let converted = run_desktop_capture(&["wslpath", "-u", selected.stdout.trim()])?;
+        if converted.status != 0 || converted.stdout.trim().is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "reason": "file_picker_path_conversion_failed",
+                "guidance": converted.stderr,
+            }));
+        }
+        return Ok(json!({
+            "ok": true,
+            "path": converted.stdout.trim(),
+            "backend": "windows_file_dialog",
+        }));
+    } else {
+        return Ok(json!({
+            "ok": false,
+            "reason": "file_picker_unavailable",
+            "guidance": "No native file picker is available. Install zenity or kdialog, or enter a path instead.",
+        }));
+    };
+    if output.status != 0 || output.stdout.trim().is_empty() {
+        return Ok(json!({"ok": false, "cancelled": true}));
+    }
+    Ok(json!({
+        "ok": true,
+        "path": output.stdout.trim(),
+        "backend": if command_exists("zenity") { "zenity" } else { "kdialog" },
+    }))
+}
+
+/// Return clipboard text only after an explicit user gesture in the terminal
+/// UI.  Agent tools deliberately use `clipboard_metadata` instead, so an LLM
+/// cannot silently exfiltrate clipboard contents.
+pub(crate) fn desktop_clipboard_read_text() -> Result<Value> {
+    let backend = clipboard_backend();
+    if backend == "unavailable" {
+        return Ok(json!({
+            "ok": false,
+            "reason": "backend_unavailable",
+            "guidance": "Clipboard paste requires wl-clipboard, xclip, xsel, or reachable Windows PowerShell under WSL.",
+        }));
+    }
+    let output = clipboard_text(backend)?;
+    if output.status != 0 {
+        return Ok(json!({
+            "ok": false,
+            "backend": backend,
+            "error": output.stderr,
+        }));
+    }
+    let max_bytes = std::env::var("AGENT_CLIPBOARD_MAX_TEXT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1_048_576);
+    if output.stdout.len() > max_bytes {
+        return Ok(json!({
+            "ok": false,
+            "backend": backend,
+            "reason": "clipboard_text_too_large",
+            "guidance": format!("Clipboard text exceeds the configured {max_bytes}-byte limit."),
+        }));
+    }
+    Ok(json!({
+        "ok": true,
+        "backend": backend,
+        "text": output.stdout,
+    }))
+}
+
+/// Materialize an image already present in the user's clipboard as a temporary
+/// file.  Its bytes are streamed directly from the clipboard program to disk,
+/// so the TUI does not retain a second full image allocation in memory.
+pub(crate) fn desktop_clipboard_image_to_file() -> Result<Value> {
+    let backend = clipboard_backend();
+    if backend == "windows_host_powershell" {
+        return windows_host_clipboard_image_to_file();
+    }
+    if !matches!(backend, "wl-clipboard" | "xclip") {
+        return Ok(json!({
+            "ok": false,
+            "reason": "image_clipboard_backend_unavailable",
+            "guidance": "Image paste requires wl-clipboard, xclip, or reachable Windows PowerShell under WSL. Use the paperclip to attach a saved image.",
+        }));
+    }
+    let types = clipboard_types(backend)?;
+    let mime = types
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|item| matches!(*item, "image/png" | "image/jpeg" | "image/webp"));
+    let Some(mime) = mime else {
+        return Ok(json!({
+            "ok": false,
+            "reason": "clipboard_has_no_supported_image",
+            "guidance": "The clipboard does not contain a PNG, JPEG, or WebP image. Use the paperclip to attach a file.",
+        }));
+    };
+    let extension = match mime {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    let directory = std::env::temp_dir().join("agent-clipboard");
+    fs::create_dir_all(&directory)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = directory.join(format!("clipboard-{timestamp}.{extension}"));
+    let file = fs::File::create(&path)?;
+    let mut command = ProcessCommand::new(if backend == "wl-clipboard" {
+        "wl-paste"
+    } else {
+        "xclip"
+    });
+    if backend == "wl-clipboard" {
+        command.args(["--type", mime]);
+    } else {
+        command.args(["-selection", "clipboard", "-t", mime, "-o"]);
+    }
+    let status = command
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::null())
+        .status()?;
+    let size_bytes = fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let max_bytes = std::env::var("AGENT_MAX_ATTACHMENT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(25 * 1024 * 1024);
+    if !status.success() || size_bytes == 0 || size_bytes > max_bytes {
+        let _ = fs::remove_file(&path);
+        return Ok(json!({
+            "ok": false,
+            "reason": if size_bytes > max_bytes { "clipboard_image_too_large" } else { "clipboard_image_read_failed" },
+            "guidance": format!("Clipboard image could not be imported within the configured {max_bytes}-byte attachment limit."),
+        }));
+    }
+    Ok(json!({
+        "ok": true,
+        "path": path,
+        "mime": mime,
+        "size_bytes": size_bytes,
+    }))
+}
+
+fn windows_host_clipboard_image_to_file() -> Result<Value> {
+    let directory = std::env::temp_dir().join("agent-clipboard");
+    fs::create_dir_all(&directory)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = directory.join(format!("clipboard-{timestamp}.png"));
+    let windows_path = run_desktop_capture(&["wslpath", "-w", path.to_string_lossy().as_ref()])?;
+    if windows_path.status != 0 || windows_path.stdout.trim().is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "reason": "clipboard_image_path_conversion_failed",
+            "guidance": "Could not prepare a temporary attachment path for the Windows clipboard image.",
+        }));
+    }
+    let escaped_path = windows_path.stdout.trim().replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
+         $image = Get-Clipboard -Format Image; if ($null -eq $image) {{ exit 2 }}; \
+         try {{ $image.Save('{escaped_path}', [System.Drawing.Imaging.ImageFormat]::Png) }} \
+         finally {{ $image.Dispose() }}"
+    );
+    let output = run_desktop_capture(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-STA",
+        "-Command",
+        &script,
+    ])?;
+    let size_bytes = fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let max_bytes = std::env::var("AGENT_MAX_ATTACHMENT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(25 * 1024 * 1024);
+    if output.status != 0 || size_bytes == 0 || size_bytes > max_bytes {
+        let _ = fs::remove_file(&path);
+        return Ok(json!({
+            "ok": false,
+            "reason": if size_bytes > max_bytes { "clipboard_image_too_large" } else { "clipboard_image_read_failed" },
+            "guidance": "The Windows clipboard does not contain a readable image, or it exceeds the attachment limit.",
+        }));
+    }
+    Ok(json!({
+        "ok": true,
+        "path": path,
+        "mime": "image/png",
+        "size_bytes": size_bytes,
+        "backend": "windows_host_powershell",
     }))
 }
 
@@ -2474,7 +2810,7 @@ fn clipboard_write_action(action: &str, value: Option<&str>) -> Result<Value> {
     let output = clipboard_write_backend(backend, text)?;
     thread::sleep(Duration::from_millis(75));
     let after = clipboard_metadata()?;
-    let expected_bytes = text.as_bytes().len() as u64;
+    let expected_bytes = text.len() as u64;
     let actual_bytes = after
         .get("text")
         .and_then(|item| item.get("byte_count"))
@@ -2618,17 +2954,18 @@ pub(crate) fn desktop_clipboard_files(paths: &[PathBuf], operation: &str) -> Res
         }));
     }
 
-    let uris = canonical
-        .iter()
-        .map(|path| file_uri(path))
-        .collect::<Result<Vec<_>>>()?;
+    let separator = if operation == "cut" { "\n" } else { "\r\n" };
+    let mut uris = String::new();
+    for path in &canonical {
+        if !uris.is_empty() {
+            uris.push_str(separator);
+        }
+        uris.push_str(&file_uri(path)?);
+    }
     let (mime, payload) = if operation == "cut" {
-        (
-            "x-special/gnome-copied-files",
-            format!("cut\n{}\n", uris.join("\n")),
-        )
+        ("x-special/gnome-copied-files", format!("cut\n{uris}\n"))
     } else {
-        ("text/uri-list", format!("{}\r\n", uris.join("\r\n")))
+        ("text/uri-list", format!("{uris}\r\n"))
     };
     let output = match backend {
         "wl-clipboard" => run_desktop_capture_with_stdin(&["wl-copy", "--type", mime], &payload)?,
@@ -2716,11 +3053,11 @@ fn run_desktop_capture(argv: &[&str]) -> Result<DesktopCommandOutput> {
 }
 
 fn run_desktop_capture_with_stdin(argv: &[&str], input: &str) -> Result<DesktopCommandOutput> {
-    if argv.is_empty() {
+    let Some((program, arguments)) = argv.split_first() else {
         return Err(anyhow::anyhow!("Cannot run an empty clipboard command"));
-    }
-    let mut child = ProcessCommand::new(argv[0])
-        .args(&argv[1..])
+    };
+    let mut child = ProcessCommand::new(program)
+        .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2853,14 +3190,17 @@ fn window_control_receipt<F>(action: &str, target: &str, argv: &[&str], verify: 
 where
     F: Fn(&Value, &Value) -> bool,
 {
-    if argv.first().is_some_and(|command| !command_exists(command)) {
+    let Some((program, _)) = argv.split_first() else {
+        return Err(anyhow::anyhow!("Cannot run an empty window command"));
+    };
+    if !command_exists(program) {
         return Ok(json!({
             "ok": false,
             "tool": "desktop_action",
             "action": action,
             "target": target,
             "reason": "dependency_unavailable",
-            "error": format!("Required window command `{}` is not installed.", argv[0]),
+            "error": format!("Required window command `{program}` is not installed."),
         }));
     }
     let before = window_state(target)?;
@@ -2873,7 +3213,7 @@ where
         "tool": "desktop_action",
         "action": action,
         "target": target,
-        "backend": argv[0],
+        "backend": program,
         "exit_code": output.status,
         "before": before,
         "after": after,
@@ -3254,20 +3594,28 @@ fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        let high = (byte >> 4) as usize;
+        let low = (byte & 0x0f) as usize;
+        // SAFETY: shifting or masking one byte yields a value in 0..=15,
+        // exactly the valid index range of HEX.
+        unsafe {
+            encoded.push(*HEX.get_unchecked(high) as char);
+            encoded.push(*HEX.get_unchecked(low) as char);
+        }
     }
     encoded
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(anyhow::anyhow!("invalid hex target"));
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
     for chunk in value.as_bytes().chunks_exact(2) {
-        let high = hex_value(chunk[0]).ok_or_else(|| anyhow::anyhow!("invalid hex target"))?;
-        let low = hex_value(chunk[1]).ok_or_else(|| anyhow::anyhow!("invalid hex target"))?;
+        // SAFETY: chunks_exact(2) yields slices whose length is exactly two.
+        let (high_byte, low_byte) = unsafe { (*chunk.get_unchecked(0), *chunk.get_unchecked(1)) };
+        let high = hex_value(high_byte).ok_or_else(|| anyhow::anyhow!("invalid hex target"))?;
+        let low = hex_value(low_byte).ok_or_else(|| anyhow::anyhow!("invalid hex target"))?;
         bytes.push((high << 4) | low);
     }
     Ok(bytes)
@@ -3335,7 +3683,7 @@ fn collect_desktop_entries(
 fn parse_desktop_entry(root: &Path, path: &Path) -> Result<Option<Value>> {
     let text = fs::read_to_string(path)?;
     let mut in_desktop_entry = false;
-    let mut entry_type = None;
+    let mut is_application = false;
     let mut name = None;
     let mut exec = None;
     let mut no_display = false;
@@ -3359,7 +3707,7 @@ fn parse_desktop_entry(root: &Path, path: &Path) -> Result<Option<Value>> {
             continue;
         };
         match key {
-            "Type" => entry_type = Some(value.to_string()),
+            "Type" => is_application = value == "Application",
             "Name" => name = Some(value.to_string()),
             "Exec" => exec = Some(value.to_string()),
             "NoDisplay" => no_display = value.eq_ignore_ascii_case("true"),
@@ -3376,7 +3724,7 @@ fn parse_desktop_entry(root: &Path, path: &Path) -> Result<Option<Value>> {
         }
     }
 
-    if entry_type.as_deref() != Some("Application") || name.is_none() || hidden || no_display {
+    if !is_application || name.is_none() || hidden || no_display {
         return Ok(None);
     }
     let relative = path.strip_prefix(root).unwrap_or(path);
@@ -3415,16 +3763,28 @@ fn linux_windows(limit: usize) -> Result<Value> {
     let output = run_capture_dynamic(&["wmctrl", "-lx"])?;
     let mut items = Vec::new();
     for line in output.stdout.lines().take(limit) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 5 {
+        let mut fields = line.split_whitespace();
+        let Some(id) = fields.next() else {
+            continue;
+        };
+        let Some(desktop) = fields.next() else {
+            continue;
+        };
+        let Some(pid) = fields.next() else {
+            continue;
+        };
+        let Some(class) = fields.next() else {
+            continue;
+        };
+        if fields.next().is_none() {
             continue;
         }
         let title_start = nth_field_start(line, 4).unwrap_or(line.len());
         items.push(json!({
-            "id": fields[0],
-            "desktop": fields[1],
-            "pid": fields[2].parse::<u32>().ok(),
-            "class": fields[3],
+            "id": id,
+            "desktop": desktop,
+            "pid": pid.parse::<u32>().ok(),
+            "class": class,
             "title": line[title_start..].trim(),
             "backend": "wmctrl",
         }));
@@ -3731,11 +4091,12 @@ pub(crate) fn valid_path_token(value: &str) -> bool {
 }
 
 pub(crate) fn valid_bluetooth_address(value: &str) -> bool {
-    let parts: Vec<&str> = value.split(':').collect();
-    parts.len() == 6
-        && parts
-            .iter()
-            .all(|part| part.len() == 2 && part.chars().all(|ch| ch.is_ascii_hexdigit()))
+    let mut count = 0;
+    let valid = value.split(':').all(|part| {
+        count += 1;
+        part.len() == 2 && part.chars().all(|character| character.is_ascii_hexdigit())
+    });
+    valid && count == 6
 }
 
 fn audio_state(kind: &str) -> Value {
@@ -3798,11 +4159,18 @@ fn process_state(pid: i32) -> Value {
 mod tests {
     use super::{
         accessibility_target_id, accessibility_tree_item, bounded_accessible_text,
-        desktop_capabilities, desktop_observe, dialog_items, dialog_kind, parse_busctl_string,
-        parse_pactl_mute, parse_pactl_volume_percent, parse_xrandr_displays,
+        desktop_capabilities, desktop_observe, dialog_items, dialog_kind, hex_decode, hex_encode,
+        parse_busctl_string, parse_pactl_mute, parse_pactl_volume_percent, parse_xrandr_displays,
         windows_host_volume_script,
     };
     use serde_json::{json, Value};
+
+    #[test]
+    fn hex_codec_roundtrips_every_byte_value() {
+        let bytes = (u8::MIN..=u8::MAX).collect::<Vec<_>>();
+
+        assert_eq!(hex_decode(&hex_encode(&bytes)).unwrap(), bytes);
+    }
 
     #[test]
     fn desktop_capabilities_reports_runtime_actions() {
@@ -4061,6 +4429,18 @@ mod tests {
             .expect_err("missing clipboard value should fail");
 
         assert!(error.to_string().contains("requires --value"));
+    }
+
+    #[test]
+    fn wsl_host_clipboard_wins_over_installed_linux_backends() {
+        assert_eq!(
+            super::select_clipboard_backend(true, true, true, true),
+            "windows_host_powershell"
+        );
+        assert_eq!(
+            super::select_clipboard_backend(false, true, true, true),
+            "wl-clipboard"
+        );
     }
 
     #[cfg(unix)]
