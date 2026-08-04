@@ -22,6 +22,7 @@ from agent.planner import (
     _handle_subagent_event,
     _summarize_approval_request,
     _prepare_tool_output,
+    _sanitize_tool_observation_for_model,
     _preflight_tool_call,
     _session_context_text,
     _looks_like_unexecuted_action,
@@ -85,6 +86,30 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertNotIn("does not need discovery", LOCAL_AGENT_PROMPT)
         self.assertIn("When no tool is needed, answer directly", prompt)
         self.assertIn("A partial inspection", prompt)
+
+    def test_desktop_window_titles_and_paths_stay_out_of_model_output(self) -> None:
+        observation = {
+            "windows": {
+                "items": [{
+                    "id": "0x1",
+                    "process": "Spark",
+                    "title": "Private conversation",
+                    "path": "C:\\Users\\nymisha\\Spark.exe",
+                }],
+            },
+        }
+
+        sanitized = _sanitize_tool_observation_for_model("desktop_observe", observation)
+
+        self.assertEqual(
+            sanitized["windows"]["items"][0]["title"],  # type: ignore[index]
+            "<redacted window title>",
+        )
+        self.assertEqual(
+            sanitized["windows"]["items"][0]["path"],  # type: ignore[index]
+            "<redacted desktop path>",
+        )
+        self.assertEqual(sanitized["windows"]["items"][0]["process"], "Spark")  # type: ignore[index]
 
     def test_gpt_prompt_uses_model_specific_outcome_guidance(self) -> None:
         prompt = load_system_prompt(provider="openai", model="gpt-5.5")
@@ -1277,7 +1302,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(session.desktop_targets[0]["target"], "0x3a00007")
         targets = {item["kind"]: item for item in session.desktop_targets}
         self.assertEqual(targets["process"]["target"], "4242")
-        self.assertEqual(targets["process"]["title"], "Editor")
+        self.assertNotIn("title", targets["process"])
 
         request = _approval_request_from_observation(
             ModelToolCall(
@@ -1298,7 +1323,7 @@ class PlannerToolUseTests(unittest.TestCase):
         )
         self.assertIsNotNone(request)
         _attach_approval_display_path(session, request)
-        self.assertEqual(request["display_path"], "desktop terminate_process Editor")
+        self.assertEqual(request["display_path"], "desktop terminate_process Code")
 
     def test_session_remembers_snapshot_bound_ui_elements(self) -> None:
         session = AgentSession()
@@ -2938,7 +2963,6 @@ class PlannerToolUseTests(unittest.TestCase):
                     "kind": "window",
                     "id": "0x3a00007",
                     "target": "0x3a00007",
-                    "title": "Editor",
                     "action": "focus_window",
                     "source": "desktop_observe",
                 }

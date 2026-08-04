@@ -398,7 +398,10 @@ def run_agent(
                 observation,
                 workspace_root=workspace_root_path,
             )
-            sanitized_observation = policy.sanitize_observation(observation)
+            sanitized_observation = _sanitize_tool_observation_for_model(
+                call.name,
+                policy.sanitize_observation(observation),
+            )
             if call.name in available_tool_names:
                 _record_tool_loop_outcome(
                     tool_loop_history,
@@ -793,7 +796,7 @@ def _desktop_target_dicts(value: Any) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         record: dict[str, str] = {}
-        for key in ("kind", "id", "target", "title", "name", "action", "source", "snapshot_id"):
+        for key in ("kind", "id", "target", "name", "action", "source", "snapshot_id"):
             text = _optional_str(item.get(key))
             if text:
                 record[key] = text
@@ -1852,9 +1855,6 @@ def _apply_desktop_observe(session: AgentSession, observation: dict[str, Any]) -
                 "action": "focus_window",
                 "source": "desktop_observe",
             }
-            title = _optional_str(item.get("title"))
-            if title:
-                record["title"] = title
             process = _optional_str(item.get("process"))
             if process:
                 record["name"] = process
@@ -1871,8 +1871,6 @@ def _apply_desktop_observe(session: AgentSession, observation: dict[str, Any]) -
                     "action": "terminate_process",
                     "source": "desktop_observe",
                 }
-                if title:
-                    process_record["title"] = title
                 if process:
                     process_record["name"] = process
                 if snapshot_id:
@@ -1997,10 +1995,9 @@ def _apply_desktop_resolve(session: AgentSession, observation: dict[str, Any]) -
             "action": _optional_str(item.get("action")) or ("focus_window" if kind == "window" else "launch_application"),
             "source": "desktop_resolve",
         }
-        for source_key, target_key in (("title", "title"), ("name", "name")):
-            text = _optional_str(item.get(source_key))
-            if text:
-                record[target_key] = text
+        name = _optional_str(item.get("name"))
+        if name:
+            record["name"] = name
         if kind == "window":
             process = _optional_str(item.get("process"))
             if process:
@@ -2149,6 +2146,29 @@ def _normalize_history(history: list[dict[str, Any]] | None) -> list[dict[str, A
             message["attachments"] = item["attachments"]
         result.append(message)
     return result
+
+
+def _sanitize_tool_observation_for_model(tool: str, observation: Any) -> Any:
+    """Keep private desktop window metadata out of model-facing tool results."""
+    if tool not in {"desktop_observe", "desktop_resolve"}:
+        return observation
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "title":
+                cleaned[key] = "<redacted window title>"
+            elif key == "path":
+                cleaned[key] = "<redacted desktop path>"
+            else:
+                cleaned[key] = scrub(item)
+        return cleaned
+
+    return scrub(observation)
 
 
 def _prepare_tool_output(observation: Any, *, max_bytes: int = 12_000) -> str:
