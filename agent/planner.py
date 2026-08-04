@@ -2149,26 +2149,70 @@ def _normalize_history(history: list[dict[str, Any]] | None) -> list[dict[str, A
 
 
 def _sanitize_tool_observation_for_model(tool: str, observation: Any) -> Any:
-    """Keep private desktop window metadata out of model-facing tool results."""
-    if tool not in {"desktop_observe", "desktop_resolve"}:
+    """Apply strict, purpose-limited outbound context to desktop tool results."""
+    if not isinstance(observation, dict):
         return observation
+    if tool == "desktop_observe":
+        return _strict_desktop_observation_summary(observation)
+    if tool == "desktop_resolve":
+        return _strict_desktop_resolution_summary(observation)
+    return observation
 
-    def scrub(value: Any) -> Any:
-        if isinstance(value, list):
-            return [scrub(item) for item in value]
+
+def _strict_desktop_observation_summary(observation: dict[str, Any]) -> dict[str, Any]:
+    """Expose only identifiers needed for desktop actions to a hosted model."""
+    result = _desktop_safe_fields(
+        observation,
+        {"ok", "tool", "scope", "backend", "runtime", "reason", "snapshot_id", "observed_at_unix_ms"},
+    )
+    for section in ("applications", "windows", "active_window"):
+        value = observation.get(section)
         if not isinstance(value, dict):
-            return value
-        cleaned: dict[str, Any] = {}
-        for key, item in value.items():
-            if key == "title":
-                cleaned[key] = "<redacted window title>"
-            elif key == "path":
-                cleaned[key] = "<redacted desktop path>"
-            else:
-                cleaned[key] = scrub(item)
-        return cleaned
+            continue
+        items = value.get("items")
+        if not isinstance(items, list):
+            item = value.get("window")
+            items = [item] if isinstance(item, dict) else []
+        item_fields = {"id", "pid", "process", "backend"}
+        if section == "applications":
+            item_fields.add("name")
+        safe_items = [
+            _desktop_safe_fields(item, item_fields)
+            for item in items
+            if isinstance(item, dict)
+        ]
+        result[section] = {
+            **_desktop_safe_fields(value, {"ok", "backend", "reason", "count"}),
+            "count": len(safe_items),
+            "items": safe_items,
+        }
+    for section in ("ui_tree", "dialogs", "clipboard", "audio", "displays", "downloads"):
+        value = observation.get(section)
+        if isinstance(value, dict):
+            result[section] = _desktop_safe_fields(value, {"ok", "backend", "reason", "count", "available"})
+    return result
 
-    return scrub(observation)
+
+def _strict_desktop_resolution_summary(observation: dict[str, Any]) -> dict[str, Any]:
+    result = _desktop_safe_fields(
+        observation,
+        {"ok", "tool", "query", "kind", "ambiguous", "backend", "reason"},
+    )
+    candidates = observation.get("candidates")
+    if isinstance(candidates, list):
+        result["candidates"] = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            fields = {"kind", "id", "target", "process", "action", "backend", "score"}
+            if item.get("kind") == "application":
+                fields.add("name")
+            result["candidates"].append(_desktop_safe_fields(item, fields))
+    return result
+
+
+def _desktop_safe_fields(value: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
+    return {key: value[key] for key in allowed if key in value}
 
 
 def _prepare_tool_output(observation: Any, *, max_bytes: int = 12_000) -> str:

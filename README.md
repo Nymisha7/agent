@@ -72,6 +72,15 @@ for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`, `/status`, `/setu
 
 ## Desktop and system capabilities
 
+### Strict hosted-model data boundaries
+
+When using a hosted model, Nym keeps desktop observations purpose-limited: it shares
+only app/process identifiers needed to act. Window titles, chat labels, application
+paths, UI text, clipboard contents, device labels, and desktop downloads stay local.
+Your typed prompt, messages in the active conversation, explicitly attached files, and
+the file/tool content needed to complete a request may still be sent to the configured
+model provider. Use a local model when no data may leave the PC.
+
 Ask natural questions such as `What devices are connected here?`.
 Agent reports live USB, Bluetooth, storage, network, input, audio, display, camera,
 printer, and power records visible to its runtime. Every category has a separate

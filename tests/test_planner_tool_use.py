@@ -87,7 +87,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("When no tool is needed, answer directly", prompt)
         self.assertIn("A partial inspection", prompt)
 
-    def test_desktop_window_titles_and_paths_stay_out_of_model_output(self) -> None:
+    def test_desktop_observation_shares_only_safe_action_metadata(self) -> None:
         observation = {
             "windows": {
                 "items": [{
@@ -101,15 +101,26 @@ class PlannerToolUseTests(unittest.TestCase):
 
         sanitized = _sanitize_tool_observation_for_model("desktop_observe", observation)
 
-        self.assertEqual(
-            sanitized["windows"]["items"][0]["title"],  # type: ignore[index]
-            "<redacted window title>",
-        )
-        self.assertEqual(
-            sanitized["windows"]["items"][0]["path"],  # type: ignore[index]
-            "<redacted desktop path>",
-        )
+        self.assertNotIn("title", sanitized["windows"]["items"][0])  # type: ignore[index]
+        self.assertNotIn("path", sanitized["windows"]["items"][0])  # type: ignore[index]
         self.assertEqual(sanitized["windows"]["items"][0]["process"], "Spark")  # type: ignore[index]
+
+    def test_desktop_resolution_hides_window_titles_but_keeps_app_names(self) -> None:
+        observation = {
+            "ok": True,
+            "tool": "desktop_resolve",
+            "candidates": [
+                {"kind": "window", "id": "0x1", "title": "Private chat", "process": "Spark"},
+                {"kind": "application", "id": "spark.desktop", "name": "Spark", "path": "/opt/spark"},
+            ],
+        }
+
+        sanitized = _sanitize_tool_observation_for_model("desktop_resolve", observation)
+
+        self.assertNotIn("title", sanitized["candidates"][0])  # type: ignore[index]
+        self.assertEqual(sanitized["candidates"][0]["process"], "Spark")  # type: ignore[index]
+        self.assertEqual(sanitized["candidates"][1]["name"], "Spark")  # type: ignore[index]
+        self.assertNotIn("path", sanitized["candidates"][1])  # type: ignore[index]
 
     def test_gpt_prompt_uses_model_specific_outcome_guidance(self) -> None:
         prompt = load_system_prompt(provider="openai", model="gpt-5.5")
