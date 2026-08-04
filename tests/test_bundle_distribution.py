@@ -70,8 +70,11 @@ class BundleDistributionTests(unittest.TestCase):
         self.assertIn("pipx", installer)
         self.assertIn("--venv", installer)
         self.assertIn("rustup", installer)
+        self.assertIn("NYM_PREBUILT_WHEEL", installer)
+        self.assertIn("prebuilt_wheel", installer)
 
     def test_wheel_is_marked_platform_specific(self) -> None:
         setup_py = Path("setup.py").read_text(encoding="utf-8")
 
         self.assertIn("self.root_is_pure = False", setup_py)
+        self.assertIn('return "py3", "none", platform', setup_py)

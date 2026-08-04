@@ -62,6 +62,12 @@ if _bdist_wheel is not None:
             super().finalize_options()
             self.root_is_pure = False
 
+        def get_tag(self) -> tuple[str, str, str]:
+            # The package contains no CPython extension. Its bundled Rust binary is
+            # Linux-platform-specific, but works with every supported Python 3.
+            _python, _abi, platform = super().get_tag()
+            return "py3", "none", platform
+
     cmdclass["bdist_wheel"] = bdist_wheel
 
 

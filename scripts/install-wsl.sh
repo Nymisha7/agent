@@ -21,6 +21,7 @@ Environment:
   NYM_REPO_URL       Default repository URL.
   NYM_INSTALL_ROOT   Clone destination. Default: ~/.local/share/nym
   NYM_INSTALL_MODE   pipx or venv. Default: pipx
+  NYM_PREBUILT_WHEEL Set to 0 to compile the Rust backend from source.
 EOF
 }
 
@@ -94,6 +95,16 @@ ensure_rust() {
   export PATH="$HOME/.cargo/bin:$PATH"
 }
 
+prebuilt_wheel() {
+  if [ "${NYM_PREBUILT_WHEEL:-1}" = "0" ] || [ "$(uname -m)" != "x86_64" ]; then
+    return 1
+  fi
+  local wheel
+  wheel=$(find packages -maxdepth 1 -type f -name 'agent-*-py3-none-linux_x86_64.whl' -print -quit 2>/dev/null || true)
+  [ -n "$wheel" ] || return 1
+  printf '%s\n' "$wheel"
+}
+
 checkout_repo() {
   if [ -n "$SOURCE_PATH" ]; then
     cd "$SOURCE_PATH"
@@ -113,22 +124,35 @@ install_with_pipx() {
     python3 -m pip install --user --upgrade pipx
     python3 -m pipx ensurepath || true
   fi
-  python3 -m pipx install --force .
+  local package_source="."
+  if wheel=$(prebuilt_wheel); then
+    package_source="$wheel"
+    echo "Installing bundled WSL wheel; Rust build is not needed."
+  else
+    ensure_rust
+  fi
+  python3 -m pipx install --force "$package_source"
   echo "Installed. If 'nym' is not on PATH yet, restart the shell or run:"
   echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
 }
 
 install_with_venv() {
+  local package_source="."
+  if wheel=$(prebuilt_wheel); then
+    package_source="$wheel"
+    echo "Installing bundled WSL wheel; Rust build is not needed."
+  else
+    ensure_rust
+  fi
   python3 -m venv .venv
   .venv/bin/python -m pip install --upgrade pip
-  .venv/bin/python -m pip install .
+  .venv/bin/python -m pip install "$package_source"
   mkdir -p "$HOME/.local/bin"
   ln -sfn "$(pwd)/.venv/bin/nym" "$HOME/.local/bin/nym"
   echo "Installed nym at $HOME/.local/bin/nym"
 }
 
 install_apt_deps
-ensure_rust
 checkout_repo
 
 case "$INSTALL_MODE" in

@@ -15,6 +15,10 @@ curl -fsSL https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install
 nym --tui
 ```
 
+On x86_64 WSL, the installer uses the bundled Linux wheel and does not install Rust or
+Cargo. Expect roughly 100–200 MB in addition to any already-installed Python and Git.
+Set `NYM_PREBUILT_WHEEL=0` only when intentionally building from source.
+
 If installing from a local checkout instead of GitHub:
 
 ```bash
