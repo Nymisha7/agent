@@ -84,10 +84,11 @@ their native class and status instead of being filtered out.
 
 Agent also exposes typed desktop actions for application launch, opening paths and web
 pages, audio and brightness changes, Bluetooth/network state, storage eject, and
-process termination. These operations always require approval for the exact target and
-value. An approval is consumed after one attempted action. Results include before/after
-state and a verification status; an unverified launch or unchanged state is never
-reported as confirmed. Agent does not expose arbitrary shell execution as a desktop tool.
+process termination. Launching an application and closing an observed window run
+immediately; all other desktop changes require approval for the exact target and value.
+An approval is consumed after one attempted action. Results include before/after state
+and a verification status; an unverified launch or unchanged state is never reported as
+confirmed. Agent does not expose arbitrary shell execution as a desktop tool.
 
 Intent selection belongs to the model and the full conversation, not English keyword
 routers. Runtime code validates structural facts: exact tool schemas, workspace

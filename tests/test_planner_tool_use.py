@@ -672,10 +672,10 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(result["reason"], "desktop_action_requires_approval")
         self.assertEqual(result["requested_path"], "desktop set_volume 0")
 
-    def test_target_only_desktop_action_ignores_stray_value_in_approval_key(self) -> None:
+    def test_launch_application_runs_without_approval(self) -> None:
         class FakeRust:
-            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
-                raise AssertionError("desktop action must not run before approval")
+            def desktop_action(self, **kwargs: Any) -> dict[str, object]:
+                return {"ok": True, "verified": True, **kwargs}
 
         ctx = ToolContext(
             rust=FakeRust(),  # type: ignore[arg-type]
@@ -692,8 +692,8 @@ class PlannerToolUseTests(unittest.TestCase):
             ctx,
         )
 
-        self.assertEqual(result["reason"], "desktop_action_requires_approval")
-        self.assertEqual(result["requested_path"], "desktop launch_application windows-app:abcdef")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["target"], "windows-app:abcdef")
 
     def test_window_action_requires_target_before_approval(self) -> None:
         class FakeRust:

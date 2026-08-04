@@ -521,7 +521,7 @@ def test_local_agent_routes_to_compact_tools_with_top_level_descriptions() -> No
     assert all(tool.get("description") for tool in llm.requests[1]["tools"])
 
 
-def test_desktop_open_intent_is_selected_by_model_and_requires_approval() -> None:
+def test_desktop_open_intent_runs_without_approval() -> None:
     class SemanticLLM:
         mode = "local"
 
@@ -540,7 +540,7 @@ def test_desktop_open_intent_is_selected_by_model_and_requires_approval() -> Non
                     }],
                     output_text="",
                 )
-            return SimpleNamespace(output=[], output_text="Approval requested.")
+            return SimpleNamespace(output=[], output_text="Spark opened.")
 
     class FakeRust:
         def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, Any]:
@@ -558,8 +558,8 @@ def test_desktop_open_intent_is_selected_by_model_and_requires_approval() -> Non
                 }],
             }
 
-        def desktop_action(self, **_kwargs: Any) -> dict[str, Any]:
-            raise AssertionError("desktop action must wait for approval")
+        def desktop_action(self, **kwargs: Any) -> dict[str, Any]:
+            return {"ok": True, "verified": True, **kwargs}
 
     session = AgentSession()
     llm = SemanticLLM()
@@ -571,13 +571,9 @@ def test_desktop_open_intent_is_selected_by_model_and_requires_approval() -> Non
         session=session,
     )
 
-    assert answer == "Approval requested."
+    assert answer == "Spark opened."
     assert llm.calls == 2
-    assert session.pending_approvals
-    request = session.pending_approvals[0]
-    assert request["tool"] == "desktop_action"
-    assert request["args"]["action"] == "launch_application"
-    assert request["args"]["target"] == "spark.desktop"
+    assert not session.pending_approvals
 
 
 def test_file_open_request_does_not_use_desktop_fast_path() -> None:

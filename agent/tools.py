@@ -108,6 +108,9 @@ DESKTOP_VALUE_REQUIRED_ACTIONS = frozenset({
     "set_volume", "set_brightness", "clipboard_write", "send_key", "type_text",
     "scroll", "invoke_element", "set_field_text",
 })
+DESKTOP_ACTIONS_WITHOUT_APPROVAL = frozenset({
+    "launch_application", "close_window",
+})
 
 TEXT_SUFFIXES = {
     ".cfg",
@@ -838,7 +841,8 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
             schema=_function_schema(
                 name="desktop_action",
                 description=(
-                    "Perform one narrow desktop or device action after explicit user approval. "
+                    "Perform one narrow desktop or device action. Launching an application and closing "
+                    "an observed window run immediately; other actions require explicit user approval. "
                     "Never use this for read-only questions; use connected_devices, system_info, "
                     "or process_list instead. Results include before/after state and verification."
                 ),
@@ -2120,21 +2124,22 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             raise ValueError("set_mute value must be true, false, or toggle.")
         value = value.casefold()
 
-    approval_key = _desktop_action_approval_key(action, target, value)
-    if approval_key not in ctx.approved_system_commands:
-        return {
-            "ok": False,
-            "tool": "desktop_action",
-            "blocked": True,
-            "recoverable": True,
-            "reason": "desktop_action_requires_approval",
-            "operation": "desktop",
-            "requested_path": approval_key,
-            "guidance": (
-                "This action can change desktop or host state. Ask the user to approve this "
-                "exact action before retrying."
-            ),
-        }
+    if action not in DESKTOP_ACTIONS_WITHOUT_APPROVAL:
+        approval_key = _desktop_action_approval_key(action, target, value)
+        if approval_key not in ctx.approved_system_commands:
+            return {
+                "ok": False,
+                "tool": "desktop_action",
+                "blocked": True,
+                "recoverable": True,
+                "reason": "desktop_action_requires_approval",
+                "operation": "desktop",
+                "requested_path": approval_key,
+                "guidance": (
+                    "This desktop action needs approval. Ask the user to approve this exact "
+                    "action before retrying."
+                ),
+            }
     backend_bus = _optional_desktop_backend_arg(args.get("_backend_bus"), "_backend_bus")
     backend_path = _optional_desktop_backend_arg(args.get("_backend_path"), "_backend_path")
     rust_args: dict[str, Any] = {"action": action, "target": target, "value": value}
