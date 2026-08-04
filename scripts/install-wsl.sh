@@ -60,7 +60,7 @@ install_apt_deps() {
     return
   fi
   local missing=()
-  for cmd in python3 git cargo rg; do
+  for cmd in python3 git rg curl; do
     if ! need_cmd "$cmd"; then
       missing+=("$cmd")
     fi
@@ -80,7 +80,18 @@ install_apt_deps() {
     exit 1
   fi
   sudo apt-get update
-  sudo apt-get install -y python3 python3-venv python3-pip git cargo ripgrep pipx
+  sudo apt-get install -y python3 python3-venv python3-pip git curl ripgrep pipx
+}
+
+ensure_rust() {
+  # Ubuntu's packaged Cargo is often older than the lockfile format used by this
+  # project. Keep the Rust toolchain in the user's home directory via rustup.
+  if ! need_cmd rustup; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+  fi
+  "$HOME/.cargo/bin/rustup" toolchain install stable --profile minimal
+  "$HOME/.cargo/bin/rustup" default stable
+  export PATH="$HOME/.cargo/bin:$PATH"
 }
 
 checkout_repo() {
@@ -117,6 +128,7 @@ install_with_venv() {
 }
 
 install_apt_deps
+ensure_rust
 checkout_repo
 
 case "$INSTALL_MODE" in

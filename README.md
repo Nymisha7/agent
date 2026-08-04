@@ -10,7 +10,7 @@ WSL install from Git:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git python3 python3-venv python3-pip cargo ripgrep pipx
+sudo apt-get install -y git curl python3 python3-venv python3-pip ripgrep pipx
 curl -fsSL https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install-wsl.sh | bash
 nym --tui
 ```

@@ -69,6 +69,7 @@ class BundleDistributionTests(unittest.TestCase):
         self.assertIn("NYM_REPO_URL", installer)
         self.assertIn("pipx", installer)
         self.assertIn("--venv", installer)
+        self.assertIn("rustup", installer)
 
     def test_wheel_is_marked_platform_specific(self) -> None:
         setup_py = Path("setup.py").read_text(encoding="utf-8")
