@@ -57,6 +57,19 @@ class BundleDistributionTests(unittest.TestCase):
         self.assertIn('"bin/*"', pyproject)
         self.assertIn('"wheel"', pyproject)
 
+    def test_source_distribution_includes_wsl_install_scripts(self) -> None:
+        manifest = Path("MANIFEST.in").read_text(encoding="utf-8")
+
+        self.assertIn("include scripts/install-wsl.sh", manifest)
+        self.assertIn("include scripts/build-wheel.sh", manifest)
+
+    def test_wsl_installer_documents_supported_install_modes(self) -> None:
+        installer = Path("scripts/install-wsl.sh").read_text(encoding="utf-8")
+
+        self.assertIn("NYM_REPO_URL", installer)
+        self.assertIn("pipx", installer)
+        self.assertIn("--venv", installer)
+
     def test_wheel_is_marked_platform_specific(self) -> None:
         setup_py = Path("setup.py").read_text(encoding="utf-8")
 

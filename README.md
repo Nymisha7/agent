@@ -6,6 +6,29 @@ Agent is a terminal coding agent with a Python agent core and a Rust/Ratatui int
 
 ## Run
 
+WSL install from Git:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3 python3-venv python3-pip cargo ripgrep pipx
+curl -fsSL https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install-wsl.sh | bash
+nym --tui
+```
+
+If installing from a local checkout instead of GitHub:
+
+```bash
+./scripts/install-wsl.sh --path "$PWD"
+nym --tui
+```
+
+The WSL installer uses `pipx` by default and builds the bundled Rust backend during
+installation. To install into a checkout-local `.venv` instead, run:
+
+```bash
+./scripts/install-wsl.sh --path "$PWD" --venv
+```
+
 Portable local run:
 
 ```bash
@@ -24,6 +47,14 @@ cd agent-rust && cargo build && cd ..
 nym --tui
 ```
 
+Build a wheel for distribution:
+
+```bash
+./scripts/build-wheel.sh
+python -m pip install --force-reinstall dist/agent-*.whl
+nym --tui
+```
+
 File discovery and content search require `rg` (ripgrep) on `PATH`, matching
 Goose's Developer-extension search backend.
 
@@ -33,11 +64,11 @@ Building a wheel runs `cargo build --release` and copies the executable into the
 package. Source-only development builds can set `AGENT_SKIP_RUST_BUILD=1`, but
 distributed wheels should not use that flag.
 
-The TUI keeps file sharing in the composer: select the paperclip (or press F4) to
-add a photo or file, and use Ctrl+V to paste text or a clipboard image. Selected
-files appear beside the message and are sent with it. Type `/` to open the secondary
-command menu for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`,
-`/status`, `/setup`, `/help`, and `/exit`.
+The TUI keeps file sharing in the composer: click `+` or press Ctrl+O/F4 to add an
+attachment, and use Ctrl+V to paste text or a clipboard image. Selected files appear
+beside the message and are sent with it. Type `/` to open the secondary command menu
+for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`, `/status`, `/setup`,
+`/help`, and `/exit`.
 
 ## Desktop and system capabilities
 

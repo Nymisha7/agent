@@ -2,6 +2,8 @@ include README.md
 include pyproject.toml
 include agent-rust/Cargo.toml
 include agent-rust/Cargo.lock
+include scripts/install-wsl.sh
+include scripts/build-wheel.sh
 recursive-include agent-rust/src *
 recursive-include agent/prompts *.txt
 recursive-include agent/skills */SKILL.md
