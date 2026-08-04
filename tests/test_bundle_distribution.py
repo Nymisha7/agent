@@ -72,6 +72,8 @@ class BundleDistributionTests(unittest.TestCase):
         self.assertIn("rustup", installer)
         self.assertIn("NYM_PREBUILT_WHEEL", installer)
         self.assertIn("prebuilt_wheel", installer)
+        self.assertIn("normalize_repo_url", installer)
+        self.assertIn("https://github.com/${REPO_URL#git@github.com:}", installer)
 
     def test_wheel_is_marked_platform_specific(self) -> None:
         setup_py = Path("setup.py").read_text(encoding="utf-8")

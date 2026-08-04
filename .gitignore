@@ -9,3 +9,4 @@ target/
 .codex/
 .agent-session.sqlite3*
 ubuntu-shell-config-backup/
+.agent/parallel-work.md

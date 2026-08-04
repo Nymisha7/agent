@@ -56,6 +56,17 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+normalize_repo_url() {
+  case "$REPO_URL" in
+    git@github.com:*)
+      REPO_URL="https://github.com/${REPO_URL#git@github.com:}"
+      ;;
+    ssh://git@github.com/*)
+      REPO_URL="https://github.com/${REPO_URL#ssh://git@github.com/}"
+      ;;
+  esac
+}
+
 install_apt_deps() {
   if ! need_cmd apt-get; then
     return
@@ -153,6 +164,7 @@ install_with_venv() {
 }
 
 install_apt_deps
+normalize_repo_url
 checkout_repo
 
 case "$INSTALL_MODE" in

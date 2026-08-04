@@ -147,7 +147,13 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
             action_capability("network_connect", linux_supported && command_exists("ip"), "ip", "approval_required", Some("target_required")),
             action_capability("network_disconnect", linux_supported && command_exists("ip"), "ip", "approval_required", Some("target_required")),
             action_capability("eject_storage", linux_supported && command_exists("udisksctl"), "udisksctl", "approval_required", Some("target_required")),
-            action_capability("terminate_process", linux_supported, "libc_signal", "approval_required", Some("target_required")),
+            action_capability(
+                "terminate_process",
+                linux_supported,
+                if wsl && has_powershell_host { "libc_signal/windows_host_powershell" } else { "libc_signal" },
+                "approval_required",
+                Some("target_required"),
+            ),
             action_capability("launch_application", linux_supported && (has_gtk_launch || has_xdg_open || (wsl && has_powershell_host)), if has_gtk_launch { "gtk-launch" } else if has_xdg_open { "xdg-open" } else if wsl && has_powershell_host { "windows_host_powershell" } else { "path_lookup" }, "approval_required", Some("target_required")),
             action_capability("open_path", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
             action_capability("open_url", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
@@ -499,24 +505,7 @@ pub(crate) fn desktop_action(
             let pid = raw_pid
                 .parse::<i32>()
                 .map_err(|_| anyhow::anyhow!("terminate_process requires a numeric PID"))?;
-            if pid <= 1 || pid == std::process::id() as i32 {
-                return Err(anyhow::anyhow!("Refusing to terminate protected PID {pid}"));
-            }
-            let before = process_state(pid);
-            let status = unsafe { libc::kill(pid, libc::SIGTERM) };
-            thread::sleep(Duration::from_millis(75));
-            let after = process_state(pid);
-            Ok(json!({
-                "ok": status == 0,
-                "tool": "desktop_action",
-                "action": action,
-                "target": raw_pid,
-                "before": before,
-                "after": after,
-                "verified": status == 0 && after.get("running").and_then(Value::as_bool) == Some(false),
-                "verification": if status == 0 && after.get("running").and_then(Value::as_bool) == Some(false) { "confirmed" } else { "not_confirmed" },
-                "error": if status == 0 { None } else { Some(std::io::Error::last_os_error().to_string()) },
-            }))
+            terminate_process_action(action, raw_pid, pid)
         }
         "launch_application" => {
             launch_desktop_target(action, required_target(action, target)?, false)
@@ -553,6 +542,51 @@ pub(crate) fn desktop_action(
             "error": format!("Unsupported desktop action: {action}"),
         })),
     }
+}
+
+fn terminate_process_action(action: &str, raw_pid: &str, pid: i32) -> Result<Value> {
+    if pid <= 1 || pid == std::process::id() as i32 {
+        return Err(anyhow::anyhow!("Refusing to terminate protected PID {pid}"));
+    }
+
+    let before = process_state(pid);
+    let before_running = before.get("running").and_then(Value::as_bool) == Some(true);
+    if before_running {
+        let status = unsafe { libc::kill(pid, libc::SIGTERM) };
+        thread::sleep(Duration::from_millis(75));
+        let after = process_state(pid);
+        let stopped = after.get("running").and_then(Value::as_bool) == Some(false);
+        return Ok(json!({
+            "ok": status == 0,
+            "tool": "desktop_action",
+            "action": action,
+            "target": raw_pid,
+            "backend": "libc_signal",
+            "before": before,
+            "after": after,
+            "verified": status == 0 && stopped,
+            "verification": if status == 0 && stopped { "confirmed" } else { "not_confirmed" },
+            "error": if status == 0 { None } else { Some(std::io::Error::last_os_error().to_string()) },
+        }));
+    }
+
+    if is_wsl_runtime() && windows_host_powershell_available() {
+        return windows_host_terminate_process_receipt(action, raw_pid, pid);
+    }
+
+    Ok(json!({
+        "ok": true,
+        "tool": "desktop_action",
+        "action": action,
+        "target": raw_pid,
+        "backend": "libc_signal",
+        "reason": "already_not_running",
+        "before": before,
+        "after": process_state(pid),
+        "verified": true,
+        "verification": "confirmed",
+        "error": None::<String>,
+    }))
 }
 
 fn desktop_runtime() -> &'static str {
@@ -3889,10 +3923,10 @@ public static class AgentUser32 {
 $hwnd = [AgentUser32]::GetForegroundWindow()
 $builder = New-Object System.Text.StringBuilder 1024
 [void][AgentUser32]::GetWindowText($hwnd, $builder, $builder.Capacity)
-$pid = 0
-[void][AgentUser32]::GetWindowThreadProcessId($hwnd, [ref]$pid)
-$process = if ($pid) { Get-Process -Id $pid -ErrorAction SilentlyContinue } else { $null }
-@{ id = ('0x{0:x}' -f $hwnd.ToInt64()); pid = $pid; title = $builder.ToString(); process = $process.ProcessName; path = $process.Path } | ConvertTo-Json -Compress
+$processId = 0
+[void][AgentUser32]::GetWindowThreadProcessId($hwnd, [ref]$processId)
+$process = if ($processId) { Get-Process -Id $processId -ErrorAction SilentlyContinue } else { $null }
+@{ id = ('0x{0:x}' -f $hwnd.ToInt64()); pid = $processId; title = $builder.ToString(); process = $process.ProcessName; path = $process.Path } | ConvertTo-Json -Compress
 "#;
     let output = run_capture_dynamic(&[
         "powershell.exe",
@@ -3971,14 +4005,105 @@ $active = [AgentUser32]::GetForegroundWindow().ToInt64()
     ))
 }
 
+fn windows_host_terminate_process_receipt(action: &str, raw_pid: &str, pid: i32) -> Result<Value> {
+    let before = windows_host_process_state(pid)?;
+    let output = windows_host_terminate_process(pid)?;
+    thread::sleep(Duration::from_millis(250));
+    let after = windows_host_process_state(pid)?;
+    let after_available = after.get("available").and_then(Value::as_bool) == Some(true);
+    let after_running = after.get("running").and_then(Value::as_bool) == Some(true);
+    let before_running = before.get("running").and_then(Value::as_bool) == Some(true);
+    let verified = output.status == 0 && after_available && !after_running;
+    Ok(json!({
+        "ok": output.status == 0 && verified,
+        "tool": "desktop_action",
+        "action": action,
+        "target": raw_pid,
+        "backend": "windows_host_powershell",
+        "exit_code": output.status,
+        "reason": if before_running { None::<&str> } else { Some("already_not_running") },
+        "before": before,
+        "after": after,
+        "verified": verified,
+        "verification": if verified { "confirmed" } else if output.status != 0 { "failed" } else { "not_confirmed" },
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+    }))
+}
+
+fn windows_host_terminate_process(pid: i32) -> Result<DesktopCommandOutput> {
+    let script = windows_host_terminate_process_script(pid)?;
+    run_desktop_capture(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ])
+}
+
+fn windows_host_terminate_process_script(pid: i32) -> Result<String> {
+    if pid <= 1 {
+        return Err(anyhow::anyhow!("Refusing to terminate protected PID {pid}"));
+    }
+    Ok(format!(
+        r#"
+$processId = {pid}
+$process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+if ($null -eq $process) {{ Write-Output "not_running"; exit 0 }}
+Stop-Process -Id $processId -Force -ErrorAction Stop
+Write-Output "stopped"
+"#
+    ))
+}
+
+fn windows_host_process_state(pid: i32) -> Result<Value> {
+    let script = windows_host_process_state_script(pid)?;
+    let output = run_desktop_capture(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ])?;
+    let item = serde_json::from_str::<Value>(&output.stdout).unwrap_or(Value::Null);
+    if output.status == 0 && item.is_object() {
+        return Ok(item);
+    }
+    Ok(json!({
+        "pid": pid,
+        "running": false,
+        "available": false,
+        "backend": "windows_host_powershell",
+        "error": output.stderr,
+    }))
+}
+
+fn windows_host_process_state_script(pid: i32) -> Result<String> {
+    if pid <= 0 {
+        return Err(anyhow::anyhow!("PID must be positive"));
+    }
+    Ok(format!(
+        r#"
+$processId = {pid}
+$process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+if ($null -eq $process) {{
+    @{{ pid = $processId; running = $false; name = $null; path = $null; available = $true; backend = "windows_host_powershell" }} | ConvertTo-Json -Compress
+    exit 0
+}}
+$processPath = try {{ $process.Path }} catch {{ $null }}
+@{{ pid = $process.Id; running = $true; name = $process.ProcessName; path = $processPath; available = $true; backend = "windows_host_powershell" }} | ConvertTo-Json -Compress
+"#
+    ))
+}
+
 fn windows_host_close_window_receipt(action: &str, target: &str) -> Result<Value> {
     let before = window_state(target)?;
     let output = windows_host_close_window(target)?;
     thread::sleep(Duration::from_millis(250));
     let after = window_state(target)?;
-    let verified = output.status == 0
-        && window_state_bool(&before, "visible") == Some(true)
-        && window_state_bool(&after, "visible") == Some(false);
+    let after_closed = window_state_bool(&after, "visible") == Some(false);
+    let verified = output.status == 0 && after_closed;
     Ok(json!({
         "ok": output.status == 0,
         "tool": "desktop_action",
@@ -4023,17 +4148,17 @@ public static class AgentUser32 {{
 '@
 $hwnd = [IntPtr]{handle}
 if (-not [AgentUser32]::IsWindow($hwnd)) {{ Write-Error "Invalid window handle"; exit 2 }}
-$pid = 0
-[void][AgentUser32]::GetWindowThreadProcessId($hwnd, [ref]$pid)
+$processId = 0
+[void][AgentUser32]::GetWindowThreadProcessId($hwnd, [ref]$processId)
 $ok = [AgentUser32]::PostMessage($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 500
 $forced = $false
-if ([AgentUser32]::IsWindow($hwnd) -and $pid -gt 0) {{
-    Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+if ([AgentUser32]::IsWindow($hwnd) -and $processId -gt 0) {{
+    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     $forced = $true
     Start-Sleep -Milliseconds 250
 }}
-@{{ target = {handle}; pid = $pid; close_requested = $ok; forced = $forced }} | ConvertTo-Json -Compress
+@{{ target = {handle}; pid = $processId; close_requested = $ok; forced = $forced }} | ConvertTo-Json -Compress
 "#
     ))
 }
@@ -4548,8 +4673,26 @@ mod tests {
 
         assert!(script.contains("PostMessage($hwnd, 0x0010"));
         assert!(script.contains("IsWindow($hwnd)"));
-        assert!(script.contains("Stop-Process -Id $pid -Force"));
+        assert!(script.contains("$processId = 0"));
+        assert!(script.contains("Stop-Process -Id $processId -Force"));
+        assert!(!script.contains("$pid"));
         assert!(super::windows_host_close_window_script("0x3a00007;rm").is_err());
+    }
+
+    #[test]
+    fn windows_host_process_scripts_do_not_overwrite_builtin_pid_variable() {
+        let terminate =
+            super::windows_host_terminate_process_script(16608).expect("terminate process script");
+        let state = super::windows_host_process_state_script(16608).expect("process state script");
+
+        assert!(terminate.contains("$processId = 16608"));
+        assert!(terminate.contains("Stop-Process -Id $processId -Force"));
+        assert!(!terminate.contains("$pid"));
+        assert!(state.contains("$processId = 16608"));
+        assert!(state.contains("Get-Process -Id $processId"));
+        assert!(!state.contains("$pid"));
+        assert!(super::windows_host_terminate_process_script(1).is_err());
+        assert!(super::windows_host_process_state_script(0).is_err());
     }
 
     #[test]
