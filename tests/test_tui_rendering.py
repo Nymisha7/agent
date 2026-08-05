@@ -25,9 +25,14 @@ from agent.main import (
     _handle_local_command,
     _is_exit_command,
     _local_runtime_status_lines,
+    _load_agent_name,
+    _load_tui_copy_keys,
+    _load_tui_mouse_capture,
+    _load_tui_paste_keys,
     _provider_api_key_needed,
     _load_persisted_api_keys,
     _persist_api_key,
+    _persist_agent_name,
     _queue_status,
     _record_local_command_exchange,
     _redact_local_command,
@@ -150,6 +155,21 @@ class TuiExitTests(unittest.TestCase):
         self.assertEqual(command[1], "tui")
         self.assertIn("--session-id", command)
         self.assertIn("abc123", command)
+        paste_key_indexes = [
+            index for index, value in enumerate(command) if value == "--paste-key"
+        ]
+        paste_keys = [command[index + 1] for index in paste_key_indexes]
+        self.assertIn("ctrl+v", paste_keys)
+        self.assertIn("ctrl+shift+v", paste_keys)
+        self.assertIn("shift+insert", paste_keys)
+        self.assertIn("alt+v", paste_keys)
+        copy_key_indexes = [
+            index for index, value in enumerate(command) if value == "--copy-key"
+        ]
+        copy_keys = [command[index + 1] for index in copy_key_indexes]
+        self.assertIn("alt+c", copy_keys)
+        self.assertIn("ctrl+y", copy_keys)
+        self.assertIn("--mouse-capture", command)
 
     def test_stream_bridge_startup_failure_emits_final_frame(self) -> None:
         output = io.StringIO()
@@ -178,6 +198,90 @@ class TuiExitTests(unittest.TestCase):
 
 
 class TuiRenderingTests(unittest.TestCase):
+    def test_agent_name_persists_to_preferences(self) -> None:
+        with TemporaryDirectory() as config_home:
+            with patch.dict("os.environ", {"XDG_CONFIG_HOME": config_home}, clear=True):
+                self.assertEqual(_load_agent_name(), "Agent")
+
+                saved = _persist_agent_name("Nymisha Helper")
+
+                self.assertEqual(saved, "Nymisha Helper")
+                self.assertEqual(_load_agent_name(), "Nymisha Helper")
+                preferences = Path(config_home) / "agent" / "preferences.json"
+                self.assertEqual(preferences.stat().st_mode & 0o777, 0o600)
+
+    def test_tui_paste_keys_include_user_configured_shortcuts(self) -> None:
+        with TemporaryDirectory() as config_home:
+            preferences = Path(config_home) / "agent" / "preferences.json"
+            preferences.parent.mkdir(parents=True)
+            preferences.write_text('{"paste_keys":["alt+v"," ctrl + alt + p "]}\n', encoding="utf-8")
+            with patch.dict("os.environ", {"XDG_CONFIG_HOME": config_home}, clear=True):
+                paste_keys = _load_tui_paste_keys()
+
+        self.assertEqual(
+            paste_keys[:4],
+            ("ctrl+v", "ctrl+shift+v", "shift+insert", "alt+v"),
+        )
+        self.assertIn("alt+v", paste_keys)
+        self.assertIn("ctrl+alt+p", paste_keys)
+
+    def test_tui_copy_keys_include_user_configured_shortcuts(self) -> None:
+        with TemporaryDirectory() as config_home:
+            preferences = Path(config_home) / "agent" / "preferences.json"
+            preferences.parent.mkdir(parents=True)
+            preferences.write_text('{"copy_keys":["alt+shift+c"]}\n', encoding="utf-8")
+            with patch.dict("os.environ", {"XDG_CONFIG_HOME": config_home}, clear=True):
+                copy_keys = _load_tui_copy_keys()
+
+        self.assertEqual(copy_keys[:2], ("alt+c", "ctrl+y"))
+        self.assertIn("alt+shift+c", copy_keys)
+
+    def test_tui_mouse_capture_is_enabled_for_in_app_selection_by_default(self) -> None:
+        with TemporaryDirectory() as config_home:
+            with patch.dict("os.environ", {"XDG_CONFIG_HOME": config_home}, clear=True):
+                self.assertTrue(_load_tui_mouse_capture())
+
+    def test_tui_mouse_capture_can_be_disabled_from_preferences(self) -> None:
+        with TemporaryDirectory() as config_home:
+            preferences = Path(config_home) / "agent" / "preferences.json"
+            preferences.parent.mkdir(parents=True)
+            preferences.write_text('{"mouse_capture": false}\n', encoding="utf-8")
+            with patch.dict("os.environ", {"XDG_CONFIG_HOME": config_home}, clear=True):
+                self.assertFalse(_load_tui_mouse_capture())
+
+    def test_name_command_shows_and_changes_agent_name(self) -> None:
+        with TemporaryDirectory() as config_home:
+            with patch.dict("os.environ", {"XDG_CONFIG_HOME": config_home}, clear=True):
+                ctx = SimpleNamespace(agent_name="Agent")
+
+                current = _handle_local_command(ctx, "/name")
+                changed = _handle_local_command(ctx, "/name Nymi")
+
+                self.assertIn("Agent name: Agent", current)
+                self.assertEqual(changed, "Okay, my name is now Nymi.")
+                self.assertEqual(ctx.agent_name, "Nymi")
+                self.assertEqual(_load_agent_name(), "Nymi")
+
+    def test_name_command_accepts_apostrophes_without_shell_quoting(self) -> None:
+        with TemporaryDirectory() as config_home:
+            with patch.dict("os.environ", {"XDG_CONFIG_HOME": config_home}, clear=True):
+                ctx = SimpleNamespace(agent_name="Agent")
+
+                changed = _handle_local_command(ctx, "/name Nymisha's Helper")
+
+                self.assertEqual(changed, "Okay, my name is now Nymisha's Helper.")
+                self.assertEqual(_load_agent_name(), "Nymisha's Helper")
+
+    def test_render_tui_transcript_uses_custom_agent_name(self) -> None:
+        messages = [
+            SimpleNamespace(role="assistant", content="Ready.", created_at="now", attachments=[]),
+        ]
+
+        rendered = _render_tui_transcript(messages, {}, 80, agent_name="Nymi")
+
+        self.assertIn("Nymi  now", rendered)
+        self.assertNotIn("Agent  now", rendered)
+
     def test_tools_are_agent_managed_and_not_selectable(self) -> None:
         ctx = SimpleNamespace()
 

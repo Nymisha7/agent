@@ -97,6 +97,24 @@ class AgentSession:
     last_desktop_snapshot: dict[str, str] = field(default_factory=dict)
 
 
+def _apply_agent_name(system_prompt: str, agent_name: str) -> str:
+    name = _safe_agent_name(agent_name)
+    if name == "Agent":
+        return system_prompt
+    return (
+        f"Your display name is {name}. When identifying yourself by name, use {name}.\n"
+        f"{system_prompt}"
+    )
+
+
+def _safe_agent_name(value: str) -> str:
+    name = " ".join(str(value or "Agent").strip().split())
+    if not name:
+        return "Agent"
+    name = "".join(char for char in name if ord(char) >= 32 and ord(char) != 127)
+    return name[:40] or "Agent"
+
+
 def run_agent(
     *,
     llm: LLMClient,
@@ -105,6 +123,7 @@ def run_agent(
     search_roots: list[str] | None = None,
     user_prompt: str,
     user_visible_prompt: str | None = None,
+    agent_name: str = "Agent",
     session: AgentSession | None = None,
     stored_context: str | None = None,
     conversation_history: list[dict[str, Any]] | None = None,
@@ -128,6 +147,7 @@ def run_agent(
             model=getattr(llm, "model", None),
         )
     )
+    system_prompt = _apply_agent_name(system_prompt, agent_name)
     active_session = session or AgentSession()
     if active_session.last_failure.get("scope") == "turn":
         # A prior turn already reported this partial outcome. Keep durable hard

@@ -21,7 +21,8 @@ Environment:
   NYM_REPO_URL       Default repository URL.
   NYM_INSTALL_ROOT   Clone destination. Default: ~/.local/share/nym
   NYM_INSTALL_MODE   pipx or venv. Default: pipx
-  NYM_PREBUILT_WHEEL Set to 0 to compile the Rust backend from source.
+  NYM_AGENT_NAME     Initial display name for your agent. Default: Agent
+  NYM_PREBUILT_WHEEL Set to 1 to use a bundled wheel when available.
 EOF
 }
 
@@ -72,7 +73,7 @@ install_apt_deps() {
     return
   fi
   local missing=()
-  for cmd in python3 git rg curl; do
+  for cmd in python3 git rg curl ffmpeg espeak-ng; do
     if ! need_cmd "$cmd"; then
       missing+=("$cmd")
     fi
@@ -83,6 +84,9 @@ install_apt_deps() {
   if ! python3 -m venv --help >/dev/null 2>&1; then
     missing+=("python3-venv")
   fi
+  if ! need_cmd powershell.exe && ! need_cmd wl-copy && ! need_cmd xclip && ! need_cmd xsel; then
+    missing+=("wl-clipboard")
+  fi
   if [ "${#missing[@]}" -eq 0 ]; then
     return
   fi
@@ -92,7 +96,7 @@ install_apt_deps() {
     exit 1
   fi
   sudo apt-get update
-  sudo apt-get install -y python3 python3-venv python3-pip git curl ripgrep pipx
+  sudo apt-get install -y python3 python3-venv python3-pip git curl ripgrep pipx wl-clipboard xclip xsel ffmpeg espeak-ng
 }
 
 ensure_rust() {
@@ -107,7 +111,10 @@ ensure_rust() {
 }
 
 prebuilt_wheel() {
-  if [ "${NYM_PREBUILT_WHEEL:-1}" = "0" ] || [ "$(uname -m)" != "x86_64" ]; then
+  if [ "${NYM_PREBUILT_WHEEL:-0}" != "1" ] || [ "$(uname -m)" != "x86_64" ]; then
+    return 1
+  fi
+  if [ -n "$SOURCE_PATH" ]; then
     return 1
   fi
   local wheel
@@ -163,6 +170,55 @@ install_with_venv() {
   echo "Installed nym at $HOME/.local/bin/nym"
 }
 
+configure_agent_name() {
+  local agent_name="${NYM_AGENT_NAME:-}"
+  if [ -z "$agent_name" ] && [ -e /dev/tty ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    if { printf 'Name your agent [Agent]: ' > /dev/tty; } 2>/dev/null; then
+      IFS= read -r agent_name < /dev/tty || agent_name=""
+    fi
+  fi
+  if [ -z "$agent_name" ]; then
+    return
+  fi
+  NYM_AGENT_NAME="$agent_name" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+name = " ".join((os.environ.get("NYM_AGENT_NAME") or "Agent").strip().split())
+if not name:
+    name = "Agent"
+if len(name) > 40:
+    name = name[:40]
+if any(ord(char) < 32 or ord(char) == 127 for char in name):
+    raise SystemExit("Agent name cannot contain control characters.")
+
+config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")).expanduser()
+path = config_home / "agent" / "preferences.json"
+path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+try:
+    os.chmod(path.parent, 0o700)
+except OSError:
+    pass
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except (FileNotFoundError, OSError, json.JSONDecodeError):
+    payload = {}
+if not isinstance(payload, dict):
+    payload = {}
+payload["agent_name"] = name
+tmp_path = path.with_suffix(".tmp")
+tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+try:
+    os.chmod(tmp_path, 0o600)
+except OSError:
+    pass
+tmp_path.replace(path)
+print(f"Agent name set to: {name}")
+print("Tip: use /name anytime to change it.")
+PY
+}
+
 install_apt_deps
 normalize_repo_url
 checkout_repo
@@ -180,4 +236,5 @@ case "$INSTALL_MODE" in
     ;;
 esac
 
+configure_agent_name
 echo "Run: nym --tui"

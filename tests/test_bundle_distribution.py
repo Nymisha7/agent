@@ -72,6 +72,8 @@ class BundleDistributionTests(unittest.TestCase):
         self.assertIn("rustup", installer)
         self.assertIn("NYM_PREBUILT_WHEEL", installer)
         self.assertIn("prebuilt_wheel", installer)
+        self.assertIn('NYM_PREBUILT_WHEEL:-0', installer)
+        self.assertIn('[ -n "$SOURCE_PATH" ]', installer)
         self.assertIn("normalize_repo_url", installer)
         self.assertIn("https://github.com/${REPO_URL#git@github.com:}", installer)
 

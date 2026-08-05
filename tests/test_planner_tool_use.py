@@ -242,6 +242,32 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("# GPT-family guidance", llm.instructions)
         self.assertIn("# Nym execution policy", llm.instructions)
 
+    def test_run_agent_includes_custom_agent_name_in_instructions(self) -> None:
+        class FakeLLM:
+            provider = "openai"
+            model = "gpt-5.5"
+            reasoning_effort = None
+            reasoning_summary = None
+
+            def __init__(self) -> None:
+                self.instructions = ""
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.instructions = kwargs["instructions"]
+                return SimpleNamespace(output=[], output_text="Done.")
+
+        llm = FakeLLM()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=SimpleNamespace(),  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="hello",
+            agent_name="Nymi",
+        )
+
+        self.assertEqual(answer, "Done.")
+        self.assertIn("Your display name is Nymi.", llm.instructions)
+
     def test_run_agent_executes_model_invoked_parallel_batch(self) -> None:
         class FakeLLM:
             provider = "openai"

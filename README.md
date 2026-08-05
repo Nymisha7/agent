@@ -15,9 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install
 nym --tui
 ```
 
-On x86_64 WSL, the installer uses the bundled Linux wheel and does not install Rust or
-Cargo. Expect roughly 100–200 MB in addition to any already-installed Python and Git.
-Set `NYM_PREBUILT_WHEEL=0` only when intentionally building from source.
+The WSL installer builds the bundled Rust backend from source by default. Set
+`NYM_PREBUILT_WHEEL=1` only when intentionally installing a matching release wheel.
 
 If installing from a local checkout instead of GitHub:
 
@@ -69,10 +68,31 @@ package. Source-only development builds can set `AGENT_SKIP_RUST_BUILD=1`, but
 distributed wheels should not use that flag.
 
 The TUI keeps file sharing in the composer: click `+` or press Ctrl+O/F4 to add an
-attachment, and use Ctrl+V to paste text or a clipboard image. Selected files appear
-beside the message and are sent with it. Type `/` to open the secondary command menu
+attachment, click the microphone or press F5 to dictate, and use Ctrl+V to paste text
+or a clipboard image. Selected files appear beside the message and are sent with it.
+Type `/` to open the secondary command menu
 for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`, `/status`, `/setup`,
 `/help`, and `/exit`.
+
+## Voice
+
+Voice setup is optional and never opens an API-key prompt. The microphone is active
+only when Nym finds a recorder plus a transcription path; otherwise it stays muted and
+explains the missing local capability when selected. On WSL, the installer provides
+`ffmpeg` for microphone capture and `espeak-ng` for local speech playback.
+
+Nym reuses an existing `OPENAI_API_KEY` for OpenAI-compatible transcription and speech.
+`AGENT_VOICE_API_KEY` and `AGENT_VOICE_BASE_URL` can instead point voice at a separate
+OpenAI-compatible service. Models and voice are configurable with
+`AGENT_VOICE_STT_MODEL`, `AGENT_VOICE_TTS_MODEL`, and `AGENT_VOICE_TTS_VOICE`.
+
+For an entirely local setup, provide commands without a key: `AGENT_VOICE_RECORDER`
+must contain `{output}`, `AGENT_VOICE_STT_COMMAND` must contain `{input}`, and
+`AGENT_VOICE_TTS_COMMAND` must contain `{input}` or `{text}` as a separate argument.
+Nym invokes those commands directly rather than through a shell. Set
+`AGENT_TTS_ENABLED=1` to speak completed replies in the background; it is off by
+default. `AGENT_VOICE_RECORD_SECONDS` bounds a microphone turn (default 20 seconds),
+and `AGENT_VOICE_ENABLED=0` disables the feature entirely.
 
 ## Desktop and system capabilities
 
