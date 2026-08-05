@@ -15,9 +15,9 @@ curl -fsSL https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install
 nym --tui
 ```
 
-On WSL, the installer builds the bundled Rust backend from source so updates match
-the checked-out code. Set `NYM_PREBUILT_WHEEL=1` only when intentionally using a
-bundled release wheel.
+On x86_64 WSL, the installer uses the bundled Linux wheel and does not install Rust or
+Cargo. Expect roughly 100–200 MB in addition to any already-installed Python and Git.
+Set `NYM_PREBUILT_WHEEL=0` only when intentionally building from source.
 
 If installing from a local checkout instead of GitHub:
 
@@ -68,34 +68,11 @@ Building a wheel runs `cargo build --release` and copies the executable into the
 package. Source-only development builds can set `AGENT_SKIP_RUST_BUILD=1`, but
 distributed wheels should not use that flag.
 
-The TUI supports in-app transcript selection: drag over visible conversation text
-and release to copy it. In WSL, copied text goes to the Windows clipboard. Use
-Alt+C or Ctrl+Y to copy the latest assistant response directly. Use Ctrl+O/F4 to
-add an attachment, and use Ctrl+V, Ctrl+Shift+V, Alt+V, Shift+Insert, or terminal
-paste to paste text or a clipboard image. Selected files appear beside the message
-and are sent with it. Type `/` to open the secondary command menu for `/model`,
-`/name`, `/install`, `/reasoning`, `/skills`, `/gateway`, `/status`, `/setup`,
+The TUI keeps file sharing in the composer: click `+` or press Ctrl+O/F4 to add an
+attachment, and use Ctrl+V to paste text or a clipboard image. Selected files appear
+beside the message and are sent with it. Type `/` to open the secondary command menu
+for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`, `/status`, `/setup`,
 `/help`, and `/exit`.
-
-If a terminal reserves all default paste shortcuts, add another paste key to
-`~/.config/agent/preferences.json` only for that machine:
-
-```json
-{
-  "paste_keys": ["ctrl+alt+p"]
-}
-```
-
-Agent keeps the default paste shortcuts and adds any keys listed there.
-
-Mouse capture is on by default so Agent can copy selected transcript text itself.
-To hand mouse selection back to the terminal instead, set `"mouse_capture": false`
-in `~/.config/agent/preferences.json`.
-
-The WSL installer asks for an agent name and stores it in
-`~/.config/agent/preferences.json`. For unattended installs, set
-`NYM_AGENT_NAME="Your Name"` before running the installer. Inside Agent, use
-`/name` to see the current name or `/name <new name>` to change it anytime.
 
 ## Desktop and system capabilities
 
@@ -196,7 +173,7 @@ does not run a separate orchestration classifier before every message. The main 
 receives `parallel_subagents` beside its other tools and either answers directly, uses
 ordinary tools, or invokes one parallel batch when multiple independent, bounded
 workstreams would materially improve the task. This follows the model-invoked task-tool
-pattern. Singleton and sequential
+pattern used by OpenCode, Goose, Codex, and Claude Code. Singleton and sequential
 subagent execution remain intentionally unsupported.
 
 Every child is a fresh in-memory agent with its own model/tool loop and no parent

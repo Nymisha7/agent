@@ -71,10 +71,6 @@ SESSION_LIST_LIMIT = 10
 TUI_TRANSCRIPT_LIMIT = 200
 USAGE_PANEL_WIDTH = 30
 USAGE_PANEL_MIN_TERMINAL_WIDTH = 105
-DEFAULT_AGENT_NAME = "Agent"
-MAX_AGENT_NAME_CHARS = 40
-DEFAULT_TUI_PASTE_KEYS = ("ctrl+v", "ctrl+shift+v", "shift+insert", "alt+v")
-DEFAULT_TUI_COPY_KEYS = ("alt+c", "ctrl+y")
 DEFAULT_CONTEXT_WINDOWS = {
     "gpt-5.5": 1_000_000,
     "gpt-5.5-mini": 400_000,
@@ -124,7 +120,6 @@ DEFAULT_CONTEXT_WINDOWS = {
 
 LOCAL_COMMANDS = (
     ("/model", "Choose a model or local runtime"),
-    ("/name", "Show or change this agent's name"),
     ("/install", "Install an open-source/open-weight model locally"),
     ("/reasoning", "Set reasoning effort for supported models"),
     ("/skills", "Show layered workspace and personal skills"),
@@ -145,7 +140,6 @@ PROVIDER_API_KEY_ENVS = {
     "deepseek": "DEEPSEEK_API_KEY",
     "glm": "GLM_API_KEY",
     "openai-compatible": "AGENT_OPENAI_COMPAT_API_KEY",
-    "voice": "AGENT_VOICE_API_KEY",
 }
 _CREDENTIAL_ENV_NAMES = frozenset(PROVIDER_API_KEY_ENVS.values())
 
@@ -163,145 +157,6 @@ def _legacy_credentials_path() -> Path:
 
 def _credential_key_path() -> Path:
     return _credentials_path().with_name("credentials.key")
-
-
-def _preferences_path() -> Path:
-    config_home = Path(
-        os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
-    ).expanduser()
-    return config_home / "agent" / "preferences.json"
-
-
-def _load_agent_name() -> str:
-    configured = os.environ.get("AGENT_NAME") or os.environ.get("NYM_AGENT_NAME")
-    if configured:
-        try:
-            return _normalize_agent_name(configured)
-        except ValueError:
-            return DEFAULT_AGENT_NAME
-    try:
-        payload = json.loads(_preferences_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return DEFAULT_AGENT_NAME
-    if not isinstance(payload, dict):
-        return DEFAULT_AGENT_NAME
-    try:
-        return _normalize_agent_name(payload.get("agent_name"))
-    except ValueError:
-        return DEFAULT_AGENT_NAME
-
-
-def _persist_agent_name(name: str) -> str:
-    normalized = _normalize_agent_name(name)
-    path = _preferences_path()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    payload["agent_name"] = normalized
-    serialized = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    _atomic_private_write(path, serialized)
-    return normalized
-
-
-def _load_tui_paste_keys() -> tuple[str, ...]:
-    return _load_tui_keys(
-        default_keys=DEFAULT_TUI_PASTE_KEYS,
-        env_names=("AGENT_TUI_PASTE_KEYS", "NYM_TUI_PASTE_KEYS"),
-        preference_key="paste_keys",
-    )
-
-
-def _load_tui_copy_keys() -> tuple[str, ...]:
-    return _load_tui_keys(
-        default_keys=DEFAULT_TUI_COPY_KEYS,
-        env_names=("AGENT_TUI_COPY_KEYS", "NYM_TUI_COPY_KEYS"),
-        preference_key="copy_keys",
-    )
-
-
-def _load_tui_keys(
-    *,
-    default_keys: tuple[str, ...],
-    env_names: tuple[str, str],
-    preference_key: str,
-) -> tuple[str, ...]:
-    keys = list(default_keys)
-    configured = next((os.environ.get(name) for name in env_names if os.environ.get(name)), None)
-    raw_value: Any = None
-    if configured:
-        raw_value = [item for item in configured.split(",")]
-    else:
-        try:
-            payload = json.loads(_preferences_path().read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            payload = {}
-        if isinstance(payload, dict):
-            raw_value = payload.get(preference_key)
-            if raw_value is None and isinstance(payload.get("tui"), dict):
-                raw_value = payload["tui"].get(preference_key)
-    for key in _normalized_key_list(raw_value):
-        if key not in keys:
-            keys.append(key)
-    return tuple(keys)
-
-
-def _load_tui_mouse_capture() -> bool:
-    configured = os.environ.get("AGENT_TUI_MOUSE_CAPTURE") or os.environ.get("NYM_TUI_MOUSE_CAPTURE")
-    if configured is not None:
-        return _truthy_config_value(configured)
-    try:
-        payload = json.loads(_preferences_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return True
-    if not isinstance(payload, dict):
-        return True
-    raw_value = payload.get("mouse_capture")
-    if raw_value is None and isinstance(payload.get("tui"), dict):
-        raw_value = payload["tui"].get("mouse_capture")
-    if raw_value is None:
-        return True
-    return _truthy_config_value(raw_value)
-
-
-def _truthy_config_value(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().casefold() in {"1", "true", "yes", "on"}
-    return False
-
-
-def _normalized_key_list(value: Any) -> tuple[str, ...]:
-    if isinstance(value, str):
-        candidates = value.split(",")
-    elif isinstance(value, list):
-        candidates = value
-    else:
-        return ()
-    keys: list[str] = []
-    for item in candidates:
-        if not isinstance(item, str):
-            continue
-        key = "+".join(part.strip().casefold() for part in item.split("+") if part.strip())
-        if key and key not in keys:
-            keys.append(key)
-    return tuple(keys)
-
-
-def _normalize_agent_name(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ValueError("Agent name must be text.")
-    name = " ".join(value.strip().split())
-    if not name:
-        raise ValueError("Agent name cannot be empty.")
-    if len(name) > MAX_AGENT_NAME_CHARS:
-        raise ValueError(f"Agent name must be {MAX_AGENT_NAME_CHARS} characters or fewer.")
-    if any(ord(char) < 32 or ord(char) == 127 for char in name):
-        raise ValueError("Agent name cannot contain control characters.")
-    return name
 
 
 def _load_persisted_api_keys() -> None:
@@ -626,7 +481,6 @@ class AppContext:
     skills: SkillCatalog = field(default_factory=SkillCatalog)
     gateway: AgentGateway | None = None
     agent_id: str = "main"
-    agent_name: str = DEFAULT_AGENT_NAME
     tool_allowlist: tuple[str, ...] | None = None
     route_key: str | None = None
     config_path: Path | None = None
@@ -1124,7 +978,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tui-bridge",
         choices=(
             "snapshot", "submit", "stream-submit", "complete", "gateway",
-            "approve", "deny", "voice-record", "voice-speak",
+            "approve", "deny",
         ),
         help=argparse.SUPPRESS,
     )
@@ -1260,7 +1114,6 @@ def build_context(
         skills=skills,
         gateway=start_gateway(config=config, store=store),
         agent_id=agent_id,
-        agent_name=_load_agent_name(),
         tool_allowlist=tool_allowlist,
         route_key=_session_route_key(store, session_info.id),
         config_path=config_path,
@@ -1409,7 +1262,6 @@ def _run_prompt_turn(
                 search_roots=[str(root) for root in ctx.search_roots],
                 user_prompt=agent_prompt,
                 user_visible_prompt=prompt,
-                agent_name=_agent_display_name(ctx),
                 session=ctx.session,
                 stored_context=ctx.stored_context,
                 conversation_history=conversation_history,
@@ -1566,15 +1418,15 @@ def _cli_approval_requester(request: dict[str, Any]) -> str:
 
 
 def repl(ctx: AppContext) -> int:
-    print(f"{_agent_display_name(ctx)} started.")
+    print("Agent started.")
     print(f"Session: {ctx.session_id}")
-    print("Type '/exit' to quit. Tip: use /name to change your agent name.")
+    print("Type '/exit' to quit.")
     print()
 
     try:
         while True:
             try:
-                user_input = input(f"{_prompt_agent_label(ctx)}> ").strip()
+                user_input = input("agent> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0
@@ -1791,8 +1643,6 @@ def _dispatch_local_command(
         return None
     if text == "/":
         return _slash_help_text()
-    if text.casefold().startswith("/name "):
-        return _set_agent_name_command(ctx, _unquote_agent_name_argument(text[6:]))
     try:
         parts = shlex.split(text)
     except ValueError as exc:
@@ -1836,11 +1686,6 @@ def _dispatch_local_command(
                     secret_provider=normalized,
                 )
         return _set_provider_api_key(ctx, provider, api_key)
-
-    if command == "/name":
-        if len(parts) == 1:
-            return f"Agent name: {getattr(ctx, 'agent_name', DEFAULT_AGENT_NAME)}\nChange it with: /name <new name>"
-        return _set_agent_name_command(ctx, " ".join(parts[1:]))
 
     if command in {"/models", "/model"} and len(parts) == 1:
         return _models_text(ctx)
@@ -3558,33 +3403,8 @@ def _model_source_label(provider: str) -> str:
     return PROVIDER_DISPLAY_NAMES.get(provider, provider)
 
 
-def _agent_display_name(ctx: Any) -> str:
-    return str(getattr(ctx, "agent_name", DEFAULT_AGENT_NAME) or DEFAULT_AGENT_NAME)
-
-
-def _prompt_agent_label(ctx: Any) -> str:
-    label = _agent_display_name(ctx).strip().casefold().replace(" ", "-")
-    return truncate(label or "agent", 18)
-
-
-def _unquote_agent_name_argument(value: str) -> str:
-    name = value.strip()
-    if len(name) >= 2 and name[0] == name[-1] and name[0] in {"'", '"'}:
-        return name[1:-1]
-    return name
-
-
-def _set_agent_name_command(ctx: Any, raw_name: str) -> str:
-    try:
-        agent_name = _persist_agent_name(raw_name)
-    except ValueError as exc:
-        return str(exc)
-    ctx.agent_name = agent_name
-    return f"Okay, my name is now {agent_name}."
-
-
 def _status_text(ctx: AppContext) -> str:
-    lines = ["Status", "", "Agent:", _agent_display_name(ctx), "", "Session:", str(ctx.session_id), ""]
+    lines = ["Status", "", "Session:", str(ctx.session_id), ""]
     lines.extend(_status_context_lines(ctx))
     return "\n".join(lines)
 
@@ -4192,12 +4012,6 @@ def run_tui(ctx: AppContext) -> int:
         "--session-id",
         ctx.session_id,
     ]
-    for key in _load_tui_paste_keys():
-        command.extend(["--paste-key", key])
-    for key in _load_tui_copy_keys():
-        command.extend(["--copy-key", key])
-    if _load_tui_mouse_capture():
-        command.append("--mouse-capture")
     env = os.environ.copy()
     store_db_path = getattr(getattr(ctx, "store", None), "db_path", None)
     if store_db_path is not None:
@@ -4279,13 +4093,6 @@ def _run_tui_stream_submit(ctx: AppContext, prompt: str) -> int:
                 )
             else:
                 _record_local_command_exchange(ctx, prompt, answer)
-            if os.environ.get("AGENT_TTS_ENABLED") == "1" and answer:
-                try:
-                    from .voice import speak
-                    import threading as _threading
-                    _threading.Thread(target=speak, args=(answer,), daemon=True).start()
-                except Exception:
-                    pass
             _bridge_emit({
                 "kind": "final",
                 "ok": True,
@@ -4379,15 +4186,6 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
             else:
                 decision = "approved" if args.tui_bridge == "approve" else "denied"
                 payload = _tui_bridge_apply_approval_decision(ctx, request_id, decision)
-        elif args.tui_bridge == "voice-record":
-            from .voice import bridge_voice_record
-            payload = bridge_voice_record()
-            payload["ok"] = payload.get("ok", False)
-        elif args.tui_bridge == "voice-speak":
-            from .voice import bridge_voice_speak
-            text = (args.bridge_prompt or "").strip()
-            payload = bridge_voice_speak(text)
-            payload["ok"] = payload.get("ok", False)
         elif args.tui_bridge == "stream-submit":
             prompt = (args.bridge_prompt or "").strip()
             return _run_tui_stream_submit(ctx, prompt)
@@ -4432,7 +4230,6 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             "title": session.title,
             "workspace_root": session.workspace_root,
             "updated_at": session.updated_at,
-            "agent_name": _agent_display_name(ctx),
             "provider": _active_provider(ctx),
             "model": ctx.llm.model,
             "mode": _llm_mode(ctx),
@@ -4708,7 +4505,6 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             messages,
             live_turn.snapshot(),
             max(20, content_width - 2),
-            agent_name=_agent_display_name(ctx),
         )
         palette_entries = [] if secret_provider else _slash_palette_entries(prompt)
         if palette_entries:
@@ -4773,7 +4569,7 @@ def _run_tui(stdscr: Any, ctx: AppContext) -> None:
             input_y,
             width,
             "*" * len(secret_value) if secret_provider else prompt,
-            label=f" {secret_provider} key> " if secret_provider else f" {_prompt_agent_label(ctx)}> ",
+            label=f" {secret_provider} key> " if secret_provider else " agent> ",
         )
         stdscr.refresh()
 
@@ -5039,7 +4835,7 @@ def _has_tui_colors() -> bool:
 
 def _draw_header(stdscr: Any, ctx: AppContext, width: int) -> None:
     root_budget = max(12, width - 58)
-    title = f" {_agent_display_name(ctx)} "
+    title = " agent "
     detail = (
         f"session {ctx.session_id}  source {_model_source_label(_active_provider(ctx))}  model {ctx.llm.model}  "
         f"root {truncate(str(ctx.workspace_root), root_budget)}"
@@ -5155,13 +4951,13 @@ def _slash_palette_entries(prompt: str, *, ctx: Any | None = None) -> list[Palet
 
 
 def _slash_command_complete_to(name: str) -> str:
-    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/name", "/install", "/reasoning", "/setup"}:
+    if name in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install", "/reasoning", "/setup"}:
         return f"{name} "
     return name
 
 
 def _slash_command_executes(name: str) -> bool:
-    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/name", "/install", "/reasoning", "/setup"}
+    return name not in PROVIDER_ARGUMENT_COMMANDS | {"/model", "/install", "/reasoning", "/setup"}
 
 
 def _is_setup_palette_prompt(prompt: str, parts: list[str]) -> bool:
@@ -5745,13 +5541,7 @@ def _draw_input_line(
     stdscr.move(y, cursor_x)
 
 
-def _render_tui_transcript(
-    messages: list[Any],
-    live_turn: dict[str, Any],
-    width: int,
-    *,
-    agent_name: str = DEFAULT_AGENT_NAME,
-) -> list[str]:
+def _render_tui_transcript(messages: list[Any], live_turn: dict[str, Any], width: int) -> list[str]:
     active = bool(live_turn.get("active"))
     error = live_turn.get("error")
     prompt = live_turn.get("prompt", "")
@@ -5765,11 +5555,7 @@ def _render_tui_transcript(
         ):
             visible_messages = visible_messages[:-1]
 
-    lines = (
-        _render_messages(visible_messages, width, agent_name=agent_name)
-        if visible_messages
-        else []
-    )
+    lines = _render_messages(visible_messages, width) if visible_messages else []
     has_recent_subagents = any(
         isinstance(item, (list, tuple))
         and len(item) == 2
@@ -5777,7 +5563,7 @@ def _render_tui_transcript(
         for item in live_turn.get("feed", [])
     )
     live_lines = (
-        _render_live_turn(live_turn, width, agent_name=agent_name)
+        _render_live_turn(live_turn, width)
         if active or error or has_recent_subagents
         else []
     )
@@ -5791,15 +5577,10 @@ def _render_tui_transcript(
     return ["No messages yet."]
 
 
-def _render_messages(
-    messages: list[Any],
-    width: int,
-    *,
-    agent_name: str = DEFAULT_AGENT_NAME,
-) -> list[str]:
+def _render_messages(messages: list[Any], width: int) -> list[str]:
     lines: list[str] = []
     for message in messages:
-        speaker = "You" if message.role == "user" else agent_name if message.role == "assistant" else message.role.title()
+        speaker = "You" if message.role == "user" else "Agent" if message.role == "assistant" else message.role.title()
         lines.append(f"{speaker}  {message.created_at}")
         body = message.content.strip() or "<empty>"
         for paragraph in body.splitlines() or [""]:
@@ -5823,12 +5604,7 @@ def _render_messages(
     return lines or ["No messages yet."]
 
 
-def _render_live_turn(
-    live_turn: dict[str, Any],
-    width: int,
-    *,
-    agent_name: str = DEFAULT_AGENT_NAME,
-) -> list[str]:
+def _render_live_turn(live_turn: dict[str, Any], width: int) -> list[str]:
     phase = live_turn.get("phase")
     feed = live_turn.get("feed", [])
     active = live_turn.get("active", False)
@@ -5842,7 +5618,7 @@ def _render_live_turn(
         lines.append(f"You")
         lines.extend(_wrap_lines(prompt, width, indent="  "))
         lines.append("")
-        lines.append(agent_name)
+        lines.append("Agent")
 
     prev_kind: str | None = None
     for kind, content in feed:

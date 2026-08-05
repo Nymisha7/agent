@@ -485,15 +485,6 @@ struct TuiArgs {
     #[arg(long)]
     session_id: String,
 
-    #[arg(long = "paste-key", hide = true)]
-    paste_keys: Vec<String>,
-
-    #[arg(long = "copy-key", hide = true)]
-    copy_keys: Vec<String>,
-
-    #[arg(long, hide = true)]
-    mouse_capture: bool,
-
     /// API keys entered in the masked TUI prompt. They are forwarded to bridge
     /// children, which save them in the user's private Agent credential store.
     #[arg(skip)]
@@ -887,7 +878,6 @@ struct AttachmentPreview {
 #[derive(Debug)]
 enum AppEvent {
     StreamFrame(Result<BridgeStreamFrame>),
-    VoiceResult(Result<String>),
 }
 
 struct TranscriptCache {
@@ -897,7 +887,6 @@ struct TranscriptCache {
     requested_scroll: u16,
     paragraph: Paragraph<'static>,
     attachment_hit_areas: Vec<AttachmentHitArea>,
-    selection_lines: Vec<String>,
 }
 
 struct TuiApp {
@@ -931,38 +920,6 @@ struct TuiApp {
     notices: VecDeque<UiNotice>,
     setup_required: bool,
     gateway_view: Option<GatewayViewState>,
-    paste_keys: Vec<PasteKey>,
-    copy_keys: Vec<PasteKey>,
-    mouse_capture: bool,
-    transcript_drag_start: Option<SelectionPoint>,
-    transcript_selection: Option<TranscriptSelection>,
-    voice_recording: bool,
-    mic_button_area: Option<Rect>,
-    tts_enabled: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SelectionPoint {
-    row: usize,
-    col: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TranscriptSelection {
-    start: SelectionPoint,
-    end: SelectionPoint,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PasteKey {
-    code: PasteKeyCode,
-    modifiers: KeyModifiers,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PasteKeyCode {
-    Char(char),
-    Insert,
 }
 
 const GATEWAY_TABS: [&str; 6] = [
@@ -1383,15 +1340,14 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    if args.mouse_capture {
-        execute!(stdout, EnableMouseCapture)?;
-    }
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let paste_keys = parse_paste_keys(&args.paste_keys);
-    let copy_keys = parse_paste_keys(&args.copy_keys);
-    let mouse_capture = args.mouse_capture;
 
     let result = run_tui_loop(
         &mut terminal,
@@ -1428,24 +1384,14 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
             notices: initial_notices.into(),
             setup_required: initial_needs_setup,
             gateway_view: None,
-            paste_keys,
-            copy_keys,
-            mouse_capture,
-            transcript_drag_start: None,
-            transcript_selection: None,
-            voice_recording: false,
-            mic_button_area: None,
-            tts_enabled: std::env::var("AGENT_TTS_ENABLED").as_deref() == Ok("1"),
         },
     );
 
     disable_raw_mode()?;
-    if mouse_capture {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -1500,29 +1446,6 @@ fn run_tui_loop(
             Event::Key(key) => key,
             Event::Mouse(mouse) => {
                 match mouse.kind {
-                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                        if app.snapshot.approvals.is_empty()
-                            && app.attachment_preview.is_none()
-                            && app.gateway_view.is_none()
-                            && transcript_point_for_mouse(&app, mouse.column, mouse.row)
-                                .is_some()
-                            && !app.attachment_hit_areas.iter().any(|target| {
-                                mouse_in_rect(mouse.column, mouse.row, target.area)
-                            }) =>
-                    {
-                        start_transcript_selection(&mut app, mouse.column, mouse.row);
-                    }
-                    MouseEventKind::Drag(crossterm::event::MouseButton::Left)
-                        if app.transcript_drag_start.is_some() =>
-                    {
-                        update_transcript_selection(&mut app, mouse.column, mouse.row);
-                    }
-                    MouseEventKind::Up(crossterm::event::MouseButton::Left)
-                        if app.transcript_drag_start.is_some() =>
-                    {
-                        update_transcript_selection(&mut app, mouse.column, mouse.row);
-                        copy_transcript_selection_to_clipboard(&mut app);
-                    }
                     MouseEventKind::ScrollUp => scroll_active_view(&mut app, false),
                     MouseEventKind::ScrollDown => scroll_active_view(&mut app, true),
                     MouseEventKind::Down(crossterm::event::MouseButton::Left)
@@ -1544,17 +1467,6 @@ fn run_tui_loop(
                             }) =>
                     {
                         open_attachment_picker(&runtime, &args, &tx, &mut app);
-                    }
-                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                        if app.secret_provider.is_none()
-                            && app.snapshot.approvals.is_empty()
-                            && app.attachment_preview.is_none()
-                            && !app.submitting
-                            && app.mic_button_area.is_some_and(|area| {
-                                mouse_in_rect(mouse.column, mouse.row, area)
-                            }) =>
-                    {
-                        start_voice_recording(&runtime, &args, &tx, &mut app);
                     }
                     _ => {}
                 }
@@ -1731,13 +1643,6 @@ fn run_tui_loop(
             KeyCode::F(4) if app.secret_provider.is_none() && app.snapshot.approvals.is_empty() => {
                 open_attachment_picker(&runtime, &args, &tx, &mut app);
             }
-            KeyCode::F(5)
-                if app.secret_provider.is_none()
-                    && app.snapshot.approvals.is_empty()
-                    && !app.submitting =>
-            {
-                start_voice_recording(&runtime, &args, &tx, &mut app);
-            }
             KeyCode::Char('o')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && app.secret_provider.is_none()
@@ -1745,11 +1650,8 @@ fn run_tui_loop(
             {
                 open_attachment_picker(&runtime, &args, &tx, &mut app);
             }
-            code if is_clipboard_paste_shortcut(&code, key.modifiers, &app.paste_keys) => {
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 paste_clipboard_into_composer(&runtime, &args, &tx, &mut app);
-            }
-            code if is_clipboard_paste_shortcut(&code, key.modifiers, &app.copy_keys) => {
-                copy_latest_response_to_clipboard(&mut app);
             }
             KeyCode::Backspace => {
                 if app.secret_provider.is_some() {
@@ -2011,101 +1913,6 @@ fn mouse_in_rect(column: u16, row: u16, area: Rect) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
-fn transcript_point_for_mouse(app: &TuiApp, column: u16, row: u16) -> Option<SelectionPoint> {
-    let cache = app.transcript_cache.as_ref()?;
-    let inner_x = cache.area.x.saturating_add(1);
-    let inner_y = cache.area.y.saturating_add(1);
-    let inner_width = cache.area.width.saturating_sub(2);
-    let inner_height = cache.area.height.saturating_sub(2);
-    if column < inner_x
-        || row < inner_y
-        || column >= inner_x.saturating_add(inner_width)
-        || row >= inner_y.saturating_add(inner_height)
-    {
-        return None;
-    }
-    Some(SelectionPoint {
-        row: row.saturating_sub(inner_y) as usize,
-        col: column.saturating_sub(inner_x) as usize,
-    })
-}
-
-fn start_transcript_selection(app: &mut TuiApp, column: u16, row: u16) {
-    let Some(point) = transcript_point_for_mouse(app, column, row) else {
-        return;
-    };
-    app.transcript_drag_start = Some(point);
-    app.transcript_selection = Some(TranscriptSelection {
-        start: point,
-        end: point,
-    });
-    app.status = String::from("Selecting transcript text...");
-}
-
-fn update_transcript_selection(app: &mut TuiApp, column: u16, row: u16) {
-    let Some(start) = app.transcript_drag_start else {
-        return;
-    };
-    let Some(end) = transcript_point_for_mouse(app, column, row) else {
-        return;
-    };
-    app.transcript_selection = Some(TranscriptSelection { start, end });
-}
-
-fn copy_transcript_selection_to_clipboard(app: &mut TuiApp) {
-    let selected = app
-        .transcript_selection
-        .and_then(|selection| selected_transcript_text(app, selection));
-    app.transcript_drag_start = None;
-    app.transcript_selection = None;
-    let Some(text) = selected.filter(|text| !text.trim().is_empty()) else {
-        app.status = String::from("No transcript text selected");
-        return;
-    };
-    copy_text_to_clipboard(app, &text, "Copied selected transcript text to clipboard");
-}
-
-fn selected_transcript_text(app: &TuiApp, selection: TranscriptSelection) -> Option<String> {
-    if selection.start == selection.end {
-        return None;
-    }
-    let lines = &app.transcript_cache.as_ref()?.selection_lines;
-    if lines.is_empty() {
-        return None;
-    }
-    let (start, end) = normalized_selection(selection);
-    let start_row = start.row.min(lines.len().saturating_sub(1));
-    let end_row = end.row.min(lines.len().saturating_sub(1));
-    let mut selected = Vec::new();
-    for row in start_row..=end_row {
-        let line = &lines[row];
-        let start_col = if row == start_row { start.col } else { 0 };
-        let end_col = if row == end_row {
-            end.col.saturating_add(1)
-        } else {
-            line.chars().count()
-        };
-        selected.push(slice_chars(line, start_col, end_col));
-    }
-    Some(selected.join("\n"))
-}
-
-fn normalized_selection(selection: TranscriptSelection) -> (SelectionPoint, SelectionPoint) {
-    if (selection.start.row, selection.start.col) <= (selection.end.row, selection.end.col) {
-        (selection.start, selection.end)
-    } else {
-        (selection.end, selection.start)
-    }
-}
-
-fn slice_chars(value: &str, start: usize, end: usize) -> String {
-    value
-        .chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
-}
-
 fn insert_composer_paste(app: &mut TuiApp, text: &str) {
     if text.is_empty() {
         return;
@@ -2115,65 +1922,6 @@ fn insert_composer_paste(app: &mut TuiApp, text: &str) {
     } else {
         app.input.push_str(text);
         app.status = String::from("Pasted text — review and press Enter to send");
-    }
-}
-
-fn parse_paste_keys(raw_keys: &[String]) -> Vec<PasteKey> {
-    raw_keys
-        .iter()
-        .filter_map(|raw| parse_paste_key(raw))
-        .collect()
-}
-
-fn parse_paste_key(raw: &str) -> Option<PasteKey> {
-    let mut modifiers = KeyModifiers::empty();
-    let mut key_name: Option<String> = None;
-    for part in raw.split('+') {
-        let token = part.trim().to_ascii_lowercase();
-        if token.is_empty() {
-            continue;
-        }
-        match token.as_str() {
-            "ctrl" | "control" => modifiers.insert(KeyModifiers::CONTROL),
-            "shift" => modifiers.insert(KeyModifiers::SHIFT),
-            "alt" | "option" | "meta" => modifiers.insert(KeyModifiers::ALT),
-            "super" | "cmd" | "command" => modifiers.insert(KeyModifiers::SUPER),
-            _ => key_name = Some(token),
-        }
-    }
-    if modifiers.is_empty() {
-        return None;
-    }
-    let code = match key_name.as_deref()? {
-        "insert" | "ins" => PasteKeyCode::Insert,
-        key if key.chars().count() == 1 => {
-            PasteKeyCode::Char(key.chars().next()?.to_ascii_lowercase())
-        }
-        _ => return None,
-    };
-    Some(PasteKey { code, modifiers })
-}
-
-fn is_clipboard_paste_shortcut(
-    code: &KeyCode,
-    modifiers: KeyModifiers,
-    paste_keys: &[PasteKey],
-) -> bool {
-    paste_keys
-        .iter()
-        .any(|binding| paste_key_matches(binding, code, modifiers))
-}
-
-fn paste_key_matches(binding: &PasteKey, code: &KeyCode, modifiers: KeyModifiers) -> bool {
-    if !modifiers.contains(binding.modifiers) {
-        return false;
-    }
-    match (&binding.code, code) {
-        (PasteKeyCode::Char(expected), KeyCode::Char(actual)) => {
-            actual.eq_ignore_ascii_case(expected)
-        }
-        (PasteKeyCode::Insert, KeyCode::Insert) => true,
-        _ => false,
     }
 }
 
@@ -2295,27 +2043,6 @@ fn open_preview_in_system_viewer(app: &mut TuiApp) {
     }
 }
 
-fn start_voice_recording(
-    runtime: &RuntimeHandle,
-    args: &Arc<TuiArgs>,
-    tx: &mpsc::Sender<AppEvent>,
-    app: &mut TuiApp,
-) {
-    if app.voice_recording {
-        return;
-    }
-    app.voice_recording = true;
-    app.status = String::from("Listening… speak now");
-    invalidate_transcript(app);
-    let tx_clone = tx.clone();
-    let args_clone = Arc::clone(args);
-    runtime.spawn(async move {
-        let result = call_bridge_async(args_clone.as_ref(), "voice-record", None).await;
-        let voice_result = result.map(|response| response.answer.unwrap_or_default());
-        let _ = tx_clone.send(AppEvent::VoiceResult(voice_result));
-    });
-}
-
 fn open_attachment_picker(
     runtime: &RuntimeHandle,
     args: &Arc<TuiArgs>,
@@ -2365,11 +2092,7 @@ fn paste_clipboard_into_composer(
     tx: &mpsc::Sender<AppEvent>,
     app: &mut TuiApp,
 ) {
-    if !app.snapshot.approvals.is_empty() {
-        return;
-    }
-    if app.secret_provider.is_some() {
-        paste_clipboard_text(app);
+    if app.secret_provider.is_some() || !app.snapshot.approvals.is_empty() {
         return;
     }
     if app.submitting || bridge_process_active(app) {
@@ -2419,57 +2142,12 @@ fn paste_clipboard_text(app: &mut TuiApp) -> bool {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            if app.secret_provider.is_some() {
-                app.secret_input.push_str(text);
-                app.status = String::from("Pasted text into the hidden field");
-            } else {
-                app.input.push_str(text);
-                app.status = String::from("Pasted text from the clipboard");
-            }
+            app.input.push_str(text);
+            app.status = String::from("Pasted text from the clipboard");
             return true;
         }
     }
     false
-}
-
-fn copy_latest_response_to_clipboard(app: &mut TuiApp) {
-    let Some(text) = latest_assistant_response_text(app) else {
-        app.status = String::from("No assistant response to copy yet");
-        return;
-    };
-    copy_text_to_clipboard(app, &text, "Copied latest response to clipboard");
-}
-
-fn copy_text_to_clipboard(app: &mut TuiApp, text: &str, success_status: &str) {
-    match desktop_action("clipboard_write", None, Some(text), None, None) {
-        Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
-            app.status = String::from(success_status);
-        }
-        Ok(value) => {
-            let guidance = value
-                .get("guidance")
-                .or_else(|| value.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or("Clipboard copy failed");
-            app.status = format!("Copy failed: {}", clip_status(guidance, 72));
-        }
-        Err(err) => {
-            app.status = format!("Copy failed: {}", clip_status(&err.to_string(), 72));
-        }
-    }
-}
-
-fn latest_assistant_response_text(app: &TuiApp) -> Option<String> {
-    let streaming = app.streaming_text.trim();
-    if !streaming.is_empty() {
-        return Some(streaming.to_string());
-    }
-    app.snapshot
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "assistant" && !message.content.trim().is_empty())
-        .map(|message| message.content.trim().to_string())
 }
 
 fn request_active_stop(app: &mut TuiApp) {
@@ -2666,7 +2344,6 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                     app.secret_provider.is_some(),
                     !app.snapshot.approvals.is_empty(),
                     app.submitting,
-                    app.mouse_capture,
                 )
             ),
             Style::default().fg(Color::DarkGray),
@@ -2721,17 +2398,11 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         height: composer_area.height.saturating_sub(2),
     };
     let attachment_width = 4;
-    let mic_width = 4u16;
-    let [attachment_area, mic_area, input_area] = Layout::default()
+    let [attachment_area, input_area] = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(attachment_width),
-            Constraint::Length(mic_width),
-            Constraint::Min(12),
-        ])
+        .constraints([Constraint::Length(attachment_width), Constraint::Min(12)])
         .areas(composer_inner);
     app.attachment_button_area = Some(attachment_area);
-    app.mic_button_area = Some(mic_area);
 
     frame.render_widget(
         Block::default()
@@ -2786,11 +2457,6 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         Paragraph::new(attachment_button_text(controls_enabled))
             .alignment(ratatui::layout::Alignment::Center),
         attachment_area,
-    );
-    frame.render_widget(
-        Paragraph::new(mic_button_text(controls_enabled, app.voice_recording))
-            .alignment(ratatui::layout::Alignment::Center),
-        mic_area,
     );
     if palette_is_open(app) {
         let query = palette_context(&app.input)
@@ -2911,36 +2577,15 @@ fn attachment_button_text(enabled: bool) -> Text<'static> {
     )))
 }
 
-fn mic_button_text(enabled: bool, recording: bool) -> Text<'static> {
-    let (icon, color) = if recording {
-        ("⏺", Color::Red)
-    } else if enabled {
-        ("🎤", Color::Cyan)
-    } else {
-        ("🎤", Color::DarkGray)
-    };
-    Text::from(Line::from(Span::styled(
-        icon,
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )))
-}
-
-fn footer_help_text(
-    auth_active: bool,
-    approval_active: bool,
-    submitting: bool,
-    mouse_capture: bool,
-) -> &'static str {
+fn footer_help_text(auth_active: bool, approval_active: bool, submitting: bool) -> &'static str {
     if auth_active {
         "Enter save key  Esc cancel  input hidden"
     } else if approval_active {
         "Enter/Y approve  N/Esc deny  Ctrl+N/P select"
     } else if submitting {
         "Esc/Ctrl+C stop  Enter queue  End follow"
-    } else if mouse_capture {
-        "Enter send  click +/Ctrl+O/F4  Ctrl+V paste  Alt+C copy  / commands"
     } else {
-        "Enter send  Ctrl+O/F4 attach  Ctrl+V paste  Alt+C copy  / commands"
+        "Enter send  click +/Ctrl+O/F4  Ctrl+V paste  / commands  Esc close"
     }
 }
 
@@ -3572,7 +3217,6 @@ fn render_transcript(
             .scroll((scroll, 0));
         let attachment_hit_areas =
             transcript_attachment_hit_areas(&lines, &app.snapshot, area, scroll);
-        let selection_lines = transcript_visible_plain_lines(&lines, area, scroll);
         app.transcript_cache = Some(TranscriptCache {
             show_inline_activity,
             area,
@@ -3580,7 +3224,6 @@ fn render_transcript(
             requested_scroll: app.scroll,
             paragraph,
             attachment_hit_areas,
-            selection_lines,
         });
     }
 
@@ -3589,42 +3232,6 @@ fn render_transcript(
         app.attachment_hit_areas
             .extend(cache.attachment_hit_areas.iter().cloned());
     }
-}
-
-fn transcript_visible_plain_lines(lines: &Text<'_>, area: Rect, scroll: u16) -> Vec<String> {
-    let width = area.width.saturating_sub(2) as usize;
-    let height = area.height.saturating_sub(2) as usize;
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
-    let wrapped: Vec<String> = lines
-        .lines
-        .iter()
-        .flat_map(|line| wrap_plain_line(&line_to_plain_text(line), width))
-        .collect();
-    wrapped
-        .into_iter()
-        .skip(scroll as usize)
-        .take(height)
-        .collect()
-}
-
-fn line_to_plain_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>()
-}
-
-fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
-    if line.is_empty() {
-        return vec![String::new()];
-    }
-    let chars: Vec<char> = line.chars().collect();
-    chars
-        .chunks(width.max(1))
-        .map(|chunk| chunk.iter().collect())
-        .collect()
 }
 
 fn transcript_attachment_hit_areas(
@@ -5149,22 +4756,6 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             push_notice(app, "Bridge failed", &err.to_string(), true);
             app.status = String::from("Error — details shown in conversation");
         }
-        AppEvent::VoiceResult(Ok(text)) => {
-            app.voice_recording = false;
-            invalidate_transcript(app);
-            let trimmed = text.trim().to_string();
-            if trimmed.is_empty() {
-                app.status = String::from("No speech detected — try again with F5");
-            } else {
-                app.input = trimmed;
-                app.status = String::from("Voice transcribed — press Enter to send");
-            }
-        }
-        AppEvent::VoiceResult(Err(err)) => {
-            app.voice_recording = false;
-            invalidate_transcript(app);
-            app.status = format!("Voice error: {}", clip_status(&err.to_string(), 72));
-        }
     }
 }
 
@@ -5881,9 +5472,6 @@ mod tui_lifecycle_tests {
             python: String::from("python3"),
             repo_root: PathBuf::from("."),
             session_id: String::from("session-1"),
-            paste_keys: Vec::new(),
-            copy_keys: Vec::new(),
-            mouse_capture: false,
             api_keys: Arc::new(Mutex::new(HashMap::new())),
         };
         let (tx, _rx) = mpsc::channel();
@@ -6056,19 +5644,6 @@ mod tui_tests {
             notices: VecDeque::new(),
             setup_required: false,
             gateway_view: None,
-            paste_keys: parse_paste_keys(&[
-                String::from("ctrl+v"),
-                String::from("ctrl+shift+v"),
-                String::from("shift+insert"),
-                String::from("alt+v"),
-            ]),
-            copy_keys: parse_paste_keys(&[String::from("alt+c"), String::from("ctrl+y")]),
-            mouse_capture: false,
-            transcript_drag_start: None,
-            transcript_selection: None,
-            voice_recording: false,
-            mic_button_area: None,
-            tts_enabled: false,
         }
     }
 
@@ -6876,118 +6451,19 @@ mod tui_tests {
     #[test]
     fn approval_controls_take_priority_while_agent_is_waiting() {
         assert_eq!(
-            footer_help_text(false, true, true, false),
+            footer_help_text(false, true, true),
             "Enter/Y approve  N/Esc deny  Ctrl+N/P select"
         );
     }
 
     #[test]
-    fn attachment_control_is_icon_with_keyboard_shortcut_in_footer() {
+    fn attachment_control_is_icon_click_target_with_keyboard_shortcut_in_footer() {
         let text = rendered_text(&attachment_button_text(true));
 
         assert!(text.contains("+"));
         assert!(!text.contains("Add file"));
         assert!(!text.contains("F4"));
-        assert!(footer_help_text(false, false, false, false).contains("Ctrl+O/F4 attach"));
-        assert!(footer_help_text(false, false, false, false).contains("Alt+C copy"));
-        assert!(!footer_help_text(false, false, false, false).contains("click +"));
-        assert!(footer_help_text(false, false, false, true).contains("click +/Ctrl+O/F4"));
-    }
-
-    #[test]
-    fn paste_shortcuts_include_shifted_terminal_variants() {
-        let paste_keys = parse_paste_keys(&[
-            String::from("ctrl+v"),
-            String::from("ctrl+shift+v"),
-            String::from("shift+insert"),
-            String::from("alt+v"),
-        ]);
-        assert!(is_clipboard_paste_shortcut(
-            &KeyCode::Char('v'),
-            KeyModifiers::CONTROL,
-            &paste_keys,
-        ));
-        assert!(is_clipboard_paste_shortcut(
-            &KeyCode::Char('V'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-            &paste_keys,
-        ));
-        assert!(is_clipboard_paste_shortcut(
-            &KeyCode::Insert,
-            KeyModifiers::SHIFT,
-            &paste_keys,
-        ));
-        assert!(is_clipboard_paste_shortcut(
-            &KeyCode::Char('v'),
-            KeyModifiers::ALT,
-            &paste_keys,
-        ));
-        assert!(!is_clipboard_paste_shortcut(
-            &KeyCode::Char('v'),
-            KeyModifiers::empty(),
-            &paste_keys,
-        ));
-    }
-
-    #[test]
-    fn bracketed_paste_goes_into_hidden_secret_field() {
-        let mut app = test_app();
-        app.secret_provider = Some(String::from("openai"));
-
-        insert_composer_paste(&mut app, "sk-test");
-
-        assert_eq!(app.secret_input, "sk-test");
-        assert!(app.input.is_empty());
-    }
-
-    #[test]
-    fn latest_assistant_response_prefers_streaming_text_for_copy() {
-        let mut app = test_app();
-        app.snapshot.messages.push(BridgeMessage {
-            role: String::from("assistant"),
-            content: String::from("completed answer"),
-            created_at: String::from("now"),
-            attachments: Vec::new(),
-        });
-
-        assert_eq!(
-            latest_assistant_response_text(&app).as_deref(),
-            Some("completed answer")
-        );
-
-        app.streaming_text = String::from("live answer");
-
-        assert_eq!(
-            latest_assistant_response_text(&app).as_deref(),
-            Some("live answer")
-        );
-    }
-
-    #[test]
-    fn transcript_selection_extracts_visible_text_range() {
-        let mut app = test_app();
-        app.transcript_cache = Some(TranscriptCache {
-            show_inline_activity: true,
-            area: Rect::new(0, 0, 40, 6),
-            auto_follow: true,
-            requested_scroll: 0,
-            paragraph: Paragraph::new(""),
-            attachment_hit_areas: Vec::new(),
-            selection_lines: vec![
-                String::from("first visible line"),
-                String::from("second visible line"),
-            ],
-        });
-
-        let selected = selected_transcript_text(
-            &app,
-            TranscriptSelection {
-                start: SelectionPoint { row: 0, col: 6 },
-                end: SelectionPoint { row: 1, col: 5 },
-            },
-        );
-
-        assert_eq!(selected.as_deref(), Some("visible line\nsecond"));
+        assert!(footer_help_text(false, false, false).contains("click +/Ctrl+O/F4"));
     }
 
     #[test]
