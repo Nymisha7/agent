@@ -150,8 +150,7 @@ install_with_pipx() {
     ensure_rust
   fi
   python3 -m pipx install --force "$package_source"
-  echo "Installed. If 'nym' is not on PATH yet, restart the shell or run:"
-  echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+  echo "Installed."
 }
 
 install_with_venv() {
@@ -236,5 +235,20 @@ case "$INSTALL_MODE" in
     ;;
 esac
 
+ensure_path() {
+  local shell_rc
+  case "${SHELL:-}" in
+    */zsh) shell_rc="$HOME/.zshrc" ;;
+    *)     shell_rc="$HOME/.bashrc" ;;
+  esac
+  local line='export PATH="$HOME/.local/bin:$PATH"'
+  if ! grep -qF 'local/bin' "$shell_rc" 2>/dev/null; then
+    echo "$line" >> "$shell_rc"
+    echo "Added \$HOME/.local/bin to PATH in $shell_rc"
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
+}
+
+ensure_path
 configure_agent_name
 echo "Run: nym --tui"
