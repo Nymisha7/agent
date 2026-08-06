@@ -347,13 +347,17 @@ class TuiRenderingTests(unittest.TestCase):
             ])
             stdout = io.StringIO()
 
-            with redirect_stdout(stdout):
+            with (
+                patch.dict("os.environ", {"NYM_AGENT_NAME": "Nymi"}, clear=False),
+                redirect_stdout(stdout),
+            ):
                 exit_code = _run_tui_bridge(args, store)
 
             payload = json.loads(stdout.getvalue())
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["snapshot"]["agent_name"], "Nymi")
         self.assertEqual(
             [item["role"] for item in payload["snapshot"]["messages"]],
             ["user", "assistant"],

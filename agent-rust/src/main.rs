@@ -6545,6 +6545,23 @@ mod tui_tests {
     }
 
     #[test]
+    fn assistant_headers_use_configured_agent_name() {
+        let mut app = test_app();
+        app.snapshot.agent_name = String::from("Nymi");
+        app.snapshot.messages.push(BridgeMessage {
+            role: String::from("assistant"),
+            content: String::from("Ready."),
+            created_at: String::from("now"),
+            attachments: Vec::new(),
+        });
+
+        let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
+
+        assert!(rendered.contains("Nymi"));
+        assert!(!rendered.contains("AGENT"));
+    }
+
+    #[test]
     fn successful_configured_turn_clears_stale_error_notice() {
         let mut app = test_app();
         push_notice(
