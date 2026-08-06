@@ -176,6 +176,34 @@ class VoiceTests(unittest.TestCase):
                 "wss://voice.example/realtime",
             )
 
+    def test_realtime_connect_url_sends_realtime_bearer_token(self) -> None:
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"connect_url": "wss://voice.example/realtime"}'
+
+        def urlopen(request: object, timeout: int = 0) -> Response:
+            self.assertEqual(timeout, 15)
+            self.assertEqual(request.get_header("Authorization"), "Bearer hf-secret")
+            return Response()
+
+        with patch("agent.voice.urllib.request.urlopen", side_effect=urlopen):
+            self.assertEqual(
+                _realtime_connect_url("https://voice.example", api_key="hf-secret"),
+                "wss://voice.example/realtime",
+            )
+
+    def test_realtime_voice_api_key_uses_huggingface_token_environment(self) -> None:
+        with patch.dict("os.environ", {"HF_TOKEN": "hf-secret"}, clear=True):
+            config = VoiceConfig.from_environment()
+
+        self.assertEqual(config.realtime_api_key, "hf-secret")
+
     def test_realtime_connect_url_accepts_direct_websocket(self) -> None:
         self.assertEqual(
             _realtime_connect_url("wss://voice.example/realtime"),

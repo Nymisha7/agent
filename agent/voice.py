@@ -75,6 +75,7 @@ class VoiceConfig:
     realtime_url: str | None
     realtime_session_update: dict[str, object] | None
     realtime_timeout_seconds: int
+    realtime_api_key: str | None
     api_key: str | None
     base_url: str | None
     stt_model: str
@@ -107,6 +108,7 @@ class VoiceConfig:
                 minimum=5,
                 maximum=180,
             ),
+            realtime_api_key=_realtime_voice_api_key_from_environment(),
             api_key=(
                 os.environ.get("AGENT_VOICE_API_KEY", "").strip()
                 or os.environ.get("OPENAI_API_KEY", "").strip()
@@ -388,7 +390,10 @@ async def _transcribe_realtime_chunks(
     config: VoiceConfig,
     chunks: list[bytes],
 ) -> str:
-    connect_url = _realtime_connect_url(config.realtime_url or "")
+    connect_url = _realtime_connect_url(
+        config.realtime_url or "",
+        api_key=config.realtime_api_key,
+    )
     try:
         import websockets
     except ImportError as exc:
@@ -447,7 +452,7 @@ async def _realtime_handshake(ws: object, config: VoiceConfig) -> None:
     await ws.send(json.dumps(update))
 
 
-def _realtime_connect_url(raw_url: str) -> str:
+def _realtime_connect_url(raw_url: str, *, api_key: str | None = None) -> str:
     url = raw_url.strip()
     if not url:
         raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
@@ -456,15 +461,29 @@ def _realtime_connect_url(raw_url: str) -> str:
 
     errors: list[str] = []
     for session_url in _realtime_session_url_candidates(url):
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         request = urllib.request.Request(
             session_url,
             data=b"{}",
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            message = f"{session_url}: HTTP Error {exc.code}: {exc.reason}"
+            if exc.code in {401, 403} and _is_huggingface_realtime_url(url):
+                if api_key:
+                    message += " (Hugging Face rejected the realtime voice bearer token)"
+                else:
+                    message += " (set AGENT_REALTIME_VOICE_API_KEY or HF_TOKEN for this Hugging Face Space)"
+                errors.append(message)
+                break
+            errors.append(message)
+            continue
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
             errors.append(f"{session_url}: {exc}")
             continue
@@ -659,6 +678,16 @@ def _environment_command(name: str) -> tuple[str, ...] | None:
     if not parts:
         return None
     return parts
+
+
+def _realtime_voice_api_key_from_environment() -> str | None:
+    return (
+        os.environ.get("AGENT_REALTIME_VOICE_API_KEY", "").strip()
+        or os.environ.get("HF_TOKEN", "").strip()
+        or os.environ.get("HUGGINGFACEHUB_API_TOKEN", "").strip()
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN", "").strip()
+        or None
+    )
 
 
 def _voice_provider_from_environment() -> str | None:

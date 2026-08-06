@@ -101,12 +101,14 @@ them the agent brain. To use the public Hugging Face Space, set
 OpenAI key for transcription. You can also set `AGENT_VOICE_MODE=realtime` and
 `AGENT_REALTIME_VOICE_URL` to a direct `wss://` endpoint, an HTTP server that returns
 a `connect_url` from `/session` or `/api/session`, or a Hugging Face Space page URL such as
-`https://huggingface.co/spaces/smolagents/hf-realtime-voice`. Nym sends microphone
-audio through that OpenAI-Realtime-style WebSocket path, receives the transcript, and
-submits the text through the normal Agent runtime so desktop actions, session memory,
-and approval policy stay exactly the same as typed commands. Advanced servers can
-override the default `session.update` payload with
-`AGENT_REALTIME_VOICE_SESSION_UPDATE_JSON`.
+`https://huggingface.co/spaces/smolagents/hf-realtime-voice`. If the realtime session
+endpoint requires authentication, set `AGENT_REALTIME_VOICE_API_KEY`; for Hugging Face
+Spaces, existing `HF_TOKEN`, `HUGGINGFACEHUB_API_TOKEN`, or `HUGGING_FACE_HUB_TOKEN`
+values are also used as bearer tokens. Nym sends microphone audio through that
+OpenAI-Realtime-style WebSocket path, receives the transcript, and submits the text
+through the normal Agent runtime so desktop actions, session memory, and approval
+policy stay exactly the same as typed commands. Advanced servers can override the
+default `session.update` payload with `AGENT_REALTIME_VOICE_SESSION_UPDATE_JSON`.
 
 ## Desktop and system capabilities
 
