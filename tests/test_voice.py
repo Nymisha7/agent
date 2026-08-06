@@ -97,6 +97,23 @@ class VoiceTests(unittest.TestCase):
         self.assertTrue(status.input_ready)
         self.assertEqual(status.stt_provider, "realtime-websocket")
 
+    def test_huggingface_voice_provider_uses_public_space_without_key_prompt(self) -> None:
+        with (
+            patch.dict("os.environ", {"AGENT_VOICE_PROVIDER": "huggingface"}, clear=True),
+            patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            patch("agent.voice.importlib.util.find_spec", return_value=object()),
+        ):
+            config = VoiceConfig.from_environment()
+            status = voice_status()
+
+        self.assertEqual(config.mode, "realtime")
+        self.assertEqual(
+            config.realtime_url,
+            "https://huggingface.co/spaces/smolagents/hf-realtime-voice",
+        )
+        self.assertTrue(status.input_ready)
+        self.assertEqual(status.stt_provider, "huggingface-realtime")
+
     def test_realtime_voice_requires_url(self) -> None:
         with (
             patch.dict("os.environ", {"AGENT_VOICE_MODE": "realtime"}, clear=True),
@@ -116,6 +133,10 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(
             _realtime_session_url("voice.example/api/session"),
             "https://voice.example/api/session",
+        )
+        self.assertEqual(
+            _realtime_session_url("https://huggingface.co/spaces/smolagents/hf-realtime-voice"),
+            "https://smolagents-hf-realtime-voice.hf.space/session",
         )
 
     def test_realtime_connect_url_accepts_direct_websocket(self) -> None:

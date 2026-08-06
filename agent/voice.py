@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Iterable
 
@@ -29,6 +30,15 @@ from openai import OpenAI
 _DEFAULT_RECORD_SECONDS = 20
 _MAX_RECORD_SECONDS = 120
 _REALTIME_CHUNK_BYTES = 1280
+_HF_REALTIME_VOICE_SPACE_URL = "https://huggingface.co/spaces/smolagents/hf-realtime-voice"
+_HF_REALTIME_VOICE_PROVIDERS = {
+    "hf",
+    "hf-realtime",
+    "hf-space",
+    "huggingface",
+    "huggingface-realtime",
+    "huggingface-space",
+}
 
 
 @dataclass(frozen=True)
@@ -86,16 +96,8 @@ class VoiceConfig:
             stt_command=_environment_command("AGENT_VOICE_STT_COMMAND"),
             tts_command=_environment_command("AGENT_VOICE_TTS_COMMAND"),
             playback_command=_environment_command("AGENT_VOICE_PLAYBACK"),
-            mode=_environment_choice(
-                "AGENT_VOICE_MODE",
-                default="turn",
-                choices={"turn", "realtime"},
-            ),
-            realtime_url=(
-                os.environ.get("AGENT_REALTIME_VOICE_URL", "").strip()
-                or os.environ.get("AGENT_REALTIME_VOICE_SESSION_URL", "").strip()
-                or None
-            ),
+            mode=_voice_mode_from_environment(),
+            realtime_url=_realtime_voice_url_from_environment(),
             realtime_session_update=_environment_json_object(
                 "AGENT_REALTIME_VOICE_SESSION_UPDATE_JSON"
             ),
@@ -321,6 +323,8 @@ def _stt_provider(config: VoiceConfig) -> str | None:
             raise RuntimeError(
                 "Realtime voice requires the Python package 'websockets'."
             )
+        if _is_huggingface_realtime_url(config.realtime_url):
+            return "huggingface-realtime"
         return "realtime-websocket"
     if config.stt_command:
         _require_placeholder(config.stt_command, "{input}", "AGENT_VOICE_STT_COMMAND")
@@ -471,11 +475,55 @@ def _realtime_session_url(raw_url: str) -> str:
     url = raw_url.strip().rstrip("/")
     if not url:
         raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
+    url = _huggingface_space_app_url(url)
     if "://" not in url:
         url = f"https://{url}"
     if url.endswith("/session") or url.endswith("/api/session"):
         return url
     return f"{url}/session"
+
+
+def _huggingface_space_app_url(raw_url: str) -> str:
+    """Convert a Hugging Face Space page URL to the callable hf.space app host."""
+    value = raw_url.strip().rstrip("/")
+    if not value:
+        return value
+    parse_target = value if "://" in value else f"https://{value}"
+    parsed = urllib.parse.urlparse(parse_target)
+    host = parsed.netloc.casefold()
+    parts = [part for part in parsed.path.split("/") if part]
+
+    if host in {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}:
+        if len(parts) >= 3 and parts[0] == "spaces":
+            return f"https://{_hf_space_host(parts[1], parts[2])}"
+
+    if not parsed.netloc and len(parts) == 2:
+        return f"https://{_hf_space_host(parts[0], parts[1])}"
+
+    return value
+
+
+def _hf_space_host(owner: str, space: str) -> str:
+    return f"{_hf_domain_label(owner)}-{_hf_domain_label(space)}.hf.space"
+
+
+def _hf_domain_label(value: str) -> str:
+    label = "".join(
+        character.casefold() if character.isalnum() or character == "-" else "-"
+        for character in value
+    ).strip("-")
+    return label or "space"
+
+
+def _is_huggingface_realtime_url(raw_url: str | None) -> bool:
+    if not raw_url:
+        return False
+    normalized = _huggingface_space_app_url(raw_url)
+    parsed = urllib.parse.urlparse(normalized if "://" in normalized else f"https://{normalized}")
+    return parsed.netloc.casefold().endswith(".hf.space") or (
+        parsed.netloc.casefold() in {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}
+        and "/spaces/" in parsed.path
+    )
 
 
 def _pcm16_chunks(audio_path: Path) -> Iterable[bytes]:
@@ -601,6 +649,38 @@ def _environment_command(name: str) -> tuple[str, ...] | None:
     if not parts:
         return None
     return parts
+
+
+def _voice_provider_from_environment() -> str | None:
+    raw = (
+        os.environ.get("AGENT_VOICE_PROVIDER", "").strip()
+        or os.environ.get("AGENT_VOICE_STT_PROVIDER", "").strip()
+    )
+    return raw.casefold() or None
+
+
+def _voice_mode_from_environment() -> str:
+    provider = _voice_provider_from_environment()
+    if provider in _HF_REALTIME_VOICE_PROVIDERS:
+        return "realtime"
+    return _environment_choice(
+        "AGENT_VOICE_MODE",
+        default="turn",
+        choices={"turn", "realtime"},
+    )
+
+
+def _realtime_voice_url_from_environment() -> str | None:
+    url = (
+        os.environ.get("AGENT_REALTIME_VOICE_URL", "").strip()
+        or os.environ.get("AGENT_REALTIME_VOICE_SESSION_URL", "").strip()
+    )
+    if url:
+        return url
+    provider = _voice_provider_from_environment()
+    if provider in _HF_REALTIME_VOICE_PROVIDERS:
+        return _HF_REALTIME_VOICE_SPACE_URL
+    return None
 
 
 def _environment_choice(name: str, *, default: str, choices: set[str]) -> str:
