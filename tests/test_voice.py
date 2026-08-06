@@ -1,5 +1,6 @@
 import os
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from agent.voice import (
@@ -7,6 +8,7 @@ from agent.voice import (
     _chunk_bytes,
     _realtime_connect_url,
     _realtime_session_url,
+    _realtime_session_url_candidates,
     _transcript_fragment,
     bridge_voice_record,
     bridge_voice_speak,
@@ -138,6 +140,41 @@ class VoiceTests(unittest.TestCase):
             _realtime_session_url("https://huggingface.co/spaces/smolagents/hf-realtime-voice"),
             "https://smolagents-hf-realtime-voice.hf.space/session",
         )
+
+    def test_realtime_session_url_candidates_include_api_fallback(self) -> None:
+        self.assertEqual(
+            _realtime_session_url_candidates("https://voice.example"),
+            ["https://voice.example/session", "https://voice.example/api/session"],
+        )
+        self.assertEqual(
+            _realtime_session_url_candidates("https://voice.example/api/session"),
+            ["https://voice.example/api/session"],
+        )
+
+    def test_realtime_connect_url_falls_back_to_api_session(self) -> None:
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"connect_url": "wss://voice.example/realtime"}'
+
+        def urlopen(request: object, timeout: int = 0) -> Response:
+            self.assertEqual(timeout, 15)
+            url = getattr(request, "full_url")
+            if url == "https://voice.example/session":
+                raise urllib.error.HTTPError(url, 405, "Method Not Allowed", {}, None)
+            self.assertEqual(url, "https://voice.example/api/session")
+            return Response()
+
+        with patch("agent.voice.urllib.request.urlopen", side_effect=urlopen):
+            self.assertEqual(
+                _realtime_connect_url("https://voice.example"),
+                "wss://voice.example/realtime",
+            )
 
     def test_realtime_connect_url_accepts_direct_websocket(self) -> None:
         self.assertEqual(

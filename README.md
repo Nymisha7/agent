@@ -100,7 +100,7 @@ them the agent brain. To use the public Hugging Face Space, set
 `https://huggingface.co/spaces/smolagents/hf-realtime-voice` and will not require an
 OpenAI key for transcription. You can also set `AGENT_VOICE_MODE=realtime` and
 `AGENT_REALTIME_VOICE_URL` to a direct `wss://` endpoint, an HTTP server that returns
-a `connect_url` from `/session`, or a Hugging Face Space page URL such as
+a `connect_url` from `/session` or `/api/session`, or a Hugging Face Space page URL such as
 `https://huggingface.co/spaces/smolagents/hf-realtime-voice`. Nym sends microphone
 audio through that OpenAI-Realtime-style WebSocket path, receives the transcript, and
 submits the text through the normal Agent runtime so desktop actions, session memory,

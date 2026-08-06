@@ -453,25 +453,35 @@ def _realtime_connect_url(raw_url: str) -> str:
         raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
     if url.startswith(("ws://", "wss://")):
         return url
-    session_url = _realtime_session_url(url)
-    request = urllib.request.Request(
-        session_url,
-        data=b"{}",
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Could not create realtime voice session: {exc}") from exc
-    connect_url = payload.get("connect_url") or payload.get("websocket_url")
-    if not isinstance(connect_url, str) or not connect_url.strip():
-        raise RuntimeError("Realtime voice session response did not include connect_url.")
-    return connect_url.strip()
+
+    errors: list[str] = []
+    for session_url in _realtime_session_url_candidates(url):
+        request = urllib.request.Request(
+            session_url,
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            errors.append(f"{session_url}: {exc}")
+            continue
+        connect_url = payload.get("connect_url") or payload.get("websocket_url")
+        if isinstance(connect_url, str) and connect_url.strip():
+            return connect_url.strip()
+        errors.append(f"{session_url}: response did not include connect_url")
+
+    detail = "; ".join(errors) if errors else "no session endpoints were tried"
+    raise RuntimeError(f"Could not create realtime voice session: {detail}")
 
 
 def _realtime_session_url(raw_url: str) -> str:
+    return _realtime_session_url_candidates(raw_url)[0]
+
+
+def _realtime_session_url_candidates(raw_url: str) -> list[str]:
     url = raw_url.strip().rstrip("/")
     if not url:
         raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
@@ -479,8 +489,8 @@ def _realtime_session_url(raw_url: str) -> str:
     if "://" not in url:
         url = f"https://{url}"
     if url.endswith("/session") or url.endswith("/api/session"):
-        return url
-    return f"{url}/session"
+        return [url]
+    return [f"{url}/session", f"{url}/api/session"]
 
 
 def _huggingface_space_app_url(raw_url: str) -> str:
