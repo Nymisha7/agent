@@ -27,6 +27,7 @@ EOF
 }
 
 SOURCE_PATH=""
+NYM_FIRST_INSTALL=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo)
@@ -133,6 +134,7 @@ checkout_repo() {
   else
     mkdir -p "$(dirname "$INSTALL_ROOT")"
     git clone "$REPO_URL" "$INSTALL_ROOT"
+    NYM_FIRST_INSTALL=1
   fi
   cd "$INSTALL_ROOT"
 }
@@ -170,6 +172,9 @@ install_with_venv() {
 }
 
 configure_agent_name() {
+  if [ "$NYM_FIRST_INSTALL" != "1" ]; then
+    return
+  fi
   local agent_name="${NYM_AGENT_NAME:-}"
   if [ -z "$agent_name" ] && [ -e /dev/tty ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
     if { printf 'Name your agent [Agent]: ' > /dev/tty; } 2>/dev/null; then

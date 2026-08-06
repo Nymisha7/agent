@@ -77,6 +77,15 @@ class BundleDistributionTests(unittest.TestCase):
         self.assertIn("normalize_repo_url", installer)
         self.assertIn("https://github.com/${REPO_URL#git@github.com:}", installer)
 
+    def test_wsl_installer_only_prompts_for_agent_name_on_first_install(self) -> None:
+        installer = Path("scripts/install-wsl.sh").read_text(encoding="utf-8")
+
+        self.assertIn("NYM_FIRST_INSTALL=0", installer)
+        self.assertIn("NYM_FIRST_INSTALL=1", installer)
+        self.assertIn('if [ "$NYM_FIRST_INSTALL" != "1" ]; then', installer)
+        self.assertLess(installer.index("NYM_FIRST_INSTALL=1"), installer.index("configure_agent_name()"))
+        self.assertLess(installer.index('if [ "$NYM_FIRST_INSTALL" != "1" ]; then'), installer.index("Name your agent"))
+
     def test_wheel_is_marked_platform_specific(self) -> None:
         setup_py = Path("setup.py").read_text(encoding="utf-8")
 
