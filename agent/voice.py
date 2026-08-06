@@ -7,7 +7,11 @@ installs software, or contacts a provider while determining availability.
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 from dataclasses import dataclass
+import importlib.util
+import json
 import os
 from pathlib import Path
 import shlex
@@ -15,6 +19,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from typing import Iterable
 
 from openai import OpenAI
@@ -22,6 +28,7 @@ from openai import OpenAI
 
 _DEFAULT_RECORD_SECONDS = 20
 _MAX_RECORD_SECONDS = 120
+_REALTIME_CHUNK_BYTES = 1280
 
 
 @dataclass(frozen=True)
@@ -54,6 +61,10 @@ class VoiceConfig:
     stt_command: tuple[str, ...] | None
     tts_command: tuple[str, ...] | None
     playback_command: tuple[str, ...] | None
+    mode: str
+    realtime_url: str | None
+    realtime_session_update: dict[str, object] | None
+    realtime_timeout_seconds: int
     api_key: str | None
     base_url: str | None
     stt_model: str
@@ -75,6 +86,25 @@ class VoiceConfig:
             stt_command=_environment_command("AGENT_VOICE_STT_COMMAND"),
             tts_command=_environment_command("AGENT_VOICE_TTS_COMMAND"),
             playback_command=_environment_command("AGENT_VOICE_PLAYBACK"),
+            mode=_environment_choice(
+                "AGENT_VOICE_MODE",
+                default="turn",
+                choices={"turn", "realtime"},
+            ),
+            realtime_url=(
+                os.environ.get("AGENT_REALTIME_VOICE_URL", "").strip()
+                or os.environ.get("AGENT_REALTIME_VOICE_SESSION_URL", "").strip()
+                or None
+            ),
+            realtime_session_update=_environment_json_object(
+                "AGENT_REALTIME_VOICE_SESSION_UPDATE_JSON"
+            ),
+            realtime_timeout_seconds=_environment_int(
+                "AGENT_REALTIME_VOICE_TIMEOUT_SECONDS",
+                default=30,
+                minimum=5,
+                maximum=180,
+            ),
             api_key=(
                 os.environ.get("AGENT_VOICE_API_KEY", "").strip()
                 or os.environ.get("OPENAI_API_KEY", "").strip()
@@ -216,6 +246,9 @@ def _record_audio(config: VoiceConfig, output: Path) -> None:
 
 
 def _transcribe_audio(config: VoiceConfig, audio_path: Path) -> str:
+    if config.mode == "realtime":
+        return transcribe_realtime_audio(config, audio_path)
+
     if config.stt_command:
         completed = _run_template_command(config.stt_command, input_path=audio_path)
         return completed.stdout.strip()
@@ -279,6 +312,16 @@ def _ffmpeg_record_command(seconds: int) -> list[str]:
 
 
 def _stt_provider(config: VoiceConfig) -> str | None:
+    if config.mode == "realtime":
+        if not config.realtime_url:
+            raise RuntimeError(
+                "AGENT_REALTIME_VOICE_URL is required when AGENT_VOICE_MODE=realtime."
+            )
+        if importlib.util.find_spec("websockets") is None:
+            raise RuntimeError(
+                "Realtime voice requires the Python package 'websockets'."
+            )
+        return "realtime-websocket"
     if config.stt_command:
         _require_placeholder(config.stt_command, "{input}", "AGENT_VOICE_STT_COMMAND")
         return "command" if _command_available(config.stt_command) else None
@@ -318,6 +361,214 @@ def _default_playback_commands(audio_path: Path) -> Iterable[list[str]]:
     yield ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", path]
     yield ["aplay", "--quiet", path]
     yield ["paplay", path]
+
+
+def transcribe_realtime_audio(config: VoiceConfig, audio_path: Path) -> str:
+    """Send one recorded turn through an OpenAI-Realtime-style speech server.
+
+    The Hugging Face realtime voice Space documents a WebSocket route that
+    accepts PCM16 16 kHz mono audio chunks and emits transcript deltas. Nym uses
+    that protocol only as a voice transport: the returned transcript is still
+    submitted to the normal Agent runtime, so desktop actions and approvals keep
+    the same behavior as typed text.
+    """
+    if not config.realtime_url:
+        raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
+    chunks = list(_pcm16_chunks(audio_path))
+    if not chunks:
+        raise RuntimeError("Recorded audio did not contain usable PCM data.")
+    return asyncio.run(_transcribe_realtime_chunks(config, chunks))
+
+
+async def _transcribe_realtime_chunks(
+    config: VoiceConfig,
+    chunks: list[bytes],
+) -> str:
+    connect_url = _realtime_connect_url(config.realtime_url or "")
+    try:
+        import websockets
+    except ImportError as exc:
+        raise RuntimeError("Realtime voice requires the Python package 'websockets'.") from exc
+
+    transcript_parts: list[str] = []
+    async with websockets.connect(connect_url, open_timeout=config.realtime_timeout_seconds) as ws:
+        await _realtime_handshake(ws, config)
+        for chunk in chunks:
+            await ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(chunk).decode("ascii"),
+            }))
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        await ws.send(json.dumps({"type": "response.create"}))
+        while True:
+            try:
+                raw = await asyncio.wait_for(
+                    ws.recv(),
+                    timeout=config.realtime_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Realtime voice server did not finish transcription.") from exc
+            event = _json_event(raw)
+            event_type = str(event.get("type") or "")
+            if event_type == "error":
+                raise RuntimeError(_realtime_error_message(event))
+            fragment = _transcript_fragment(event)
+            if fragment:
+                transcript_parts.append(fragment)
+            if _realtime_done(event_type):
+                break
+    transcript = " ".join("".join(transcript_parts).split())
+    if not transcript:
+        raise RuntimeError("Realtime voice server returned no transcript.")
+    return transcript
+
+
+async def _realtime_handshake(ws: object, config: VoiceConfig) -> None:
+    update = config.realtime_session_update or {
+        "type": "session.update",
+        "session": {
+            "audio": {
+                "input": {
+                    "format": "pcm16",
+                    "sample_rate": 16000,
+                },
+                "output": {
+                    "format": "pcm16",
+                    "sample_rate": 24000,
+                },
+            },
+            "output_modalities": ["text"],
+        },
+    }
+    await ws.send(json.dumps(update))
+
+
+def _realtime_connect_url(raw_url: str) -> str:
+    url = raw_url.strip()
+    if not url:
+        raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
+    if url.startswith(("ws://", "wss://")):
+        return url
+    session_url = _realtime_session_url(url)
+    request = urllib.request.Request(
+        session_url,
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not create realtime voice session: {exc}") from exc
+    connect_url = payload.get("connect_url") or payload.get("websocket_url")
+    if not isinstance(connect_url, str) or not connect_url.strip():
+        raise RuntimeError("Realtime voice session response did not include connect_url.")
+    return connect_url.strip()
+
+
+def _realtime_session_url(raw_url: str) -> str:
+    url = raw_url.strip().rstrip("/")
+    if not url:
+        raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
+    if "://" not in url:
+        url = f"https://{url}"
+    if url.endswith("/session") or url.endswith("/api/session"):
+        return url
+    return f"{url}/session"
+
+
+def _pcm16_chunks(audio_path: Path) -> Iterable[bytes]:
+    if shutil.which("ffmpeg"):
+        command = [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(audio_path),
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "pipe:1",
+        ]
+        completed = subprocess.run(command, check=True, capture_output=True)
+        yield from _chunk_bytes(completed.stdout, _REALTIME_CHUNK_BYTES)
+        return
+    yield from _wav_pcm16_chunks(audio_path)
+
+
+def _wav_pcm16_chunks(audio_path: Path) -> Iterable[bytes]:
+    import wave
+
+    with wave.open(str(audio_path), "rb") as audio:
+        if audio.getnchannels() != 1 or audio.getframerate() != 16000 or audio.getsampwidth() != 2:
+            raise RuntimeError(
+                "Realtime voice requires ffmpeg or a 16 kHz mono PCM16 WAV recorder."
+            )
+        while data := audio.readframes(_REALTIME_CHUNK_BYTES // 2):
+            yield data
+
+
+def _chunk_bytes(data: bytes, size: int) -> Iterable[bytes]:
+    for index in range(0, len(data), size):
+        chunk = data[index:index + size]
+        if chunk:
+            yield chunk
+
+
+def _json_event(raw: object) -> dict[str, object]:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _transcript_fragment(event: dict[str, object]) -> str:
+    event_type = str(event.get("type") or "")
+    if event_type.endswith("input_audio_transcription.completed"):
+        return str(event.get("transcript") or "")
+    if event_type.endswith("input_audio_transcription.delta"):
+        return str(event.get("delta") or "")
+    if event_type in {
+        "response.audio_transcript.delta",
+        "response.output_text.delta",
+        "response.text.delta",
+    }:
+        return str(event.get("delta") or "")
+    if event_type in {
+        "response.audio_transcript.done",
+        "response.output_text.done",
+        "response.text.done",
+    }:
+        return str(event.get("transcript") or event.get("text") or "")
+    return ""
+
+
+def _realtime_done(event_type: str) -> bool:
+    return event_type in {
+        "response.done",
+        "response.completed",
+        "input_audio_buffer.speech_stopped",
+    }
+
+
+def _realtime_error_message(event: dict[str, object]) -> str:
+    error = event.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    return str(error or "Realtime voice server returned an error.")
 
 
 def _run_template_command(
@@ -363,6 +614,26 @@ def _environment_command(name: str) -> tuple[str, ...] | None:
     if not parts:
         return None
     return parts
+
+
+def _environment_choice(name: str, *, default: str, choices: set[str]) -> str:
+    raw = os.environ.get(name, "").strip().casefold()
+    if not raw:
+        return default
+    if raw not in choices:
+        return default
+    return raw
+
+
+def _environment_json_object(name: str) -> dict[str, object] | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _environment_flag(name: str, *, default: bool) -> bool:

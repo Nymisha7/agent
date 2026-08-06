@@ -145,6 +145,7 @@ PROVIDER_API_KEY_ENVS = {
     "deepseek": "DEEPSEEK_API_KEY",
     "glm": "GLM_API_KEY",
     "openai-compatible": "AGENT_OPENAI_COMPAT_API_KEY",
+    "voice": "AGENT_VOICE_API_KEY",
 }
 _CREDENTIAL_ENV_NAMES = frozenset(PROVIDER_API_KEY_ENVS.values())
 
@@ -1114,7 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tui-bridge",
         choices=(
             "snapshot", "submit", "stream-submit", "complete", "gateway",
-            "approve", "deny",
+            "approve", "deny", "voice-record", "voice-speak",
         ),
         help=argparse.SUPPRESS,
     )
@@ -4264,6 +4265,13 @@ def _run_tui_stream_submit(ctx: AppContext, prompt: str) -> int:
                 )
             else:
                 _record_local_command_exchange(ctx, prompt, answer)
+            if os.environ.get("AGENT_TTS_ENABLED") == "1" and answer:
+                try:
+                    from .voice import speak
+                    import threading as _threading
+                    _threading.Thread(target=speak, args=(answer,), daemon=True).start()
+                except Exception:
+                    pass
             _bridge_emit({
                 "kind": "final",
                 "ok": True,
@@ -4357,6 +4365,13 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
             else:
                 decision = "approved" if args.tui_bridge == "approve" else "denied"
                 payload = _tui_bridge_apply_approval_decision(ctx, request_id, decision)
+        elif args.tui_bridge == "voice-record":
+            from .voice import bridge_voice_record
+            payload = bridge_voice_record()
+        elif args.tui_bridge == "voice-speak":
+            from .voice import bridge_voice_speak
+            text = (args.bridge_prompt or "").strip()
+            payload = bridge_voice_speak(text)
         elif args.tui_bridge == "stream-submit":
             prompt = (args.bridge_prompt or "").strip()
             return _run_tui_stream_submit(ctx, prompt)
