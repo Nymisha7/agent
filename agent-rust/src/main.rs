@@ -678,11 +678,17 @@ struct GatewayViewState {
 #[derive(Debug, Clone, Deserialize)]
 struct BridgeSnapshot {
     session: BridgeSession,
+    #[serde(default = "default_agent_name")]
+    agent_name: String,
     #[serde(default)]
     approvals: Vec<BridgeApproval>,
     #[serde(default)]
     voice: BridgeVoice,
     messages: Vec<BridgeMessage>,
+}
+
+fn default_agent_name() -> String {
+    String::from("Agent")
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2580,10 +2586,11 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     render_transcript(frame, conversation_area, app, true);
 
     let session = &app.snapshot.session;
+    let agent_badge = agent_label(&app.snapshot.agent_name);
     let header_lines = vec![
         Line::from(vec![
             Span::styled(
-                " AGENT ",
+                format!(" {agent_badge} "),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -3943,20 +3950,29 @@ fn format_cost_usd(value: f64) -> String {
     }
 }
 
-fn role_label(role: &str) -> (&'static str, Color) {
-    match role {
-        "user" => ("YOU", Color::Green),
-        "assistant" => ("AGENT", Color::Yellow),
-        "tool" => ("TOOL", Color::Magenta),
-        _ => ("SYS", Color::White),
+fn agent_label(agent_name: &str) -> String {
+    let name = clip_status(agent_name, 12).into_owned();
+    if name.trim().is_empty() || name.eq_ignore_ascii_case("agent") {
+        String::from("AGENT")
+    } else {
+        name
     }
 }
 
-fn role_header(role: &str, detail: &str) -> Line<'static> {
-    let (label, color) = role_label(role);
+fn role_label(role: &str, agent_name: &str) -> (String, Color) {
+    match role {
+        "user" => (String::from("YOU"), Color::Green),
+        "assistant" => (agent_label(agent_name), Color::Yellow),
+        "tool" => (String::from("TOOL"), Color::Magenta),
+        _ => (String::from("SYS"), Color::White),
+    }
+}
+
+fn role_header(role: &str, detail: &str, agent_name: &str) -> Line<'static> {
+    let (label, color) = role_label(role, agent_name);
     Line::from(vec![
         Span::styled(
-            format!(" {:<4} ", label),
+            format!(" {label} "),
             Style::default()
                 .fg(Color::Black)
                 .bg(color)
@@ -4359,7 +4375,11 @@ fn transcript_text(
 ) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for message in &snapshot.messages {
-        lines.push(role_header(&message.role, &message.created_at));
+        lines.push(role_header(
+            &message.role,
+            &message.created_at,
+            &snapshot.agent_name,
+        ));
         for line in message.content.lines() {
             lines.push(message_body_line(line));
         }
@@ -4384,7 +4404,7 @@ fn transcript_text(
             message.role == "user" && message.content.trim() == prompt.trim()
         });
         if !prompt_is_persisted {
-            lines.push(role_header("user", "in progress"));
+            lines.push(role_header("user", "in progress", &snapshot.agent_name));
             lines.push(message_body_line(prompt));
             lines.push(Line::from(""));
         }
@@ -4436,7 +4456,7 @@ fn transcript_text(
         }
     }
     if app.submitting && !app.streaming_text.trim().is_empty() {
-        lines.push(role_header("assistant", "drafting"));
+        lines.push(role_header("assistant", "drafting", &snapshot.agent_name));
         for line in app.streaming_text.lines() {
             lines.push(message_body_line(line));
         }
@@ -6036,6 +6056,7 @@ mod tui_tests {
         TuiApp {
             snapshot: BridgeSnapshot {
                 session,
+                agent_name: String::from("Agent"),
                 approvals: Vec::new(),
                 voice: BridgeVoice::default(),
                 messages: Vec::new(),

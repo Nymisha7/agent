@@ -801,6 +801,29 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual(selected["value"], "ollama/qwen3")
         build_context.assert_not_called()
 
+    def test_tui_bridge_snapshot_includes_agent_name(self) -> None:
+        ctx = SimpleNamespace(
+            session_id="name-session",
+            agent_name="Nymi",
+            llm=SimpleNamespace(model="gpt-5.4-mini", provider="openai", mode="hosted", configuration_error=None),
+            session=SimpleNamespace(pending_approvals=[]),
+            store=SimpleNamespace(
+                get_session=lambda _: SimpleNamespace(
+                    id="name-session",
+                    title="Test",
+                    workspace_root="/workspace",
+                    updated_at="now",
+                    cost_usd=0.0,
+                    tokens=TokenUsage(),
+                ),
+                list_messages=lambda _session_id, limit=None: [],
+            ),
+        )
+
+        snapshot = _tui_bridge_snapshot(ctx)
+
+        self.assertEqual(snapshot["agent_name"], "Nymi")
+
     def test_tui_bridge_snapshot_includes_pending_approvals(self) -> None:
         seen_limits: list[int | None] = []
         ctx = SimpleNamespace(

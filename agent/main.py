@@ -1114,7 +1114,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tui-bridge",
         choices=(
             "snapshot", "submit", "stream-submit", "complete", "gateway",
-            "approve", "deny", "voice-record", "voice-speak",
+            "approve", "deny",
         ),
         help=argparse.SUPPRESS,
     )
@@ -4357,14 +4357,6 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
             else:
                 decision = "approved" if args.tui_bridge == "approve" else "denied"
                 payload = _tui_bridge_apply_approval_decision(ctx, request_id, decision)
-        elif args.tui_bridge == "voice-record":
-            from .voice import bridge_voice_record
-
-            payload = bridge_voice_record()
-        elif args.tui_bridge == "voice-speak":
-            from .voice import bridge_voice_speak
-
-            payload = bridge_voice_speak(args.bridge_prompt or "")
         elif args.tui_bridge == "stream-submit":
             prompt = (args.bridge_prompt or "").strip()
             return _run_tui_stream_submit(ctx, prompt)
@@ -4401,8 +4393,6 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
 
 
 def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
-    from .voice import voice_status
-
     session = ctx.store.get_session(ctx.session_id)
     messages = ctx.store.list_messages(ctx.session_id, limit=TUI_TRANSCRIPT_LIMIT)
     return {
@@ -4438,12 +4428,12 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
                 "cache_write": session.tokens.cache_write,
             },
         },
+        "agent_name": _agent_display_name(ctx),
         "approvals": [
             dict(item)
             for item in ctx.session.pending_approvals
             if isinstance(item, dict) and item.get("status") == "pending"
         ],
-        "voice": voice_status().as_dict(),
         "messages": [
             {
                 "role": item.role,
