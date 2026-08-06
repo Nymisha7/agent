@@ -4,9 +4,6 @@
 
 Agent is a terminal coding agent with a Python agent core and a Rust/Ratatui interface.
 
-For a plain-English and technical walkthrough of the full runtime pipeline, see
-[Nym Architecture Overview](ARCHITECTURE.md).
-
 ## Run
 
 WSL install from Git:
