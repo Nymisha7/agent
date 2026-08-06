@@ -541,26 +541,13 @@ def _transcript_fragment(event: dict[str, object]) -> str:
         return str(event.get("transcript") or "")
     if event_type.endswith("input_audio_transcription.delta"):
         return str(event.get("delta") or "")
-    if event_type in {
-        "response.audio_transcript.delta",
-        "response.output_text.delta",
-        "response.text.delta",
-    }:
-        return str(event.get("delta") or "")
-    if event_type in {
-        "response.audio_transcript.done",
-        "response.output_text.done",
-        "response.text.done",
-    }:
-        return str(event.get("transcript") or event.get("text") or "")
     return ""
 
 
 def _realtime_done(event_type: str) -> bool:
-    return event_type in {
+    return event_type.endswith("input_audio_transcription.completed") or event_type in {
         "response.done",
         "response.completed",
-        "input_audio_buffer.speech_stopped",
     }
 
 

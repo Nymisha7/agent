@@ -3549,6 +3549,24 @@ def _model_source_label(provider: str) -> str:
     return PROVIDER_DISPLAY_NAMES.get(provider, provider)
 
 
+def _voice_snapshot() -> dict[str, Any]:
+    try:
+        from .voice import voice_status
+
+        status = voice_status()
+        return status.as_dict()
+    except Exception:
+        return {
+            "input_ready": False,
+            "input_reason": "Voice module unavailable.",
+            "tts_ready": False,
+            "tts_reason": None,
+            "auto_speak": False,
+            "stt_provider": None,
+            "tts_provider": None,
+        }
+
+
 def _agent_display_name(ctx: Any) -> str:
     return str(getattr(ctx, "agent_name", DEFAULT_AGENT_NAME) or DEFAULT_AGENT_NAME)
 
@@ -4444,6 +4462,7 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             },
         },
         "agent_name": _agent_display_name(ctx),
+        "voice": _voice_snapshot(),
         "approvals": [
             dict(item)
             for item in ctx.session.pending_approvals

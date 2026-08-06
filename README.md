@@ -97,6 +97,16 @@ Nym invokes those commands directly rather than through a shell. Set
 default. `AGENT_VOICE_RECORD_SECONDS` bounds a microphone turn (default 20 seconds),
 and `AGENT_VOICE_ENABLED=0` disables the feature entirely.
 
+Realtime speech backends can be used as an optional voice transport without making
+them the agent brain. Set `AGENT_VOICE_MODE=realtime` and
+`AGENT_REALTIME_VOICE_URL` to a direct `wss://` endpoint or an HTTP server that
+returns a `connect_url` from `/session`. Nym sends microphone audio through that
+OpenAI-Realtime-style WebSocket path, receives the transcript, and submits the
+text through the normal Agent runtime so desktop actions, session memory, and
+approval policy stay exactly the same as typed commands. Advanced servers can
+override the default `session.update` payload with
+`AGENT_REALTIME_VOICE_SESSION_UPDATE_JSON`.
+
 ## Desktop and system capabilities
 
 ### Strict hosted-model data boundaries

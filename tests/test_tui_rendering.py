@@ -45,6 +45,7 @@ from agent.main import (
     _tui_bridge_apply_approval_decision,
     _tui_bridge_snapshot,
     _usage_panel_lines,
+    _voice_snapshot,
     build_parser,
     handle_prompt,
     main,
@@ -827,6 +828,13 @@ class TuiRenderingTests(unittest.TestCase):
         snapshot = _tui_bridge_snapshot(ctx)
 
         self.assertEqual(snapshot["agent_name"], "Nymi")
+
+    def test_voice_snapshot_falls_back_when_voice_module_fails(self) -> None:
+        with patch("agent.voice.voice_status", side_effect=RuntimeError("boom")):
+            snapshot = _voice_snapshot()
+
+        self.assertFalse(snapshot["input_ready"])
+        self.assertEqual(snapshot["input_reason"], "Voice module unavailable.")
 
     def test_tui_bridge_snapshot_includes_pending_approvals(self) -> None:
         seen_limits: list[int | None] = []
