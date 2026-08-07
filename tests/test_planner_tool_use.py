@@ -3979,6 +3979,80 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(second_answer, "Stopped after loop block.")
         self.assertEqual(rust.calls, 2)
 
+    def test_desktop_action_can_retry_after_fresh_observation(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def respond(self, **_kwargs: Any) -> Any:
+                self.calls += 1
+                if self.calls in {1, 3}:
+                    return SimpleNamespace(output=[{
+                        "type": "function_call",
+                        "name": "desktop_action",
+                        "call_id": f"close-{self.calls}",
+                        "arguments": json.dumps({
+                            "action": "close_window",
+                            "target": "0x30a2a",
+                        }),
+                    }], output_text="")
+                if self.calls == 2:
+                    return SimpleNamespace(output=[{
+                        "type": "function_call",
+                        "name": "desktop_observe",
+                        "call_id": "observe-2",
+                        "arguments": '{"scope":"windows"}',
+                    }], output_text="")
+                return SimpleNamespace(output=[], output_text="Spark closed.")
+
+        class FakeRust:
+            def __init__(self) -> None:
+                self.action_calls = 0
+
+            def desktop_action(self, **kwargs: Any) -> dict[str, Any]:
+                self.action_calls += 1
+                return {
+                    "ok": self.action_calls == 2,
+                    "verified": self.action_calls == 2,
+                    "tool": "desktop_action",
+                    **kwargs,
+                }
+
+            def desktop_observe(self, **kwargs: Any) -> dict[str, Any]:
+                return {
+                    "ok": True,
+                    "tool": "desktop_observe",
+                    "scope": kwargs["scope"],
+                    "windows": {
+                        "items": [{
+                            "id": "0x30a2a",
+                            "target": "0x30a2a",
+                            "title": "Spark",
+                        }],
+                    },
+                }
+
+        rust = FakeRust()
+        session = AgentSession(desktop_targets=[{
+            "kind": "window",
+            "id": "0x30a2a",
+            "target": "0x30a2a",
+            "title": "Spark",
+        }])
+        answer = run_agent(
+            llm=FakeLLM(),  # type: ignore[arg-type]
+            rust=rust,  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="close Spark",
+            session=session,
+            approval_requester=lambda _request: "approved",
+            max_steps=6,
+        )
+
+        self.assertEqual(answer, "Spark closed.")
+        self.assertEqual(rust.action_calls, 2)
+        self.assertFalse(session.last_failure)
+
 
 if __name__ == "__main__":
     unittest.main()

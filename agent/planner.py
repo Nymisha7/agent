@@ -46,6 +46,12 @@ TOOL_LOOP_HISTORY_SIZE = 30
 # A repeated call must bring changed arguments or new evidence. Waiting for a
 # second identical retry only spends a tool call and does not improve recovery.
 TOOL_LOOP_CRITICAL_THRESHOLD = 1
+DESKTOP_RETRY_EVIDENCE_TOOLS = frozenset({
+    "desktop_capabilities",
+    "desktop_observe",
+    "desktop_resolve",
+    "process_list",
+})
 DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT = 1
 REASONING_FAILURE_TEXT_LIMIT = 360
 EMPTY_RESPONSE_RETRY_INSTRUCTION = (
@@ -778,7 +784,7 @@ def _tool_loop_history_dicts(value: Any) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         record: dict[str, str] = {}
-        for key in ("tool", "args_hash", "result_hash", "run_id"):
+        for key in ("tool", "args_hash", "result_hash", "run_id", "outcome"):
             field_value = item.get(key)
             if isinstance(field_value, str) and field_value:
                 record[key] = field_value
@@ -2459,11 +2465,20 @@ def _detect_generic_tool_loop(
     args_hash = _hash_tool_call(call.name, call.arguments)
     latest_result_hash: str | None = None
     no_progress_streak = 0
+    has_new_evidence = False
     for record in reversed(history):
         if record.get("run_id") != run_id:
             continue
         if record.get("tool") != call.name or record.get("args_hash") != args_hash:
+            if (
+                call.name.startswith("desktop_")
+                and record.get("tool") in DESKTOP_RETRY_EVIDENCE_TOOLS
+                and record.get("outcome") == "success"
+            ):
+                has_new_evidence = True
             continue
+        if has_new_evidence:
+            return None
         result_hash = record.get("result_hash")
         if not result_hash:
             continue
@@ -2521,9 +2536,22 @@ def _record_tool_loop_outcome(
         "args_hash": _hash_tool_call(call.name, call.arguments),
         "result_hash": _stable_digest(observation),
         "run_id": run_id,
+        "outcome": _tool_loop_outcome(observation),
     })
     if len(history) > TOOL_LOOP_HISTORY_SIZE:
         del history[: len(history) - TOOL_LOOP_HISTORY_SIZE]
+
+
+def _tool_loop_outcome(observation: Any) -> str:
+    if not isinstance(observation, dict):
+        return "unknown"
+    if observation.get("blocked") is True:
+        return "blocked"
+    if observation.get("ok") is False or observation.get("complete") is False:
+        return "failure"
+    if observation.get("ok") is True or observation.get("complete") is True:
+        return "success"
+    return "unknown"
 
 
 def _hash_tool_call(tool_name: str, arguments: dict[str, Any]) -> str:

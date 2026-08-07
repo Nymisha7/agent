@@ -2552,6 +2552,7 @@ fn start_prompt_submission(
     app: &mut TuiApp,
     prompt: String,
 ) {
+    clear_voice_recording_state(app);
     app.input.clear();
     app.submitting = true;
     app.cancel_requested = false;
@@ -5187,7 +5188,7 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             }
             _ => {}
         },
-        AppEvent::VoiceFrame(Ok(frame)) => match frame.kind.as_str() {
+        AppEvent::VoiceFrame(Ok(frame)) if app.voice_recording => match frame.kind.as_str() {
             "delta" => {
                 if let Some(delta) = frame.delta {
                     app.voice_partial.push_str(&delta);
@@ -5218,6 +5219,7 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             }
             _ => {}
         },
+        AppEvent::VoiceFrame(Ok(_)) => {}
         AppEvent::VoiceFrame(Err(err)) => {
             clear_voice_recording_state(app);
             push_notice(app, "Voice input", &err.to_string(), true);
@@ -6885,6 +6887,27 @@ mod tui_tests {
         assert!(rendered.contains("YOU"));
         assert!(rendered.contains("listening"));
         assert!(rendered.contains("hello from the microphone"));
+    }
+
+    #[test]
+    fn late_voice_final_does_not_restore_a_submitted_transcript() {
+        let mut app = test_app();
+        app.input.clear();
+        app.voice_recording = false;
+        app.voice_input_prefix = None;
+
+        handle_app_event(
+            &mut app,
+            AppEvent::VoiceFrame(Ok(BridgeVoiceFrame {
+                kind: String::from("final"),
+                delta: None,
+                transcript: Some(String::from("close Spark")),
+                error: None,
+            })),
+        );
+
+        assert!(app.input.is_empty());
+        assert_eq!(app.status, "Ready");
     }
 
     #[test]
