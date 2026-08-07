@@ -8,6 +8,7 @@ from agent.voice import (
     _chunk_bytes,
     _local_realtime_start_command,
     _realtime_connect_url,
+    _realtime_headers,
     _realtime_session_url,
     _realtime_session_url_candidates,
     _transcript_fragment,
@@ -35,17 +36,6 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(status.stt_provider, "openai-compatible")
         self.assertEqual(status.tts_provider, "system")
         self.assertFalse(status.auto_speak)
-
-    def test_installed_huggingface_local_voice_is_default_stt_provider(self) -> None:
-        with (
-            patch.dict("os.environ", {"OPENAI_API_KEY": "existing-key"}, clear=True),
-            patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
-            patch("agent.voice.importlib.util.find_spec", return_value=object()),
-        ):
-            status = voice_status()
-
-        self.assertTrue(status.input_ready)
-        self.assertEqual(status.stt_provider, "huggingface-local")
 
     def test_voice_can_use_local_commands_without_a_key(self) -> None:
         environment = {
@@ -116,7 +106,41 @@ class VoiceTests(unittest.TestCase):
         self.assertTrue(status.input_ready)
         self.assertEqual(status.stt_provider, "realtime-websocket")
 
-    def test_huggingface_voice_provider_uses_public_space_without_key_prompt(self) -> None:
+    def test_openai_realtime_voice_uses_user_api_key(self) -> None:
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "AGENT_VOICE_PROVIDER": "openai-realtime",
+                    "OPENAI_API_KEY": "user-key",
+                },
+                clear=True,
+            ),
+            patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            patch("agent.voice.importlib.util.find_spec", return_value=object()),
+        ):
+            config = VoiceConfig.from_environment()
+            status = voice_status()
+
+        self.assertEqual(config.mode, "realtime")
+        self.assertEqual(config.realtime_provider, "openai-realtime")
+        self.assertEqual(config.realtime_url, "wss://api.openai.com/v1/realtime?model=gpt-realtime")
+        self.assertTrue(status.input_ready)
+        self.assertEqual(status.stt_provider, "openai-realtime")
+        self.assertEqual(_realtime_headers(config), {"Authorization": "Bearer user-key"})
+
+    def test_openai_realtime_voice_requires_user_api_key(self) -> None:
+        with (
+            patch.dict("os.environ", {"AGENT_VOICE_PROVIDER": "openai-realtime"}, clear=True),
+            patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            patch("agent.voice.importlib.util.find_spec", return_value=object()),
+        ):
+            status = voice_status()
+
+        self.assertFalse(status.input_ready)
+        self.assertIn("OpenAI Realtime voice requires", status.input_reason or "")
+
+    def test_huggingface_voice_provider_uses_local_backend_only_when_explicit(self) -> None:
         with (
             patch.dict("os.environ", {"AGENT_VOICE_PROVIDER": "huggingface"}, clear=True),
             patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),

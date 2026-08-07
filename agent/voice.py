@@ -49,6 +49,13 @@ _HF_SPACE_REALTIME_VOICE_PROVIDERS = {
     "huggingface-space-public",
     "huggingface-public",
 }
+_OPENAI_REALTIME_VOICE_PROVIDERS = {
+    "openai-realtime",
+    "openai-realtime-api",
+    "realtime-openai",
+}
+_OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
+_OPENAI_REALTIME_MODEL = "gpt-realtime"
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,8 @@ class VoiceConfig:
     playback_command: tuple[str, ...] | None
     mode: str
     realtime_url: str | None
+    realtime_provider: str | None
+    realtime_model: str
     realtime_session_update: dict[str, object] | None
     realtime_timeout_seconds: int
     realtime_api_key: str | None
@@ -111,6 +120,8 @@ class VoiceConfig:
             tts_command=_environment_command("AGENT_VOICE_TTS_COMMAND"),
             playback_command=_environment_command("AGENT_VOICE_PLAYBACK"),
             mode=_voice_mode_from_environment(),
+            realtime_provider=_voice_provider_from_environment(),
+            realtime_model=_realtime_voice_model_from_environment(),
             realtime_url=_realtime_voice_url_from_environment(),
             realtime_session_update=_environment_json_object(
                 "AGENT_REALTIME_VOICE_SESSION_UPDATE_JSON"
@@ -346,6 +357,13 @@ def _stt_provider(config: VoiceConfig) -> str | None:
             raise RuntimeError(
                 "Realtime voice requires the Python package 'websockets'."
             )
+        if _is_openai_realtime_provider(config):
+            if not _openai_realtime_api_key(config):
+                raise RuntimeError(
+                    "OpenAI Realtime voice requires AGENT_REALTIME_VOICE_API_KEY, "
+                    "AGENT_VOICE_API_KEY, or OPENAI_API_KEY."
+                )
+            return "openai-realtime"
         if config.realtime_local_autostart and _is_local_realtime_url(config.realtime_url):
             if _local_realtime_start_command(config) is None:
                 raise RuntimeError(
@@ -410,7 +428,7 @@ def transcribe_realtime_audio(config: VoiceConfig, audio_path: Path) -> str:
         raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
     if config.realtime_local_autostart and _is_local_realtime_url(config.realtime_url):
         _ensure_local_realtime_server(config)
-    chunks = list(_pcm16_chunks(audio_path))
+    chunks = list(_pcm16_chunks(audio_path, sample_rate=_realtime_input_sample_rate(config)))
     if not chunks:
         raise RuntimeError("Recorded audio did not contain usable PCM data.")
     return asyncio.run(_transcribe_realtime_chunks(config, chunks))
@@ -430,7 +448,20 @@ async def _transcribe_realtime_chunks(
         raise RuntimeError("Realtime voice requires the Python package 'websockets'.") from exc
 
     transcript_parts: list[str] = []
-    async with websockets.connect(connect_url, open_timeout=config.realtime_timeout_seconds) as ws:
+    headers = _realtime_headers(config)
+    try:
+        connection = websockets.connect(
+            connect_url,
+            open_timeout=config.realtime_timeout_seconds,
+            additional_headers=headers,
+        )
+    except TypeError:
+        connection = websockets.connect(
+            connect_url,
+            open_timeout=config.realtime_timeout_seconds,
+            extra_headers=headers,
+        )
+    async with connection as ws:
         await _realtime_handshake(ws, config)
         for chunk in chunks:
             await ws.send(json.dumps({
@@ -462,23 +493,72 @@ async def _transcribe_realtime_chunks(
 
 
 async def _realtime_handshake(ws: object, config: VoiceConfig) -> None:
-    update = config.realtime_session_update or {
-        "type": "session.update",
-        "session": {
-            "audio": {
-                "input": {
-                    "format": "pcm16",
-                    "sample_rate": 16000,
+    if config.realtime_session_update:
+        update = config.realtime_session_update
+    elif _is_openai_realtime_provider(config):
+        update = {
+            "type": "session.update",
+            "session": {
+                "modalities": ["text"],
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "input_audio_transcription": {
+                    "model": _openai_realtime_transcription_model(),
                 },
-                "output": {
-                    "format": "pcm16",
-                    "sample_rate": 24000,
-                },
+                "turn_detection": None,
             },
-            "output_modalities": ["text"],
-        },
-    }
+        }
+    else:
+        update = {
+            "type": "session.update",
+            "session": {
+                "audio": {
+                    "input": {
+                        "format": "pcm16",
+                        "sample_rate": 16000,
+                    },
+                    "output": {
+                        "format": "pcm16",
+                        "sample_rate": 24000,
+                    },
+                },
+                "output_modalities": ["text"],
+            },
+        }
     await ws.send(json.dumps(update))
+
+
+def _realtime_headers(config: VoiceConfig) -> dict[str, str] | None:
+    if not _is_openai_realtime_provider(config):
+        return None
+    api_key = _openai_realtime_api_key(config)
+    if not api_key:
+        return None
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def _openai_realtime_api_key(config: VoiceConfig) -> str | None:
+    if config.realtime_api_key:
+        return config.realtime_api_key
+    if config.api_key:
+        return config.api_key
+    return (
+        os.environ.get("AGENT_VOICE_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+        or None
+    )
+
+
+def _openai_realtime_transcription_model() -> str:
+    return (
+        os.environ.get("AGENT_REALTIME_VOICE_TRANSCRIPTION_MODEL", "").strip()
+        or os.environ.get("AGENT_VOICE_REALTIME_TRANSCRIPTION_MODEL", "").strip()
+        or "whisper-1"
+    )
+
+
+def _realtime_input_sample_rate(config: VoiceConfig) -> int:
+    return 24000 if _is_openai_realtime_provider(config) else 16000
 
 
 def _realtime_connect_url(raw_url: str, *, api_key: str | None = None) -> str:
@@ -674,7 +754,7 @@ def _is_huggingface_realtime_url(raw_url: str | None) -> bool:
     )
 
 
-def _pcm16_chunks(audio_path: Path) -> Iterable[bytes]:
+def _pcm16_chunks(audio_path: Path, *, sample_rate: int = 16000) -> Iterable[bytes]:
     if shutil.which("ffmpeg"):
         command = [
             "ffmpeg",
@@ -691,22 +771,22 @@ def _pcm16_chunks(audio_path: Path) -> Iterable[bytes]:
             "-ac",
             "1",
             "-ar",
-            "16000",
+            str(sample_rate),
             "pipe:1",
         ]
         completed = subprocess.run(command, check=True, capture_output=True)
         yield from _chunk_bytes(completed.stdout, _REALTIME_CHUNK_BYTES)
         return
-    yield from _wav_pcm16_chunks(audio_path)
+    yield from _wav_pcm16_chunks(audio_path, sample_rate=sample_rate)
 
 
-def _wav_pcm16_chunks(audio_path: Path) -> Iterable[bytes]:
+def _wav_pcm16_chunks(audio_path: Path, *, sample_rate: int = 16000) -> Iterable[bytes]:
     import wave
 
     with wave.open(str(audio_path), "rb") as audio:
-        if audio.getnchannels() != 1 or audio.getframerate() != 16000 or audio.getsampwidth() != 2:
+        if audio.getnchannels() != 1 or audio.getframerate() != sample_rate or audio.getsampwidth() != 2:
             raise RuntimeError(
-                "Realtime voice requires ffmpeg or a 16 kHz mono PCM16 WAV recorder."
+                f"Realtime voice requires ffmpeg or a {sample_rate // 1000} kHz mono PCM16 WAV recorder."
             )
         while data := audio.readframes(_REALTIME_CHUNK_BYTES // 2):
             yield data
@@ -814,20 +894,16 @@ def _voice_provider_from_environment() -> str | None:
         os.environ.get("AGENT_VOICE_PROVIDER", "").strip()
         or os.environ.get("AGENT_VOICE_STT_PROVIDER", "").strip()
     )
-    if raw:
-        return raw.casefold()
-    if os.environ.get("AGENT_VOICE_MODE", "").strip():
-        return None
-    if os.environ.get("AGENT_VOICE_STT_COMMAND", "").strip():
-        return None
-    if shutil.which("speech-to-speech"):
-        return "huggingface"
-    return None
+    return raw.casefold() or None
 
 
 def _voice_mode_from_environment() -> str:
     provider = _voice_provider_from_environment()
-    if provider in _HF_REALTIME_VOICE_PROVIDERS or provider in _HF_SPACE_REALTIME_VOICE_PROVIDERS:
+    if (
+        provider in _HF_REALTIME_VOICE_PROVIDERS
+        or provider in _HF_SPACE_REALTIME_VOICE_PROVIDERS
+        or provider in _OPENAI_REALTIME_VOICE_PROVIDERS
+    ):
         return "realtime"
     return _environment_choice(
         "AGENT_VOICE_MODE",
@@ -845,6 +921,8 @@ def _realtime_voice_url_from_environment() -> str | None:
     if url:
         return url
     provider = _voice_provider_from_environment()
+    if provider in _OPENAI_REALTIME_VOICE_PROVIDERS:
+        return _openai_realtime_url(_realtime_voice_model_from_environment())
     if provider in _HF_REALTIME_VOICE_PROVIDERS:
         return _HF_LOCAL_REALTIME_URL
     if provider in _HF_SPACE_REALTIME_VOICE_PROVIDERS:
@@ -856,6 +934,27 @@ def _realtime_local_autostart_from_environment() -> bool:
     provider = _voice_provider_from_environment()
     default = provider in _HF_REALTIME_VOICE_PROVIDERS
     return _environment_flag("AGENT_REALTIME_VOICE_AUTOSTART", default=default)
+
+
+def _realtime_voice_model_from_environment() -> str:
+    return (
+        os.environ.get("AGENT_REALTIME_VOICE_MODEL", "").strip()
+        or os.environ.get("AGENT_VOICE_REALTIME_MODEL", "").strip()
+        or _OPENAI_REALTIME_MODEL
+    )
+
+
+def _openai_realtime_url(model: str) -> str:
+    query = urllib.parse.urlencode({"model": model.strip() or _OPENAI_REALTIME_MODEL})
+    return f"{_OPENAI_REALTIME_URL}?{query}"
+
+
+def _is_openai_realtime_provider(config: VoiceConfig) -> bool:
+    if config.realtime_provider in _OPENAI_REALTIME_VOICE_PROVIDERS:
+        return True
+    url = (config.realtime_url or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    return parsed.netloc.casefold() == "api.openai.com" and parsed.path.rstrip("/") == "/v1/realtime"
 
 
 def _environment_choice(name: str, *, default: str, choices: set[str]) -> str:
