@@ -130,7 +130,7 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(config.realtime_provider, "openai-realtime")
         self.assertEqual(
             config.realtime_url,
-            "wss://api.openai.com/v1/realtime?model=gpt-live-transcribe",
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime",
         )
         self.assertEqual(config.language, "en")
         self.assertTrue(status.input_ready)

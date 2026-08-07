@@ -55,7 +55,8 @@ _OPENAI_REALTIME_VOICE_PROVIDERS = {
     "realtime-openai",
 }
 _OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-_OPENAI_REALTIME_MODEL = "gpt-live-transcribe"
+_OPENAI_REALTIME_MODEL = "gpt-realtime"
+_OPENAI_REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 
 
 @dataclass(frozen=True)
@@ -815,7 +816,7 @@ def _openai_realtime_transcription_model() -> str:
     return (
         os.environ.get("AGENT_REALTIME_VOICE_TRANSCRIPTION_MODEL", "").strip()
         or os.environ.get("AGENT_VOICE_REALTIME_TRANSCRIPTION_MODEL", "").strip()
-        or "gpt-live-transcribe"
+        or _OPENAI_REALTIME_TRANSCRIPTION_MODEL
     )
 
 
