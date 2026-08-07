@@ -339,8 +339,9 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(update["session"]["type"], "transcription")
         self.assertEqual(transcription["model"], "gpt-live-transcribe")
         self.assertEqual(transcription["languages"], ["en"])
-        self.assertEqual(transcription["delay"], "low")
-        self.assertIn("English only", transcription["prompt"])
+        self.assertNotIn("delay", transcription)
+        self.assertNotIn("keywords", transcription)
+        self.assertNotIn("prompt", transcription)
         self.assertIsNone(audio_input["turn_detection"])
 
     def test_voice_language_can_use_automatic_detection(self) -> None:
