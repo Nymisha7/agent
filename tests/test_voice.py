@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import unittest
 import urllib.error
@@ -9,6 +11,7 @@ from agent.voice import (
     _local_realtime_start_command,
     _realtime_connect_url,
     _realtime_headers,
+    _realtime_handshake,
     _realtime_session_url,
     _realtime_session_url_candidates,
     _transcript_fragment,
@@ -28,12 +31,13 @@ class VoiceTests(unittest.TestCase):
         with (
             patch.dict("os.environ", {"OPENAI_API_KEY": "existing-key"}, clear=True),
             patch("agent.voice.shutil.which", side_effect=no_local_voice),
+            patch("agent.voice.importlib.util.find_spec", return_value=object()),
         ):
             status = voice_status()
 
         self.assertTrue(status.input_ready)
         self.assertTrue(status.tts_ready)
-        self.assertEqual(status.stt_provider, "openai-compatible")
+        self.assertEqual(status.stt_provider, "openai-realtime")
         self.assertEqual(status.tts_provider, "system")
         self.assertFalse(status.auto_speak)
 
@@ -124,7 +128,11 @@ class VoiceTests(unittest.TestCase):
 
         self.assertEqual(config.mode, "realtime")
         self.assertEqual(config.realtime_provider, "openai-realtime")
-        self.assertEqual(config.realtime_url, "wss://api.openai.com/v1/realtime?model=gpt-realtime")
+        self.assertEqual(
+            config.realtime_url,
+            "wss://api.openai.com/v1/realtime?model=gpt-live-transcribe",
+        )
+        self.assertEqual(config.language, "en")
         self.assertTrue(status.input_ready)
         self.assertEqual(status.stt_provider, "openai-realtime")
         self.assertEqual(_realtime_headers(config), {"Authorization": "Bearer user-key"})
@@ -141,7 +149,7 @@ class VoiceTests(unittest.TestCase):
         self.assertIn("OpenAI Realtime voice requires", status.input_reason or "")
         self.assertEqual(status.input_secret_provider, "voice")
 
-    def test_missing_turn_voice_key_requests_masked_voice_key_prompt(self) -> None:
+    def test_missing_voice_key_requests_masked_voice_key_prompt(self) -> None:
         with (
             patch.dict("os.environ", {}, clear=True),
             patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
@@ -150,7 +158,7 @@ class VoiceTests(unittest.TestCase):
 
         self.assertFalse(status.input_ready)
         self.assertEqual(status.input_secret_provider, "voice")
-        self.assertIn("Voice needs an API key", status.input_reason or "")
+        self.assertIn("OpenAI Realtime voice requires", status.input_reason or "")
 
     def test_huggingface_voice_provider_uses_local_backend_only_when_explicit(self) -> None:
         with (
@@ -299,10 +307,48 @@ class VoiceTests(unittest.TestCase):
             )
 
     def test_realtime_voice_api_key_uses_huggingface_token_environment(self) -> None:
-        with patch.dict("os.environ", {"HF_TOKEN": "hf-secret"}, clear=True):
+        with patch.dict(
+            "os.environ",
+            {"AGENT_VOICE_PROVIDER": "huggingface-public", "HF_TOKEN": "hf-secret"},
+            clear=True,
+        ):
             config = VoiceConfig.from_environment()
 
         self.assertEqual(config.realtime_api_key, "hf-secret")
+
+    def test_openai_realtime_session_requests_live_english_transcription(self) -> None:
+        class WebSocket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            async def send(self, value: str) -> None:
+                self.sent.append(value)
+
+        websocket = WebSocket()
+        with patch.dict(
+            "os.environ",
+            {"OPENAI_API_KEY": "user-key"},
+            clear=True,
+        ):
+            config = VoiceConfig.from_environment()
+            asyncio.run(_realtime_handshake(websocket, config))
+
+        update = json.loads(websocket.sent[0])
+        transcription = update["session"]["audio"]["input"]["transcription"]
+        self.assertEqual(update["session"]["type"], "transcription")
+        self.assertEqual(transcription["model"], "gpt-live-transcribe")
+        self.assertEqual(transcription["languages"], ["en"])
+        self.assertEqual(transcription["delay"], "low")
+
+    def test_voice_language_can_use_automatic_detection(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"OPENAI_API_KEY": "user-key", "AGENT_VOICE_LANGUAGE": "auto"},
+            clear=True,
+        ):
+            config = VoiceConfig.from_environment()
+
+        self.assertIsNone(config.language)
 
     def test_realtime_connect_url_accepts_direct_websocket(self) -> None:
         self.assertEqual(

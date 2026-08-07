@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Iterable
+from typing import Callable, Iterable
 
 from openai import OpenAI
 
@@ -55,7 +55,7 @@ _OPENAI_REALTIME_VOICE_PROVIDERS = {
     "realtime-openai",
 }
 _OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-_OPENAI_REALTIME_MODEL = "gpt-realtime"
+_OPENAI_REALTIME_MODEL = "gpt-live-transcribe"
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,7 @@ class VoiceConfig:
     api_key: str | None
     base_url: str | None
     stt_model: str
+    language: str | None
     tts_model: str
     tts_voice: str
     auto_speak: bool
@@ -152,6 +153,7 @@ class VoiceConfig:
             stt_model=os.environ.get(
                 "AGENT_VOICE_STT_MODEL", "gpt-4o-mini-transcribe"
             ).strip(),
+            language=_voice_language_from_environment(),
             tts_model=os.environ.get(
                 "AGENT_VOICE_TTS_MODEL", "gpt-4o-mini-tts"
             ).strip(),
@@ -294,6 +296,38 @@ def bridge_voice_record() -> dict[str, object]:
         return {"ok": False, "error": _voice_error("Voice input failed", exc)}
 
 
+def bridge_voice_stream() -> int:
+    """Emit live microphone transcript frames for the Rust TUI bridge."""
+    def emit(payload: dict[str, object]) -> None:
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+    try:
+        config = VoiceConfig.from_environment()
+        status = voice_status()
+        if not status.input_ready:
+            raise RuntimeError(status.input_reason or "Voice input is unavailable.")
+
+        stream_command = _stream_recorder_command(
+            config,
+            sample_rate=_realtime_input_sample_rate(config),
+        )
+        if config.mode == "realtime" and stream_command is not None:
+            transcript = asyncio.run(
+                _transcribe_realtime_microphone(
+                    config,
+                    stream_command,
+                    lambda delta: emit({"kind": "delta", "delta": delta}),
+                )
+            )
+        else:
+            transcript = transcribe_microphone()
+        emit({"kind": "final", "transcript": transcript})
+        return 0
+    except Exception as exc:
+        emit({"kind": "error", "error": _voice_error("Voice input failed", exc)})
+        return 1
+
+
 def bridge_voice_speak(text: str) -> dict[str, object]:
     try:
         speak(text)
@@ -320,12 +354,14 @@ def _transcribe_audio(config: VoiceConfig, audio_path: Path) -> str:
         return completed.stdout.strip()
 
     client = _openai_client(config)
+    options: dict[str, object] = {
+        "model": config.stt_model,
+        "response_format": "text",
+    }
+    if config.language:
+        options["language"] = config.language
     with audio_path.open("rb") as audio_file:
-        response = client.audio.transcriptions.create(
-            model=config.stt_model,
-            file=audio_file,
-            response_format="text",
-        )
+        response = client.audio.transcriptions.create(file=audio_file, **options)
     return str(response).strip()
 
 
@@ -377,22 +413,52 @@ def _ffmpeg_record_command(seconds: int) -> list[str]:
     ]
 
 
+def _stream_recorder_command(
+    config: VoiceConfig,
+    *,
+    sample_rate: int,
+) -> tuple[str, ...] | None:
+    """Return a recorder command that writes raw mono PCM16 to stdout."""
+    if config.recorder_command:
+        return None
+    if shutil.which("ffmpeg"):
+        if sys.platform == "darwin":
+            source = ("-f", "avfoundation", "-i", ":0")
+        else:
+            source_format = "pulse" if os.environ.get("PULSE_SERVER") or _is_wsl() else "alsa"
+            source = ("-f", source_format, "-i", "default")
+        return (
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            *source,
+            "-ac", "1", "-ar", str(sample_rate),
+            "-t", str(config.record_seconds),
+            "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
+        )
+    if shutil.which("arecord"):
+        return (
+            "arecord", "--quiet", "--format=S16_LE", "--file-type=raw",
+            f"--rate={sample_rate}", "--channels=1",
+            f"--duration={config.record_seconds}",
+        )
+    return None
+
+
 def _stt_provider(config: VoiceConfig) -> str | None:
     if config.mode == "realtime":
         if not config.realtime_url:
             raise RuntimeError(
                 "AGENT_REALTIME_VOICE_URL is required when AGENT_VOICE_MODE=realtime."
             )
+        if _is_openai_realtime_provider(config) and not _openai_realtime_api_key(config):
+            raise RuntimeError(
+                "OpenAI Realtime voice requires AGENT_REALTIME_VOICE_API_KEY, "
+                "AGENT_VOICE_API_KEY, or OPENAI_API_KEY."
+            )
         if importlib.util.find_spec("websockets") is None:
             raise RuntimeError(
                 "Realtime voice requires the Python package 'websockets'."
             )
         if _is_openai_realtime_provider(config):
-            if not _openai_realtime_api_key(config):
-                raise RuntimeError(
-                    "OpenAI Realtime voice requires AGENT_REALTIME_VOICE_API_KEY, "
-                    "AGENT_VOICE_API_KEY, or OPENAI_API_KEY."
-                )
             return "openai-realtime"
         if config.realtime_local_autostart and _is_local_realtime_url(config.realtime_url):
             if _local_realtime_start_command(config) is None:
@@ -498,6 +564,7 @@ async def _transcribe_realtime_chunks(
         raise RuntimeError("Realtime voice requires the Python package 'websockets'.") from exc
 
     transcript_parts: list[str] = []
+    final_transcript: str | None = None
     headers = _realtime_headers(config)
     try:
         connection = websockets.connect(
@@ -531,31 +598,171 @@ async def _transcribe_realtime_chunks(
             event_type = str(event.get("type") or "")
             if event_type == "error":
                 raise RuntimeError(_realtime_error_message(event))
-            fragment = _transcript_fragment(event)
-            if fragment:
-                transcript_parts.append(fragment)
+            if event_type.endswith("input_audio_transcription.delta"):
+                fragment = str(event.get("delta") or "")
+                if fragment:
+                    transcript_parts.append(fragment)
+            elif event_type.endswith("input_audio_transcription.completed"):
+                final_transcript = str(event.get("transcript") or "")
             if _realtime_done(event_type):
                 break
-    transcript = " ".join("".join(transcript_parts).split())
+    transcript = " ".join((final_transcript or "".join(transcript_parts)).split())
     if not transcript:
         raise RuntimeError("Realtime voice server returned no transcript.")
     return transcript
+
+
+async def _transcribe_realtime_microphone(
+    config: VoiceConfig,
+    command: tuple[str, ...],
+    on_delta: Callable[[str], None],
+) -> str:
+    """Stream raw microphone PCM to Realtime and forward transcript deltas."""
+    if not config.realtime_url:
+        raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
+    try:
+        import websockets
+    except ImportError as exc:
+        raise RuntimeError("Realtime voice requires the Python package 'websockets'.") from exc
+
+    connect_url = _realtime_connect_url(
+        config.realtime_url,
+        api_key=config.realtime_api_key,
+    )
+    headers = _realtime_headers(config)
+    try:
+        connection = websockets.connect(
+            connect_url,
+            open_timeout=config.realtime_timeout_seconds,
+            additional_headers=headers,
+        )
+    except TypeError:
+        connection = websockets.connect(
+            connect_url,
+            open_timeout=config.realtime_timeout_seconds,
+            extra_headers=headers,
+        )
+
+    process: subprocess.Popen[bytes] | None = None
+    sender: asyncio.Task[None] | None = None
+    transcript_parts: list[str] = []
+    final_transcript: str | None = None
+    try:
+        async with connection as ws:
+            await _realtime_handshake(ws, config)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if process.stdout is None:
+                raise RuntimeError("Microphone recorder stdout was not captured.")
+
+            async def send_audio() -> None:
+                assert process is not None and process.stdout is not None
+                sent_audio = False
+                while True:
+                    chunk = await asyncio.to_thread(
+                        process.stdout.read,
+                        _REALTIME_CHUNK_BYTES,
+                    )
+                    if not chunk:
+                        break
+                    sent_audio = True
+                    await ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk).decode("ascii"),
+                    }))
+                if not sent_audio:
+                    detail = _recorder_error(process)
+                    raise RuntimeError(detail or "The recorder did not produce usable audio.")
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+            sender = asyncio.create_task(send_audio())
+            deadline = time.monotonic() + config.record_seconds + config.realtime_timeout_seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Realtime voice server did not finish transcription.")
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=min(1.0, remaining))
+                except asyncio.TimeoutError:
+                    if sender.done():
+                        sender.result()
+                    continue
+                event = _json_event(raw)
+                event_type = str(event.get("type") or "")
+                if event_type == "error":
+                    raise RuntimeError(_realtime_error_message(event))
+                if event_type.endswith("input_audio_transcription.failed"):
+                    raise RuntimeError(_realtime_error_message(event))
+                if event_type.endswith("input_audio_transcription.delta"):
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        transcript_parts.append(delta)
+                        on_delta(delta)
+                elif event_type.endswith("input_audio_transcription.completed"):
+                    final_transcript = str(event.get("transcript") or "")
+                    break
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        if sender is not None and not sender.done():
+            sender.cancel()
+        if sender is not None:
+            await asyncio.gather(sender, return_exceptions=True)
+
+    transcript = " ".join((final_transcript or "".join(transcript_parts)).split())
+    if not transcript:
+        raise RuntimeError("Realtime voice server returned no transcript.")
+    return transcript
+
+
+def _recorder_error(process: subprocess.Popen[bytes]) -> str:
+    if process.stderr is None:
+        return ""
+    try:
+        return process.stderr.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
 
 
 async def _realtime_handshake(ws: object, config: VoiceConfig) -> None:
     if config.realtime_session_update:
         update = config.realtime_session_update
     elif _is_openai_realtime_provider(config):
+        transcription: dict[str, object] = {
+            "model": _openai_realtime_transcription_model(),
+        }
+        if config.language:
+            if _openai_realtime_transcription_model() == "gpt-live-transcribe":
+                transcription["languages"] = [config.language]
+                transcription["delay"] = "low"
+            else:
+                transcription["language"] = config.language
         update = {
             "type": "session.update",
             "session": {
-                "modalities": ["text"],
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": _openai_realtime_transcription_model(),
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "noise_reduction": {"type": "near_field"},
+                        "transcription": transcription,
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 700,
+                        },
+                    },
                 },
-                "turn_detection": None,
             },
         }
     else:
@@ -603,7 +810,7 @@ def _openai_realtime_transcription_model() -> str:
     return (
         os.environ.get("AGENT_REALTIME_VOICE_TRANSCRIPTION_MODEL", "").strip()
         or os.environ.get("AGENT_VOICE_REALTIME_TRANSCRIPTION_MODEL", "").strip()
-        or "whisper-1"
+        or "gpt-live-transcribe"
     )
 
 
@@ -930,9 +1137,14 @@ def _environment_command(name: str) -> tuple[str, ...] | None:
 
 
 def _realtime_voice_api_key_from_environment() -> str | None:
+    explicit = os.environ.get("AGENT_REALTIME_VOICE_API_KEY", "").strip()
+    if explicit:
+        return explicit
+    provider = _voice_provider_from_environment()
+    if provider not in _HF_REALTIME_VOICE_PROVIDERS | _HF_SPACE_REALTIME_VOICE_PROVIDERS:
+        return None
     return (
-        os.environ.get("AGENT_REALTIME_VOICE_API_KEY", "").strip()
-        or os.environ.get("HF_TOKEN", "").strip()
+        os.environ.get("HF_TOKEN", "").strip()
         or os.environ.get("HUGGINGFACEHUB_API_TOKEN", "").strip()
         or os.environ.get("HUGGING_FACE_HUB_TOKEN", "").strip()
         or None
@@ -944,7 +1156,27 @@ def _voice_provider_from_environment() -> str | None:
         os.environ.get("AGENT_VOICE_PROVIDER", "").strip()
         or os.environ.get("AGENT_VOICE_STT_PROVIDER", "").strip()
     )
-    return raw.casefold() or None
+    if raw:
+        return raw.casefold()
+    if os.environ.get("AGENT_VOICE_MODE", "").strip():
+        return None
+    if any(
+        os.environ.get(name, "").strip()
+        for name in (
+            "AGENT_VOICE_RECORDER",
+            "AGENT_VOICE_STT_COMMAND",
+            "AGENT_VOICE_BASE_URL",
+        )
+    ):
+        return None
+    return "openai-realtime"
+
+
+def _voice_language_from_environment() -> str | None:
+    language = os.environ.get("AGENT_VOICE_LANGUAGE", "en").strip().casefold()
+    if language in {"", "auto", "detect"}:
+        return None
+    return language
 
 
 def _voice_mode_from_environment() -> str:

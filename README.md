@@ -82,22 +82,26 @@ existing Nym runtime; tool use, approvals, session memory, and model routing are
 exactly the same as typed prompts. On WSL, the installer provides `ffmpeg` for
 microphone capture and `espeak-ng` for local speech playback.
 
-Nym reuses an existing `OPENAI_API_KEY` for OpenAI-compatible transcription and
-speech. `AGENT_VOICE_API_KEY` and `AGENT_VOICE_BASE_URL` can instead point voice at a
-separate OpenAI-compatible voice service, including a subscription-gated Nym cloud
-voice bridge. Models and voice are configurable with `AGENT_VOICE_STT_MODEL`,
-`AGENT_VOICE_TTS_MODEL`, and `AGENT_VOICE_TTS_VOICE`.
+By default, Nym uses OpenAI Realtime transcription with the user's masked voice key
+or an existing `OPENAI_API_KEY`. Partial transcripts appear in the composer while the
+user is speaking, but only the completed transcript is submitted through the normal
+agent runtime. English is the default recognition language; set
+`AGENT_VOICE_LANGUAGE` to another supported language code, or to `auto` for automatic
+detection.
 
-For OpenAI Realtime voice using the user's API key, set:
+An environment-based setup can provide the key before launch:
 
 ```bash
 export OPENAI_API_KEY="..."
-export AGENT_VOICE_PROVIDER=openai-realtime
 ```
 
-This connects to `wss://api.openai.com/v1/realtime?model=gpt-realtime`, receives
-only the user transcript, and submits that transcript through the normal local Nym
-runtime. Override the realtime model with `AGENT_REALTIME_VOICE_MODEL` if needed.
+This connects to OpenAI Realtime transcription, receives only the user transcript,
+and submits that transcript through the normal local Nym runtime. Override the
+realtime transcription model with `AGENT_REALTIME_VOICE_TRANSCRIPTION_MODEL` if
+needed. `AGENT_VOICE_API_KEY` and `AGENT_VOICE_BASE_URL` can still point turn-based
+voice at a separate OpenAI-compatible service, including a subscription-gated Nym
+cloud voice bridge. Turn-based models and speech output remain configurable with
+`AGENT_VOICE_STT_MODEL`, `AGENT_VOICE_TTS_MODEL`, and `AGENT_VOICE_TTS_VOICE`.
 
 For an entirely local setup, provide commands without a key: `AGENT_VOICE_RECORDER`
 must contain `{output}`, `AGENT_VOICE_STT_COMMAND` must contain `{input}`, and

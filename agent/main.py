@@ -1117,7 +1117,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tui-bridge",
         choices=(
             "snapshot", "submit", "stream-submit", "complete", "gateway",
-            "approve", "deny", "voice-record", "voice-speak",
+            "approve", "deny", "voice-record", "voice-stream", "voice-speak",
         ),
         help=argparse.SUPPRESS,
     )
@@ -4389,6 +4389,9 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
         elif args.tui_bridge == "voice-record":
             from .voice import bridge_voice_record
             payload = bridge_voice_record()
+        elif args.tui_bridge == "voice-stream":
+            from .voice import bridge_voice_stream
+            return bridge_voice_stream()
         elif args.tui_bridge == "voice-speak":
             from .voice import bridge_voice_speak
             text = (args.bridge_prompt or "").strip()
