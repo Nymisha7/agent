@@ -76,15 +76,28 @@ for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`, `/status`, `/setu
 
 ## Voice
 
-Voice setup is optional and never opens an API-key prompt. The microphone is active
-only when Nym finds a recorder plus a transcription path; otherwise it stays muted and
-explains the missing local capability when selected. On WSL, the installer provides
-`ffmpeg` for microphone capture and `espeak-ng` for local speech playback.
+Voice setup is optional and never opens an API-key prompt. Fresh installs include the
+local Hugging Face `speech-to-speech` WebSocket backend by default, so the microphone
+uses open-source local models when the host can run them. The voice layer only turns
+speech into text for the existing Nym runtime; tool use, approvals, session memory,
+and model routing are exactly the same as typed prompts. On WSL, the installer also
+provides `ffmpeg` for microphone capture and `espeak-ng` for local speech playback.
 
-Nym reuses an existing `OPENAI_API_KEY` for OpenAI-compatible transcription and speech.
-`AGENT_VOICE_API_KEY` and `AGENT_VOICE_BASE_URL` can instead point voice at a separate
-OpenAI-compatible service. Models and voice are configurable with
-`AGENT_VOICE_STT_MODEL`, `AGENT_VOICE_TTS_MODEL`, and `AGENT_VOICE_TTS_VOICE`.
+The local Hugging Face backend is selected automatically when `speech-to-speech` is
+installed. Set `AGENT_VOICE_PROVIDER=huggingface` to force it, or
+`NYM_SKIP_LOCAL_VOICE=1` during installation to skip the large local voice package.
+The first voice use may download open-source model weights into the normal Hugging
+Face cache on the machine; no Hugging Face token or OpenAI Realtime key is required.
+Advanced installs can override the server command with
+`AGENT_REALTIME_VOICE_START_COMMAND`, the local realtime URL with
+`AGENT_HF_VOICE_LOCAL_URL`, or the local model choices with `AGENT_HF_VOICE_STT`,
+`AGENT_HF_VOICE_LLM_BACKEND`, `AGENT_HF_VOICE_LLM_MODEL`, and `AGENT_HF_VOICE_TTS`.
+
+Nym can still reuse an existing `OPENAI_API_KEY` for OpenAI-compatible transcription
+and speech when the local Hugging Face backend is not installed or an explicit custom
+provider is configured. `AGENT_VOICE_API_KEY` and `AGENT_VOICE_BASE_URL` can instead
+point voice at a separate OpenAI-compatible service. Models and voice are configurable
+with `AGENT_VOICE_STT_MODEL`, `AGENT_VOICE_TTS_MODEL`, and `AGENT_VOICE_TTS_VOICE`.
 
 For an entirely local setup, provide commands without a key: `AGENT_VOICE_RECORDER`
 must contain `{output}`, `AGENT_VOICE_STT_COMMAND` must contain `{input}`, and
@@ -95,10 +108,10 @@ default. `AGENT_VOICE_RECORD_SECONDS` bounds a microphone turn (default 20 secon
 and `AGENT_VOICE_ENABLED=0` disables the feature entirely.
 
 Realtime speech backends can be used as an optional voice transport without making
-them the agent brain. To use the public Hugging Face Space, set
-`AGENT_VOICE_PROVIDER=huggingface`; Nym will use
-`https://huggingface.co/spaces/smolagents/hf-realtime-voice` and will not require an
-OpenAI key for transcription. You can also set `AGENT_VOICE_MODE=realtime` and
+them the agent brain. To use the local Hugging Face backend, set
+`AGENT_VOICE_PROVIDER=huggingface`; Nym will start/connect to
+`ws://127.0.0.1:8765/v1/realtime` and will not require an OpenAI key for
+transcription. You can also set `AGENT_VOICE_MODE=realtime` and
 `AGENT_REALTIME_VOICE_URL` to a direct `wss://` endpoint, an HTTP server that returns
 a `connect_url` from `/session` or `/api/session`, or a Hugging Face Space page URL such as
 `https://huggingface.co/spaces/smolagents/hf-realtime-voice`. If the realtime session

@@ -6,6 +6,7 @@ from unittest.mock import patch
 from agent.voice import (
     VoiceConfig,
     _chunk_bytes,
+    _local_realtime_start_command,
     _realtime_connect_url,
     _realtime_session_url,
     _realtime_session_url_candidates,
@@ -18,9 +19,14 @@ from agent.voice import (
 
 class VoiceTests(unittest.TestCase):
     def test_voice_uses_existing_openai_key_without_network_probe(self) -> None:
+        def no_local_voice(name: str) -> str | None:
+            if name == "speech-to-speech":
+                return None
+            return "/usr/bin/" + name
+
         with (
             patch.dict("os.environ", {"OPENAI_API_KEY": "existing-key"}, clear=True),
-            patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            patch("agent.voice.shutil.which", side_effect=no_local_voice),
         ):
             status = voice_status()
 
@@ -29,6 +35,17 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(status.stt_provider, "openai-compatible")
         self.assertEqual(status.tts_provider, "system")
         self.assertFalse(status.auto_speak)
+
+    def test_installed_huggingface_local_voice_is_default_stt_provider(self) -> None:
+        with (
+            patch.dict("os.environ", {"OPENAI_API_KEY": "existing-key"}, clear=True),
+            patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            patch("agent.voice.importlib.util.find_spec", return_value=object()),
+        ):
+            status = voice_status()
+
+        self.assertTrue(status.input_ready)
+        self.assertEqual(status.stt_provider, "huggingface-local")
 
     def test_voice_can_use_local_commands_without_a_key(self) -> None:
         environment = {
@@ -111,10 +128,57 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(config.mode, "realtime")
         self.assertEqual(
             config.realtime_url,
+            "ws://127.0.0.1:8765/v1/realtime",
+        )
+        self.assertTrue(config.realtime_local_autostart)
+        self.assertTrue(status.input_ready)
+        self.assertEqual(status.stt_provider, "huggingface-local")
+
+    def test_huggingface_public_space_provider_remains_explicit(self) -> None:
+        with (
+            patch.dict("os.environ", {"AGENT_VOICE_PROVIDER": "huggingface-public"}, clear=True),
+            patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            patch("agent.voice.importlib.util.find_spec", return_value=object()),
+        ):
+            config = VoiceConfig.from_environment()
+            status = voice_status()
+
+        self.assertEqual(config.mode, "realtime")
+        self.assertEqual(
+            config.realtime_url,
             "https://huggingface.co/spaces/smolagents/hf-realtime-voice",
         )
+        self.assertFalse(config.realtime_local_autostart)
         self.assertTrue(status.input_ready)
         self.assertEqual(status.stt_provider, "huggingface-realtime")
+
+    def test_huggingface_local_provider_requires_local_backend_command(self) -> None:
+        def no_speech_to_speech(name: str) -> str | None:
+            if name == "speech-to-speech":
+                return None
+            return "/usr/bin/" + name
+
+        with (
+            patch.dict("os.environ", {"AGENT_VOICE_PROVIDER": "huggingface"}, clear=True),
+            patch("agent.voice.shutil.which", side_effect=no_speech_to_speech),
+            patch("agent.voice.importlib.util.find_spec", return_value=object()),
+        ):
+            status = voice_status()
+
+        self.assertFalse(status.input_ready)
+        self.assertIn("speech-to-speech", status.input_reason or "")
+
+    def test_huggingface_local_start_command_uses_open_source_backend(self) -> None:
+        with (
+            patch.dict("os.environ", {"AGENT_VOICE_PROVIDER": "huggingface"}, clear=True),
+            patch("agent.voice.shutil.which", return_value="/usr/bin/speech-to-speech"),
+        ):
+            command = _local_realtime_start_command(VoiceConfig.from_environment())
+
+        self.assertIsNotNone(command)
+        self.assertIn("--llm_backend", command or ())
+        self.assertIn("transformers", command or ())
+        self.assertNotIn("responses-api", command or ())
 
     def test_realtime_voice_requires_url(self) -> None:
         with (

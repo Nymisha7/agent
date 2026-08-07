@@ -16,9 +16,11 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,13 +33,21 @@ _DEFAULT_RECORD_SECONDS = 20
 _MAX_RECORD_SECONDS = 120
 _REALTIME_CHUNK_BYTES = 1280
 _HF_REALTIME_VOICE_SPACE_URL = "https://huggingface.co/spaces/smolagents/hf-realtime-voice"
+_HF_LOCAL_REALTIME_URL = "ws://127.0.0.1:8765/v1/realtime"
 _HF_REALTIME_VOICE_PROVIDERS = {
     "hf",
+    "hf-local",
     "hf-realtime",
     "hf-space",
     "huggingface",
+    "huggingface-local",
     "huggingface-realtime",
     "huggingface-space",
+}
+_HF_SPACE_REALTIME_VOICE_PROVIDERS = {
+    "hf-space-public",
+    "huggingface-space-public",
+    "huggingface-public",
 }
 
 
@@ -76,6 +86,9 @@ class VoiceConfig:
     realtime_session_update: dict[str, object] | None
     realtime_timeout_seconds: int
     realtime_api_key: str | None
+    realtime_local_autostart: bool
+    realtime_start_command: tuple[str, ...] | None
+    realtime_start_timeout_seconds: int
     api_key: str | None
     base_url: str | None
     stt_model: str
@@ -109,6 +122,14 @@ class VoiceConfig:
                 maximum=180,
             ),
             realtime_api_key=_realtime_voice_api_key_from_environment(),
+            realtime_local_autostart=_realtime_local_autostart_from_environment(),
+            realtime_start_command=_environment_command("AGENT_REALTIME_VOICE_START_COMMAND"),
+            realtime_start_timeout_seconds=_environment_int(
+                "AGENT_REALTIME_VOICE_START_TIMEOUT_SECONDS",
+                default=180,
+                minimum=5,
+                maximum=900,
+            ),
             api_key=(
                 os.environ.get("AGENT_VOICE_API_KEY", "").strip()
                 or os.environ.get("OPENAI_API_KEY", "").strip()
@@ -325,6 +346,13 @@ def _stt_provider(config: VoiceConfig) -> str | None:
             raise RuntimeError(
                 "Realtime voice requires the Python package 'websockets'."
             )
+        if config.realtime_local_autostart and _is_local_realtime_url(config.realtime_url):
+            if _local_realtime_start_command(config) is None:
+                raise RuntimeError(
+                    "Local Hugging Face voice requires the 'speech-to-speech' command. "
+                    "Install local voice dependencies, then retry."
+                )
+            return "huggingface-local"
         if _is_huggingface_realtime_url(config.realtime_url):
             return "huggingface-realtime"
         return "realtime-websocket"
@@ -370,16 +398,18 @@ def _default_playback_commands(audio_path: Path) -> Iterable[list[str]]:
 
 
 def transcribe_realtime_audio(config: VoiceConfig, audio_path: Path) -> str:
-    """Send one recorded turn through an OpenAI-Realtime-style speech server.
+    """Send one recorded turn through a local OpenAI-Realtime-style speech server.
 
-    The Hugging Face realtime voice Space documents a WebSocket route that
-    accepts PCM16 16 kHz mono audio chunks and emits transcript deltas. Nym uses
-    that protocol only as a voice transport: the returned transcript is still
+    The Hugging Face speech-to-speech backend exposes the same WebSocket wire
+    shape as the smolagents HF realtime voice Space. Nym uses only the local
+    speech transport/transcription part of that protocol: the transcript is
     submitted to the normal Agent runtime, so desktop actions and approvals keep
     the same behavior as typed text.
     """
     if not config.realtime_url:
         raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
+    if config.realtime_local_autostart and _is_local_realtime_url(config.realtime_url):
+        _ensure_local_realtime_server(config)
     chunks = list(_pcm16_chunks(audio_path))
     if not chunks:
         raise RuntimeError("Recorded audio did not contain usable PCM data.")
@@ -408,7 +438,6 @@ async def _transcribe_realtime_chunks(
                 "audio": base64.b64encode(chunk).decode("ascii"),
             }))
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-        await ws.send(json.dumps({"type": "response.create"}))
         while True:
             try:
                 raw = await asyncio.wait_for(
@@ -510,6 +539,96 @@ def _realtime_session_url_candidates(raw_url: str) -> list[str]:
     if url.endswith("/session") or url.endswith("/api/session"):
         return [url]
     return [f"{url}/session", f"{url}/api/session"]
+
+
+def _ensure_local_realtime_server(config: VoiceConfig) -> None:
+    url = config.realtime_url or _HF_LOCAL_REALTIME_URL
+    if _local_realtime_server_ready(url):
+        return
+    command = _local_realtime_start_command(config)
+    if command is None:
+        raise RuntimeError(
+            "Local Hugging Face voice requires the 'speech-to-speech' command. "
+            "Install local voice dependencies, then retry."
+        )
+    log_path = Path(tempfile.gettempdir()) / "nym-hf-realtime-voice.log"
+    try:
+        log_handle = log_path.open("ab")
+    except OSError:
+        log_handle = subprocess.DEVNULL  # type: ignore[assignment]
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Could not start local Hugging Face voice server: {exc}") from exc
+    finally:
+        close = getattr(log_handle, "close", None)
+        if callable(close):
+            close()
+
+    deadline = time.monotonic() + config.realtime_start_timeout_seconds
+    while time.monotonic() < deadline:
+        if _local_realtime_server_ready(url):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        "Local Hugging Face voice server did not become ready. "
+        f"Check {log_path} for startup details."
+    )
+
+
+def _local_realtime_start_command(config: VoiceConfig) -> tuple[str, ...] | None:
+    if config.realtime_start_command:
+        return config.realtime_start_command
+    executable = shutil.which("speech-to-speech")
+    if executable is None:
+        return None
+    return (
+        executable,
+        "--mode",
+        "realtime",
+        "--stt",
+        os.environ.get("AGENT_HF_VOICE_STT", "parakeet-tdt").strip() or "parakeet-tdt",
+        "--llm_backend",
+        os.environ.get("AGENT_HF_VOICE_LLM_BACKEND", "transformers").strip() or "transformers",
+        "--tts",
+        os.environ.get("AGENT_HF_VOICE_TTS", "qwen3").strip() or "qwen3",
+        "--model_name",
+        os.environ.get("AGENT_HF_VOICE_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507").strip()
+        or "Qwen/Qwen3-4B-Instruct-2507",
+        "--enable_live_transcription",
+    )
+
+
+def _local_realtime_server_ready(raw_url: str) -> bool:
+    host_port = _local_realtime_host_port(raw_url)
+    if host_port is None:
+        return False
+    host, port = host_port
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _local_realtime_host_port(raw_url: str) -> tuple[str, int] | None:
+    parsed = urllib.parse.urlparse(raw_url if "://" in raw_url else f"ws://{raw_url}")
+    host = parsed.hostname
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return None
+    scheme = parsed.scheme.casefold()
+    default_port = 443 if scheme == "wss" else 80
+    return host, parsed.port or default_port
+
+
+def _is_local_realtime_url(raw_url: str | None) -> bool:
+    return bool(raw_url and _local_realtime_host_port(raw_url) is not None)
 
 
 def _huggingface_space_app_url(raw_url: str) -> str:
@@ -695,12 +814,20 @@ def _voice_provider_from_environment() -> str | None:
         os.environ.get("AGENT_VOICE_PROVIDER", "").strip()
         or os.environ.get("AGENT_VOICE_STT_PROVIDER", "").strip()
     )
-    return raw.casefold() or None
+    if raw:
+        return raw.casefold()
+    if os.environ.get("AGENT_VOICE_MODE", "").strip():
+        return None
+    if os.environ.get("AGENT_VOICE_STT_COMMAND", "").strip():
+        return None
+    if shutil.which("speech-to-speech"):
+        return "huggingface"
+    return None
 
 
 def _voice_mode_from_environment() -> str:
     provider = _voice_provider_from_environment()
-    if provider in _HF_REALTIME_VOICE_PROVIDERS:
+    if provider in _HF_REALTIME_VOICE_PROVIDERS or provider in _HF_SPACE_REALTIME_VOICE_PROVIDERS:
         return "realtime"
     return _environment_choice(
         "AGENT_VOICE_MODE",
@@ -713,13 +840,22 @@ def _realtime_voice_url_from_environment() -> str | None:
     url = (
         os.environ.get("AGENT_REALTIME_VOICE_URL", "").strip()
         or os.environ.get("AGENT_REALTIME_VOICE_SESSION_URL", "").strip()
+        or os.environ.get("AGENT_HF_VOICE_LOCAL_URL", "").strip()
     )
     if url:
         return url
     provider = _voice_provider_from_environment()
     if provider in _HF_REALTIME_VOICE_PROVIDERS:
+        return _HF_LOCAL_REALTIME_URL
+    if provider in _HF_SPACE_REALTIME_VOICE_PROVIDERS:
         return _HF_REALTIME_VOICE_SPACE_URL
     return None
+
+
+def _realtime_local_autostart_from_environment() -> bool:
+    provider = _voice_provider_from_environment()
+    default = provider in _HF_REALTIME_VOICE_PROVIDERS
+    return _environment_flag("AGENT_REALTIME_VOICE_AUTOSTART", default=default)
 
 
 def _environment_choice(name: str, *, default: str, choices: set[str]) -> str:

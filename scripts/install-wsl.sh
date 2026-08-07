@@ -23,6 +23,8 @@ Environment:
   NYM_INSTALL_MODE   pipx or venv. Default: pipx
   NYM_AGENT_NAME     Initial display name for your agent. Default: Agent
   NYM_PREBUILT_WHEEL Set to 1 to use a bundled wheel when available.
+  NYM_SKIP_LOCAL_VOICE
+                     Set to 1 to skip installing the local Hugging Face voice backend.
 EOF
 }
 
@@ -152,6 +154,9 @@ install_with_pipx() {
     ensure_rust
   fi
   python3 -m pipx install --force "$package_source"
+  if [ "${NYM_SKIP_LOCAL_VOICE:-0}" != "1" ]; then
+    scripts/install-local-voice.sh --pipx-package agent
+  fi
   echo "Installed."
 }
 
@@ -166,6 +171,9 @@ install_with_venv() {
   python3 -m venv .venv
   .venv/bin/python -m pip install --upgrade pip
   .venv/bin/python -m pip install "$package_source"
+  if [ "${NYM_SKIP_LOCAL_VOICE:-0}" != "1" ]; then
+    scripts/install-local-voice.sh --python "$(pwd)/.venv/bin/python"
+  fi
   mkdir -p "$HOME/.local/bin"
   ln -sfn "$(pwd)/.venv/bin/nym" "$HOME/.local/bin/nym"
   echo "Installed nym at $HOME/.local/bin/nym"
