@@ -4590,6 +4590,9 @@ fn palette_context(input: &str) -> Option<PaletteContext<'_>> {
         return None;
     }
     let has_argument_slot = input[command.len()..].chars().any(char::is_whitespace);
+    if has_argument_slot && command.eq_ignore_ascii_case("/name") {
+        return None;
+    }
     Some(if has_argument_slot {
         PaletteContext {
             source: PaletteSource::Command(command),
@@ -6972,6 +6975,8 @@ mod tui_tests {
     fn palette_context_does_not_request_completion_for_complete_commands() {
         assert!(palette_context("/model openai gpt").is_none());
         assert!(palette_context("plain text").is_none());
+        assert!(palette_context("/name ").is_none());
+        assert!(palette_context("/name Nymi").is_none());
         assert!(matches!(
             palette_context("/model ").map(|context| context.source),
             Some(PaletteSource::Command("/model"))
