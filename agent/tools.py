@@ -2147,7 +2147,26 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
         rust_args["backend_bus"] = backend_bus
     if backend_path is not None:
         rust_args["backend_path"] = backend_path
-    return ctx.rust.desktop_action(**rust_args)
+    result = ctx.rust.desktop_action(**rust_args)
+    if (
+        action == "close_window"
+        and isinstance(result, dict)
+        and result.get("ok") is True
+        and result.get("verified") is not True
+    ):
+        failed = dict(result)
+        failed.update({
+            "ok": False,
+            "verified": False,
+            "recoverable": True,
+            "reason": "desktop_action_verification_failed",
+            "guidance": (
+                "The close command was dispatched, but the window was not confirmed closed. "
+                "Re-observe it before reporting success."
+            ),
+        })
+        return failed
+    return result
 
 
 def _desktop_send_message(args: dict[str, Any], ctx: ToolContext) -> Any:

@@ -3239,11 +3239,14 @@ where
     }
     let before = window_state(target)?;
     let output = run_capture_dynamic(argv)?;
-    thread::sleep(Duration::from_millis(100));
-    let after = window_state(target)?;
-    let verified = output.status == 0 && verify(&before, &after);
+    let (after, verified) = if output.status == 0 {
+        wait_for_window_verification(target, &before, &verify)?
+    } else {
+        (window_state(target)?, false)
+    };
+    let (ok, verification, reason) = window_action_outcome(output.status, verified);
     Ok(json!({
-        "ok": output.status == 0,
+        "ok": ok,
         "tool": "desktop_action",
         "action": action,
         "target": target,
@@ -3252,10 +3255,54 @@ where
         "before": before,
         "after": after,
         "verified": verified,
-        "verification": if output.status != 0 { "failed" } else if verified { "confirmed" } else { "not_confirmed" },
+        "verification": verification,
+        "reason": reason,
+        "recoverable": !ok,
+        "guidance": if output.status == 0 && !verified {
+            Some("The window action was dispatched, but its postcondition was not observed. Re-observe the window before reporting success.")
+        } else {
+            None
+        },
         "stdout": output.stdout,
         "stderr": output.stderr,
     }))
+}
+
+fn wait_for_window_verification<F>(
+    target: &str,
+    before: &Value,
+    verify: &F,
+) -> Result<(Value, bool)>
+where
+    F: Fn(&Value, &Value) -> bool,
+{
+    const ATTEMPTS: usize = 20;
+    const INTERVAL: Duration = Duration::from_millis(100);
+
+    let mut after = window_state(target)?;
+    for attempt in 0..ATTEMPTS {
+        if verify(before, &after) {
+            return Ok((after, true));
+        }
+        if attempt + 1 < ATTEMPTS {
+            thread::sleep(INTERVAL);
+            after = window_state(target)?;
+        }
+    }
+    Ok((after, false))
+}
+
+fn window_action_outcome(
+    status: i32,
+    verified: bool,
+) -> (bool, &'static str, Option<&'static str>) {
+    if status != 0 {
+        return (false, "failed", Some("command_failed"));
+    }
+    if !verified {
+        return (false, "not_confirmed", Some("verification_failed"));
+    }
+    (true, "confirmed", None)
 }
 
 fn window_state(target: &str) -> Result<Value> {
@@ -4100,12 +4147,16 @@ $processPath = try {{ $process.Path }} catch {{ $null }}
 fn windows_host_close_window_receipt(action: &str, target: &str) -> Result<Value> {
     let before = window_state(target)?;
     let output = windows_host_close_window(target)?;
-    thread::sleep(Duration::from_millis(250));
-    let after = window_state(target)?;
-    let after_closed = window_state_bool(&after, "visible") == Some(false);
-    let verified = output.status == 0 && after_closed;
+    let (after, verified) = if output.status == 0 {
+        wait_for_window_verification(target, &before, &|_, after| {
+            window_state_bool(after, "visible") == Some(false)
+        })?
+    } else {
+        (window_state(target)?, false)
+    };
+    let (ok, verification, reason) = window_action_outcome(output.status, verified);
     Ok(json!({
-        "ok": output.status == 0,
+        "ok": ok,
         "tool": "desktop_action",
         "action": action,
         "target": target,
@@ -4114,7 +4165,14 @@ fn windows_host_close_window_receipt(action: &str, target: &str) -> Result<Value
         "before": before,
         "after": after,
         "verified": verified,
-        "verification": if output.status != 0 { "failed" } else if verified { "confirmed" } else { "not_confirmed" },
+        "verification": verification,
+        "reason": reason,
+        "recoverable": !ok,
+        "guidance": if output.status == 0 && !verified {
+            Some("The close request was dispatched, but the window is still visible. Re-observe it before reporting success.")
+        } else {
+            None
+        },
         "stdout": output.stdout,
         "stderr": output.stderr,
     }))
@@ -4547,6 +4605,22 @@ mod tests {
             "_NET_WM_STATE_MAXIMIZED_VERT"
         ));
         assert!(!super::window_has_state(&state, "_NET_WM_STATE_HIDDEN"));
+    }
+
+    #[test]
+    fn window_action_requires_verified_postcondition_for_success() {
+        assert_eq!(
+            super::window_action_outcome(0, false),
+            (false, "not_confirmed", Some("verification_failed"))
+        );
+        assert_eq!(
+            super::window_action_outcome(0, true),
+            (true, "confirmed", None)
+        );
+        assert_eq!(
+            super::window_action_outcome(1, false),
+            (false, "failed", Some("command_failed"))
+        );
     }
 
     #[test]

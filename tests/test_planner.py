@@ -675,6 +675,63 @@ def test_close_window_intent_runs_without_approval() -> None:
     assert not session.pending_approvals
 
 
+def test_unverified_close_cannot_be_reported_as_success() -> None:
+    class CloseWindowLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **_kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(output=[{
+                    "type": "function_call",
+                    "name": "desktop_action",
+                    "call_id": "close-browser",
+                    "arguments": json.dumps({
+                        "action": "close_window",
+                        "target": "0xb0b2e",
+                    }),
+                }], output_text="")
+            if self.calls == 2:
+                return SimpleNamespace(output=[], output_text="Chrome closed.")
+            return SimpleNamespace(
+                output=[],
+                output_text="I could not confirm that Chrome closed; the window is still visible.",
+            )
+
+    class FakeRust:
+        def desktop_action(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "verified": False,
+                "verification": "not_confirmed",
+                "tool": "desktop_action",
+                **kwargs,
+            }
+
+    llm = CloseWindowLLM()
+    session = AgentSession(desktop_targets=[{
+        "kind": "window",
+        "id": "0xb0b2e",
+        "target": "0xb0b2e",
+        "title": "Chrome",
+    }])
+
+    answer = run_agent(
+        llm=llm,
+        rust=FakeRust(),
+        workspace_root=".",
+        user_prompt="close Chrome",
+        session=session,
+    )
+
+    assert answer == "I could not confirm that Chrome closed; the window is still visible."
+    assert llm.calls == 3
+    assert session.desktop_targets[-1].get("action") != "close_window"
+
+
 def test_close_application_approval_does_not_cover_another_process() -> None:
     session = AgentSession(desktop_targets=[
         {"kind": "window", "id": "0x1", "target": "0x1", "name": "editor"},
