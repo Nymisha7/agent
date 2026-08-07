@@ -757,6 +757,25 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["target"], "windows-app:abcdef")
 
+    def test_close_window_runs_without_approval(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **kwargs: Any) -> dict[str, object]:
+                return {"ok": True, "verified": True, **kwargs}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "close_window", "target": "0x30a2a"},
+            ctx,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["target"], "0x30a2a")
+
     def test_window_action_requires_target_before_approval(self) -> None:
         class FakeRust:
             def desktop_action(self, **_kwargs: Any) -> dict[str, object]:

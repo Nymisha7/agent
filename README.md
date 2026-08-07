@@ -76,11 +76,17 @@ for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`, `/status`, `/setu
 
 ## Voice
 
-Voice setup is optional and never opens an API-key prompt unless the user chooses a
-voice provider that needs one. The voice layer only turns speech into text for the
-existing Nym runtime; tool use, approvals, session memory, and model routing are
-exactly the same as typed prompts. On WSL, the installer provides `ffmpeg` for
-microphone capture and `espeak-ng` for local speech playback.
+Remote models require each user to configure their own provider credentials.
+Selecting a model whose provider needs an API key opens a masked key field in the
+TUI; the key is saved in Nym's encrypted local credential store. Local model
+providers remain available without an API key.
+
+Voice setup is optional. When voice credentials are missing, the TUI shows a setup
+notice and selecting the microphone opens the same masked key-entry experience. The
+voice layer only turns speech into text for the existing Nym runtime; tool use,
+approvals, session memory, and model routing are exactly the same as typed prompts.
+On WSL, the installer provides `ffmpeg` for microphone capture and `espeak-ng` for
+local speech playback.
 
 By default, Nym uses OpenAI Realtime transcription with the user's masked voice key
 or an existing `OPENAI_API_KEY`. Partial transcripts appear in the composer while the

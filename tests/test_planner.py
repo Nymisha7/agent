@@ -622,8 +622,8 @@ def test_keep_it_open_clarification_does_not_use_desktop_open_fast_path() -> Non
     assert llm.calls == 1
 
 
-def test_denied_desktop_approval_is_not_requested_again_in_same_prompt() -> None:
-    class RepeatCloseLLM:
+def test_close_window_intent_runs_without_approval() -> None:
+    class CloseWindowLLM:
         mode = "local"
 
         def __init__(self) -> None:
@@ -631,80 +631,25 @@ def test_denied_desktop_approval_is_not_requested_again_in_same_prompt() -> None
 
         def respond(self, **_kwargs: Any) -> Any:
             self.calls += 1
-            if self.calls <= 2:
+            if self.calls == 1:
                 return SimpleNamespace(output=[{
                     "type": "function_call",
                     "name": "desktop_action",
-                    "call_id": f"call-{self.calls}",
+                    "call_id": "close-window",
                     "arguments": json.dumps({
                         "action": "close_window",
                         "target": "0xb0b2e",
                     }),
                 }], output_text="")
-            return SimpleNamespace(output=[], output_text="stopped")
-
-    session = AgentSession(desktop_targets=[{
-        "kind": "window",
-        "id": "0xb0b2e",
-        "target": "0xb0b2e",
-        "title": "Notepad",
-    }])
-    requests: list[dict[str, Any]] = []
-
-    def deny(request: dict[str, Any]) -> str:
-        requests.append(dict(request))
-        return "denied"
-
-    answer = run_agent(
-        llm=RepeatCloseLLM(),
-        rust=object(),
-        workspace_root=".",
-        user_prompt="close all apps except vscode and cli",
-        session=session,
-        approval_requester=deny,
-    )
-
-    assert answer == "stopped"
-    assert len(requests) == 1
-    assert requests[0]["display_path"] == "desktop close_window Notepad"
-    assert len(session.pending_approvals) == 1
-    assert session.pending_approvals[0]["status"] == "denied"
-
-
-def test_approved_desktop_approval_is_not_requested_again_in_same_prompt() -> None:
-    class RepeatCloseLLM:
-        mode = "local"
-
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def respond(self, **_kwargs: Any) -> Any:
-            self.calls += 1
-            if self.calls <= 2:
-                return SimpleNamespace(output=[{
-                    "type": "function_call",
-                    "name": "desktop_action",
-                    "call_id": f"call-{self.calls}",
-                    "arguments": json.dumps({
-                        "action": "close_window",
-                        "target": "0xb0b2e",
-                    }),
-                }], output_text="")
-            return SimpleNamespace(output=[], output_text="done")
+            return SimpleNamespace(output=[], output_text="Notepad closed.")
 
     class FakeRust:
         def __init__(self) -> None:
-            self.calls = 0
+            self.calls: list[dict[str, Any]] = []
 
-        def desktop_action(self, **_kwargs: Any) -> dict[str, Any]:
-            self.calls += 1
-            return {
-                "ok": False,
-                "tool": "desktop_action",
-                "action": "close_window",
-                "target": "0xb0b2e",
-                "verification": "not_confirmed",
-            }
+        def desktop_action(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(dict(kwargs))
+            return {"ok": True, "verified": True, "tool": "desktop_action", **kwargs}
 
     rust = FakeRust()
     session = AgentSession(desktop_targets=[{
@@ -715,67 +660,19 @@ def test_approved_desktop_approval_is_not_requested_again_in_same_prompt() -> No
     }])
     requests: list[dict[str, Any]] = []
 
-    def approve(request: dict[str, Any]) -> str:
-        requests.append(dict(request))
-        return "approved"
-
     answer = run_agent(
-        llm=RepeatCloseLLM(),
+        llm=CloseWindowLLM(),
         rust=rust,
         workspace_root=".",
-        user_prompt="close all apps except vscode and cli",
-        session=session,
-        approval_requester=approve,
-    )
-
-    assert answer == "done"
-    assert len(requests) == 1
-    assert rust.calls == 2
-    assert session.pending_approvals[0]["status"] == "approved"
-
-
-def test_close_application_approval_covers_other_windows_from_same_process() -> None:
-    class CloseTwoWindowsLLM:
-        mode = "local"
-
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def respond(self, **_kwargs: Any) -> Any:
-            self.calls += 1
-            if self.calls <= 2:
-                return SimpleNamespace(output=[{
-                    "type": "function_call",
-                    "name": "desktop_action",
-                    "call_id": f"call-{self.calls}",
-                    "arguments": json.dumps({
-                        "action": "close_window",
-                        "target": f"0x{self.calls}",
-                    }),
-                }], output_text="")
-            return SimpleNamespace(output=[], output_text="done")
-
-    class FakeRust:
-        def desktop_action(self, **_kwargs: Any) -> dict[str, Any]:
-            return {"ok": True, "tool": "desktop_action", "action": "close_window"}
-
-    session = AgentSession(desktop_targets=[
-        {"kind": "window", "id": "0x1", "target": "0x1", "title": "Editor", "name": "editor"},
-        {"kind": "window", "id": "0x2", "target": "0x2", "title": "Editor Settings", "name": "editor"},
-    ])
-    requests: list[dict[str, Any]] = []
-
-    answer = run_agent(
-        llm=CloseTwoWindowsLLM(),
-        rust=FakeRust(),
-        workspace_root=".",
-        user_prompt="close the editor application",
+        user_prompt="close Notepad",
         session=session,
         approval_requester=lambda request: requests.append(dict(request)) or "approved",
     )
 
-    assert answer == "done"
-    assert len(requests) == 1
+    assert answer == "Notepad closed."
+    assert requests == []
+    assert rust.calls == [{"action": "close_window", "target": "0xb0b2e", "value": None}]
+    assert not session.pending_approvals
 
 
 def test_close_application_approval_does_not_cover_another_process() -> None:

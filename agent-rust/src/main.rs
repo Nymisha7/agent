@@ -1397,7 +1397,10 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
         .snapshot
         .ok_or_else(|| anyhow::anyhow!("Bridge did not return a snapshot."))?;
     let initial_needs_setup = snapshot.session.configuration_state != "ready";
-    let initial_status = if initial_needs_setup {
+    let initial_secret_provider = required_text_api_key_provider(&snapshot.session);
+    let initial_status = if let Some(provider) = initial_secret_provider.as_deref() {
+        api_key_prompt_status(provider)
+    } else if initial_needs_setup {
         format!(
             "{} needs setup",
             provider_display_name(&snapshot.session.provider)
@@ -1405,7 +1408,7 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
     } else {
         String::from("Ready")
     };
-    let initial_notices = if initial_needs_setup {
+    let mut initial_notices = if initial_needs_setup {
         vec![provider_setup_notice(
             &snapshot.session.provider,
             &snapshot.session.configuration,
@@ -1414,6 +1417,9 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
     } else {
         Vec::new()
     };
+    if let Some(notice) = voice_setup_notice(&snapshot.voice) {
+        initial_notices.push(notice);
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1458,7 +1464,7 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
             reasoning_text: String::new(),
             streaming_text: String::new(),
             running_prompt: None,
-            secret_provider: None,
+            secret_provider: initial_secret_provider,
             secret_input: String::new(),
             notices: initial_notices.into(),
             setup_required: initial_needs_setup,
@@ -1899,6 +1905,14 @@ fn run_tui_loop(
                     open_gateway_view(args.as_ref(), &mut app);
                     continue;
                 }
+                if !prompt.starts_with('/') {
+                    if let Some(provider) = required_text_api_key_provider(&app.snapshot.session) {
+                        app.secret_provider = Some(provider.clone());
+                        app.secret_input.clear();
+                        app.status = api_key_prompt_status(&provider);
+                        continue;
+                    }
+                }
                 start_prompt_submission(&runtime, &args, &tx, &mut app, prompt);
             }
             KeyCode::Up => {
@@ -2204,7 +2218,7 @@ fn start_voice_recording(
         if let Some(provider) = app.snapshot.voice.input_secret_provider.clone() {
             app.secret_provider = Some(provider);
             app.secret_input.clear();
-            app.status = String::from("Paste voice API key. Input is hidden.");
+            app.status = api_key_prompt_status("voice");
             return;
         }
         app.status = app
@@ -2720,7 +2734,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
 
     let input_title = if let Some(provider) = app.secret_provider.as_deref() {
         format!(
-            " {} API key (kept in memory) ",
+            " {} API key · hidden input ",
             provider_display_name(provider)
         )
     } else if app.attachment_path_mode {
@@ -5183,7 +5197,7 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                 if let Some(provider) = key_prompt_provider {
                     app.secret_provider = Some(provider.clone());
                     app.secret_input.clear();
-                    app.status = format!("{} needs an API key", provider_display_name(&provider));
+                    app.status = api_key_prompt_status(&provider);
                 }
             }
             _ => {}
@@ -5585,15 +5599,8 @@ fn provider_setup_notice(
     configuration_state: &str,
 ) -> UiNotice {
     let mut text = configuration.to_string();
-    let needs_api_key = provider != "openai-compatible"
-        && provider_api_key_env(provider).is_some()
-        && configuration_state == "api_key_required";
-    if needs_api_key {
-        text.push_str(&format!(
-            "\nRun /apikey {provider} to enter it in a masked prompt."
-        ));
-    } else if provider == "openai-compatible" {
-        text.push_str("\nConfigure AGENT_OPENAI_COMPAT_BASE_URL, then restart Agent.");
+    if configuration_state == "api_key_required" {
+        text.push_str("\nPaste your own API key in the masked field below.");
     } else {
         text.push_str("\nComplete the provider setup, then return to Agent.");
     }
@@ -5606,6 +5613,35 @@ fn provider_setup_notice(
         text,
         error: false,
     }
+}
+
+fn required_text_api_key_provider(session: &BridgeSession) -> Option<String> {
+    (session.configuration_state == "api_key_required").then(|| session.provider.clone())
+}
+
+fn api_key_prompt_status(provider: &str) -> String {
+    format!(
+        "Paste your {} API key. Input is hidden.",
+        provider_display_name(provider)
+    )
+}
+
+fn voice_setup_notice(voice: &BridgeVoice) -> Option<UiNotice> {
+    if voice.input_ready || voice.input_secret_provider.is_none() {
+        return None;
+    }
+    let mut text = voice
+        .input_reason
+        .clone()
+        .unwrap_or_else(|| String::from("Voice needs an API key."));
+    text.push_str(
+        "\nSelect the microphone, then paste your own API key in the masked field below.",
+    );
+    Some(UiNotice {
+        title: String::from("Voice setup"),
+        text,
+        error: false,
+    })
 }
 
 fn push_notice(app: &mut TuiApp, title: &str, text: &str, error: bool) {
@@ -6844,6 +6880,56 @@ mod tui_tests {
     fn voice_provider_uses_masked_api_key_prompt() {
         assert_eq!(provider_api_key_env("voice"), Some("AGENT_VOICE_API_KEY"));
         assert_eq!(provider_display_name("voice"), "Voice");
+    }
+
+    #[test]
+    fn missing_text_api_key_selects_masked_setup_provider() {
+        let session = anthropic_session();
+
+        assert_eq!(
+            required_text_api_key_provider(&session).as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn non_api_key_provider_state_does_not_select_masked_setup_provider() {
+        let mut session = anthropic_session();
+        session.configuration_state = String::from("credentials_required");
+        assert_eq!(required_text_api_key_provider(&session), None);
+
+        session.configuration_state = String::from("ready");
+        assert_eq!(required_text_api_key_provider(&session), None);
+    }
+
+    #[test]
+    fn missing_voice_key_produces_actionable_setup_notice() {
+        let voice = BridgeVoice {
+            input_ready: false,
+            input_reason: Some(String::from("Voice needs an API key.")),
+            input_secret_provider: Some(String::from("voice")),
+            tts_ready: false,
+            auto_speak: false,
+        };
+
+        let notice = voice_setup_notice(&voice).expect("voice setup notice");
+        assert_eq!(notice.title, "Voice setup");
+        assert!(notice.text.contains("Select the microphone"));
+        assert!(notice.text.contains("masked field"));
+        assert!(!notice.error);
+    }
+
+    #[test]
+    fn ready_voice_does_not_produce_setup_notice() {
+        let voice = BridgeVoice {
+            input_ready: true,
+            input_reason: None,
+            input_secret_provider: None,
+            tts_ready: false,
+            auto_speak: false,
+        };
+
+        assert!(voice_setup_notice(&voice).is_none());
     }
 
     #[test]

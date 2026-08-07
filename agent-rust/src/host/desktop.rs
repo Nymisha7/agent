@@ -154,14 +154,14 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
                 "approval_required",
                 Some("target_required"),
             ),
-            action_capability("launch_application", linux_supported && (has_gtk_launch || has_xdg_open || (wsl && has_powershell_host)), if has_gtk_launch { "gtk-launch" } else if has_xdg_open { "xdg-open" } else if wsl && has_powershell_host { "windows_host_powershell" } else { "path_lookup" }, "approval_required", Some("target_required")),
+            action_capability("launch_application", linux_supported && (has_gtk_launch || has_xdg_open || (wsl && has_powershell_host)), if has_gtk_launch { "gtk-launch" } else if has_xdg_open { "xdg-open" } else if wsl && has_powershell_host { "windows_host_powershell" } else { "path_lookup" }, "direct", Some("target_required")),
             action_capability("open_path", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
             action_capability("open_url", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
             action_capability("focus_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool") || (wsl && has_powershell_host)), window_control_backend(), "approval_required", Some("target_required")),
             action_capability("minimize_window", linux_supported && command_exists("xdotool"), "xdotool", "approval_required", Some("target_required")),
             action_capability("maximize_window", linux_supported && command_exists("wmctrl"), "wmctrl", "approval_required", Some("target_required")),
             action_capability("restore_window", linux_supported && command_exists("wmctrl"), "wmctrl", "approval_required", Some("target_required")),
-            action_capability("close_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool") || (wsl && has_powershell_host)), window_control_backend(), "approval_required", Some("target_required")),
+            action_capability("close_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool") || (wsl && has_powershell_host)), window_control_backend(), "direct", Some("target_required")),
             action_capability("clipboard_write", linux_supported && clipboard_backend() != "unavailable", clipboard_backend(), "approval_required", None),
             action_capability("clipboard_files", linux_supported && file_clipboard_backend() != "unavailable", file_clipboard_backend(), "approval_required", Some("existing_paths_required")),
             action_capability("send_key", linux_supported && command_exists("xdotool"), "xdotool", "approval_required", None),
@@ -4316,6 +4316,17 @@ mod tests {
             .get("backends")
             .and_then(Value::as_object)
             .is_some());
+        let actions = capabilities
+            .get("actions")
+            .and_then(Value::as_array)
+            .expect("desktop actions");
+        for action_name in ["launch_application", "close_window"] {
+            let action = actions
+                .iter()
+                .find(|action| action.get("action").and_then(Value::as_str) == Some(action_name))
+                .expect("direct desktop action");
+            assert_eq!(action.get("safety").and_then(Value::as_str), Some("direct"));
+        }
     }
 
     #[test]
