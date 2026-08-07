@@ -139,6 +139,18 @@ class VoiceTests(unittest.TestCase):
 
         self.assertFalse(status.input_ready)
         self.assertIn("OpenAI Realtime voice requires", status.input_reason or "")
+        self.assertEqual(status.input_secret_provider, "voice")
+
+    def test_missing_turn_voice_key_requests_masked_voice_key_prompt(self) -> None:
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("agent.voice.shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+        ):
+            status = voice_status()
+
+        self.assertFalse(status.input_ready)
+        self.assertEqual(status.input_secret_provider, "voice")
+        self.assertIn("Voice needs an API key", status.input_reason or "")
 
     def test_huggingface_voice_provider_uses_local_backend_only_when_explicit(self) -> None:
         with (

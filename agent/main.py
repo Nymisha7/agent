@@ -409,6 +409,7 @@ PROVIDER_LOGIN_URLS = {
     "deepseek": "https://platform.deepseek.com/api_keys",
     "glm": "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
     "openai-compatible": "https://platform.openai.com/api-keys",
+    "voice": "https://platform.openai.com/api-keys",
 }
 PROVIDER_DISPLAY_NAMES = {
     "copilot": "GitHub Copilot",
@@ -423,6 +424,7 @@ PROVIDER_DISPLAY_NAMES = {
     "deepseek": "DeepSeek",
     "glm": "GLM",
     "openai-compatible": "Custom OpenAI-compatible",
+    "voice": "Voice",
     "ollama": "Ollama",
     "lmstudio": "LM Studio",
     "llamacpp": "llama.cpp",
@@ -3564,6 +3566,7 @@ def _voice_snapshot() -> dict[str, Any]:
             "auto_speak": False,
             "stt_provider": None,
             "tts_provider": None,
+            "input_secret_provider": None,
         }
 
 

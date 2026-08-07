@@ -67,6 +67,7 @@ class VoiceStatus:
     auto_speak: bool
     stt_provider: str | None
     tts_provider: str | None
+    input_secret_provider: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -77,6 +78,7 @@ class VoiceStatus:
             "auto_speak": self.auto_speak,
             "stt_provider": self.stt_provider,
             "tts_provider": self.tts_provider,
+            "input_secret_provider": self.input_secret_provider,
         }
 
 
@@ -177,15 +179,42 @@ def voice_status() -> VoiceStatus:
 
     try:
         recorder = _recorder_command(config)
+    except RuntimeError as exc:
+        return VoiceStatus(False, str(exc), False, str(exc), False, None, None)
+
+    try:
         stt_provider = _stt_provider(config)
+    except RuntimeError as exc:
+        reason = str(exc)
+        return VoiceStatus(
+            False,
+            reason,
+            False,
+            reason,
+            False,
+            None,
+            None,
+            input_secret_provider=_voice_input_secret_provider_for_error(config, reason)
+            if recorder is not None
+            else None,
+        )
+
+    try:
         tts_provider = _tts_provider(config)
     except RuntimeError as exc:
         return VoiceStatus(False, str(exc), False, str(exc), False, None, None)
+
     input_reason = None
+    input_secret_provider = None
     if recorder is None:
         input_reason = "No supported microphone recorder was found."
     elif stt_provider is None:
-        input_reason = "No speech-to-text provider is available."
+        input_secret_provider = _voice_input_secret_provider_for_missing_stt(config)
+        input_reason = (
+            "Voice needs an API key. Press the mic again and paste your key."
+            if input_secret_provider
+            else "No speech-to-text provider is available."
+        )
 
     tts_reason = None
     if tts_provider is None:
@@ -199,6 +228,7 @@ def voice_status() -> VoiceStatus:
         auto_speak=config.auto_speak and tts_provider is not None,
         stt_provider=stt_provider,
         tts_provider=tts_provider,
+        input_secret_provider=input_secret_provider,
     )
 
 
@@ -390,6 +420,26 @@ def _tts_provider(config: VoiceConfig) -> str | None:
         return "system"
     if config.api_key and config.tts_model and config.tts_voice and _has_playback_command(config):
         return "openai-compatible"
+    return None
+
+
+def _voice_input_secret_provider_for_missing_stt(config: VoiceConfig) -> str | None:
+    if config.stt_command or config.api_key:
+        return None
+    if config.mode != "turn":
+        return None
+    return "voice"
+
+
+def _voice_input_secret_provider_for_error(
+    config: VoiceConfig,
+    reason: str,
+) -> str | None:
+    if _is_openai_realtime_provider(config) and not _openai_realtime_api_key(config):
+        return "voice"
+    lowered = reason.casefold()
+    if "api_key" in lowered and "voice" in lowered:
+        return "voice"
     return None
 
 

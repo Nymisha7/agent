@@ -698,6 +698,8 @@ struct BridgeVoice {
     #[serde(default)]
     input_reason: Option<String>,
     #[serde(default)]
+    input_secret_provider: Option<String>,
+    #[serde(default)]
     tts_ready: bool,
     #[serde(default)]
     auto_speak: bool,
@@ -2184,6 +2186,12 @@ fn start_voice_recording(
         return;
     }
     if !app.snapshot.voice.input_ready {
+        if let Some(provider) = app.snapshot.voice.input_secret_provider.clone() {
+            app.secret_provider = Some(provider);
+            app.secret_input.clear();
+            app.status = String::from("Paste voice API key. Input is hidden.");
+            return;
+        }
         app.status = app
             .snapshot
             .voice
@@ -5459,6 +5467,7 @@ fn provider_api_key_env(provider: &str) -> Option<&'static str> {
         "deepseek" => Some("DEEPSEEK_API_KEY"),
         "glm" => Some("GLM_API_KEY"),
         "openai-compatible" => Some("AGENT_OPENAI_COMPAT_API_KEY"),
+        "voice" => Some("AGENT_VOICE_API_KEY"),
         _ => None,
     }
 }
@@ -5482,6 +5491,7 @@ fn provider_display_name(provider: &str) -> &'static str {
         "localai" => "LocalAI",
         "deepseek" => "DeepSeek",
         "glm" => "GLM",
+        "voice" => "Voice",
         _ => "Provider",
     }
 }
@@ -5499,6 +5509,7 @@ fn provider_setup_url(provider: &str) -> Option<&'static str> {
         "copilot" => Some("https://github.com/login/device"),
         "deepseek" => Some("https://platform.deepseek.com/api_keys"),
         "glm" => Some("https://bigmodel.cn/usercenter/proj-mgmt/apikeys"),
+        "voice" => Some("https://platform.openai.com/api-keys"),
         _ => None,
     }
 }
@@ -6707,6 +6718,12 @@ mod tui_tests {
         };
 
         assert_eq!(result.secret_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn voice_provider_uses_masked_api_key_prompt() {
+        assert_eq!(provider_api_key_env("voice"), Some("AGENT_VOICE_API_KEY"));
+        assert_eq!(provider_display_name("voice"), "Voice");
     }
 
     #[test]
