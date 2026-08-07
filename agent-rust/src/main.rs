@@ -2841,10 +2841,13 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         let query = palette_context(&app.input)
             .map(|context| context.query)
             .unwrap_or_default();
-        let palette_len = visible_palette_indices(&app.palette, query).count();
+        let palette_lines = visible_palette_entries(&app.palette, query)
+            .map(|(_, entry)| palette_entry_height(entry))
+            .sum::<usize>();
         let max_popup_height = input_area.y.saturating_sub(area.y).clamp(3, 20);
-        let popup_height = (palette_len as u16 + 2).min(max_popup_height);
-        let visible_count = popup_height.saturating_sub(2) as usize;
+        let desired_popup_height = palette_lines.saturating_add(2).min(u16::MAX as usize) as u16;
+        let popup_height = desired_popup_height.min(max_popup_height);
+        let line_budget = popup_height.saturating_sub(2) as usize;
         let popup_y = input_area.y.saturating_sub(popup_height);
         let popup_area = Rect {
             x: input_area.x,
@@ -2857,7 +2860,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             &app.palette,
             query,
             app.palette_selected,
-            visible_count,
+            line_budget,
             popup_area.width,
         ))
         .block(
@@ -2866,7 +2869,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 .border_style(Style::default().fg(Color::Magenta))
                 .title(format!(
                     " {} ",
-                    palette_title(&app.palette, query, app.palette_selected, visible_count)
+                    palette_title(&app.palette, query, app.palette_selected, line_budget)
                 )),
         )
         .wrap(Wrap { trim: false });
@@ -4693,17 +4696,6 @@ fn palette_is_open(app: &TuiApp) -> bool {
         })
 }
 
-fn palette_visible_start(total: usize, selected: usize, visible_count: usize) -> usize {
-    if total <= visible_count || visible_count == 0 {
-        return 0;
-    }
-    let selected = selected.min(total.saturating_sub(1));
-    let max_start = total.saturating_sub(visible_count);
-    selected
-        .saturating_sub(visible_count.saturating_sub(1))
-        .min(max_start)
-}
-
 fn first_selectable_palette_index(palette: &BridgeCompletions, query: &str) -> Option<usize> {
     visible_palette_entries(palette, query)
         .find(|(_, entry)| palette_entry_selectable(entry))
@@ -4774,21 +4766,61 @@ fn palette_entry_selectable(entry: &BridgeCompletionEntry) -> bool {
     !entry.value.starts_with("section:")
 }
 
+fn palette_entry_height(entry: &BridgeCompletionEntry) -> usize {
+    1 + usize::from(is_model_palette_entry(entry) && !entry.description.is_empty())
+}
+
+fn palette_visible_window(
+    palette: &BridgeCompletions,
+    query: &str,
+    selected: usize,
+    line_budget: usize,
+) -> (usize, usize, usize) {
+    let entries = visible_palette_entries(palette, query).collect::<Vec<_>>();
+    let total = entries.len();
+    if total == 0 {
+        return (0, 0, 0);
+    }
+
+    let selected_position = entries
+        .iter()
+        .position(|(index, _)| *index == selected)
+        .unwrap_or(0);
+    let line_budget = line_budget.max(1);
+    let mut start = selected_position;
+    let mut used_lines = 0usize;
+    for position in (0..=selected_position).rev() {
+        let height = palette_entry_height(entries[position].1);
+        if used_lines > 0 && used_lines.saturating_add(height) > line_budget {
+            break;
+        }
+        start = position;
+        used_lines = used_lines.saturating_add(height);
+    }
+
+    let mut end = start;
+    used_lines = 0;
+    for (position, (_, entry)) in entries.iter().enumerate().skip(start) {
+        let height = palette_entry_height(entry);
+        if used_lines > 0 && used_lines.saturating_add(height) > line_budget {
+            break;
+        }
+        end = position + 1;
+        used_lines = used_lines.saturating_add(height);
+    }
+    (start, end, total)
+}
+
 fn palette_title(
     palette: &BridgeCompletions,
     query: &str,
     selected: usize,
-    visible_count: usize,
+    line_budget: usize,
 ) -> String {
-    let total = visible_palette_indices(palette, query).count();
+    let (start, end, total) = palette_visible_window(palette, query, selected, line_budget);
     if total == 0 {
         return palette.title.clone();
     }
-    let selected = visible_palette_indices(palette, query)
-        .position(|index| index == selected)
-        .unwrap_or(0);
-    let start = palette_visible_start(total, selected, visible_count.max(1));
-    let end = (start + visible_count.max(1)).min(total);
     format!(
         "{} · {}-{}/{} · ↑↓ PgUp/PgDn wheel",
         palette.title,
@@ -4838,21 +4870,21 @@ fn palette_text(
     palette: &BridgeCompletions,
     query: &str,
     selected: usize,
-    visible_count: usize,
+    line_budget: usize,
     width: u16,
 ) -> Text<'static> {
     let mut lines = Vec::new();
     let label_width = if width > 64 { 24 } else { 16 };
-    let total = visible_palette_indices(palette, query).count();
-    let selected_position = visible_palette_indices(palette, query)
-        .position(|index| index == selected)
-        .unwrap_or(0);
-    let visible_count = visible_count.max(1);
-    let start = palette_visible_start(total, selected_position, visible_count);
+    let line_budget = line_budget.max(1);
+    let (start, end, _) = palette_visible_window(palette, query, selected, line_budget);
+    let mut remaining_lines = line_budget;
     for (index, entry) in visible_palette_entries(palette, query)
         .skip(start)
-        .take(visible_count)
+        .take(end.saturating_sub(start))
     {
+        if remaining_lines == 0 {
+            break;
+        }
         if !palette_entry_selectable(entry) {
             lines.push(Line::from(vec![
                 Span::raw("   "),
@@ -4863,6 +4895,7 @@ fn palette_text(
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
+            remaining_lines = remaining_lines.saturating_sub(1);
             continue;
         }
         let selected_style = if index == selected {
@@ -4880,6 +4913,14 @@ fn palette_text(
                     selected_style,
                 ),
                 Span::styled(
+                    if palette.selected_index == Some(index) {
+                        "✓ "
+                    } else {
+                        "  "
+                    },
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
                     entry.label.clone(),
                     Style::default().fg(if index == selected {
                         Color::Cyan
@@ -4888,14 +4929,16 @@ fn palette_text(
                     }),
                 ),
             ]));
-            if !entry.description.is_empty() {
+            remaining_lines = remaining_lines.saturating_sub(1);
+            if remaining_lines > 0 && !entry.description.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::raw("     "),
+                    Span::raw("       "),
                     Span::styled(
                         entry.description.clone(),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
+                remaining_lines = remaining_lines.saturating_sub(1);
             }
             continue;
         }
@@ -4921,6 +4964,7 @@ fn palette_text(
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+        remaining_lines = remaining_lines.saturating_sub(1);
     }
     Text::from(lines)
 }
@@ -7015,10 +7059,25 @@ mod tui_tests {
     }
 
     #[test]
-    fn model_palette_window_follows_selection_below_first_page() {
-        assert_eq!(palette_visible_start(30, 0, 8), 0);
-        assert_eq!(palette_visible_start(30, 12, 8), 5);
-        assert_eq!(palette_visible_start(30, 29, 8), 22);
+    fn model_palette_window_uses_rendered_line_heights() {
+        let mut palette = BridgeCompletions {
+            title: String::from("Models"),
+            selected_index: Some(0),
+            entries: Vec::new(),
+        };
+        for index in 0..10 {
+            palette.entries.push(BridgeCompletionEntry {
+                value: format!("model-{index}"),
+                label: format!("model-{index}"),
+                description: String::from("Provider · Ready"),
+                complete_to: format!("/model provider model-{index}"),
+                execute: true,
+            });
+        }
+
+        assert_eq!(palette_visible_window(&palette, "", 0, 8), (0, 4, 10));
+        assert_eq!(palette_visible_window(&palette, "", 4, 8), (1, 5, 10));
+        assert_eq!(palette_visible_window(&palette, "", 9, 8), (6, 10, 10));
     }
 
     #[test]
@@ -7155,6 +7214,47 @@ mod tui_tests {
 
         assert!(rendered.contains(model));
         assert!(!rendered.contains("..."));
+    }
+
+    #[test]
+    fn model_palette_keeps_keyboard_cursor_and_active_model_visible() {
+        let mut palette = BridgeCompletions {
+            title: String::from("Models"),
+            selected_index: Some(0),
+            entries: Vec::new(),
+        };
+        for index in 0..8 {
+            palette.entries.push(BridgeCompletionEntry {
+                value: format!("model-{index}"),
+                label: format!("model-{index}"),
+                description: String::from("Provider · Ready"),
+                complete_to: format!("/model provider model-{index}"),
+                execute: true,
+            });
+        }
+
+        let near_top = palette_text(&palette, "", 2, 8, 80);
+        let active_line = near_top
+            .lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content == "model-0"))
+            .expect("active model row");
+        assert_eq!(active_line.spans[1].content, "✓ ");
+        let selected_line = near_top
+            .lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content == "model-2"))
+            .expect("selected model row");
+        assert_eq!(selected_line.spans[0].content, " > ");
+
+        let below_fold = palette_text(&palette, "", 6, 6, 80);
+        let selected_line = below_fold
+            .lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content == "model-6"))
+            .expect("selected model remains inside viewport");
+        assert_eq!(selected_line.spans[0].content, " > ");
+        assert!(below_fold.lines.len() <= 6);
     }
 
     #[test]
