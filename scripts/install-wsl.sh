@@ -151,7 +151,7 @@ install_with_pipx() {
   else
     ensure_rust
   fi
-  python3 -m pipx install --force "$package_source"
+  python3 -m pipx install --force --pip-args=--no-cache-dir "$package_source"
   echo "Installed."
 }
 

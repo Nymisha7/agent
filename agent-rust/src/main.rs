@@ -4427,6 +4427,16 @@ fn transcript_text(
         }
         lines.push(Line::from(""));
     }
+    if app.voice_recording {
+        lines.push(role_header("user", "listening", &snapshot.agent_name));
+        let partial = app.voice_partial.trim();
+        lines.push(message_body_line(if partial.is_empty() {
+            "Listening..."
+        } else {
+            partial
+        }));
+        lines.push(Line::from(""));
+    }
     if let Some(prompt) = &app.running_prompt {
         let prompt_is_persisted = snapshot.messages.last().is_some_and(|message| {
             message.role == "user" && message.content.trim() == prompt.trim()
@@ -6859,6 +6869,19 @@ mod tui_tests {
         assert_eq!(app.input, "Ask Nym hello");
         assert!(!app.voice_recording);
         assert_eq!(app.status, "Voice transcription ready to send");
+    }
+
+    #[test]
+    fn voice_partial_is_visible_as_an_in_progress_chat_message() {
+        let mut app = test_app();
+        app.voice_recording = true;
+        app.voice_partial = String::from("hello from the microphone");
+
+        let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
+
+        assert!(rendered.contains("YOU"));
+        assert!(rendered.contains("listening"));
+        assert!(rendered.contains("hello from the microphone"));
     }
 
     #[test]

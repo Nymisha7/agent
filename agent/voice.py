@@ -746,6 +746,11 @@ async def _realtime_handshake(ws: object, config: VoiceConfig) -> None:
                 transcription["delay"] = "low"
             else:
                 transcription["language"] = config.language
+            if config.language == "en":
+                transcription["prompt"] = (
+                    "The speaker is speaking English. Transcribe in English only. "
+                    "Do not translate or emit text in another language."
+                )
         update = {
             "type": "session.update",
             "session": {
