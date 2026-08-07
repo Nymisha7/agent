@@ -5205,7 +5205,10 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     app.status = String::from("No speech was detected");
                 } else {
                     replace_voice_composer_text(app, transcript);
-                    app.status = String::from("Voice transcription ready to send");
+                    let prompt = app.input.trim().to_string();
+                    app.input.clear();
+                    enqueue_prompt(&mut app.queued_prompts, prompt);
+                    app.status = String::from("Sending voice message...");
                 }
                 clear_voice_recording_state(app);
             }
@@ -6844,7 +6847,7 @@ mod tui_tests {
     }
 
     #[test]
-    fn voice_deltas_update_composer_and_final_transcript_reconciles_text() {
+    fn voice_deltas_update_composer_and_final_transcript_submits_automatically() {
         let mut app = test_app();
         app.input = String::from("Ask Nym ");
         app.voice_recording = true;
@@ -6871,9 +6874,13 @@ mod tui_tests {
                 error: None,
             })),
         );
-        assert_eq!(app.input, "Ask Nym hello");
+        assert!(app.input.is_empty());
         assert!(!app.voice_recording);
-        assert_eq!(app.status, "Voice transcription ready to send");
+        assert_eq!(
+            app.queued_prompts.front().map(String::as_str),
+            Some("Ask Nym hello")
+        );
+        assert_eq!(app.status, "Sending voice message...");
     }
 
     #[test]
