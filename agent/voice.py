@@ -55,7 +55,6 @@ _OPENAI_REALTIME_VOICE_PROVIDERS = {
     "realtime-openai",
 }
 _OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-_OPENAI_REALTIME_MODEL = "gpt-realtime"
 _OPENAI_REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 
 
@@ -738,11 +737,12 @@ async def _realtime_handshake(ws: object, config: VoiceConfig) -> None:
     if config.realtime_session_update:
         update = config.realtime_session_update
     elif _is_openai_realtime_provider(config):
+        transcription_model = _openai_realtime_transcription_model()
         transcription: dict[str, object] = {
-            "model": _openai_realtime_transcription_model(),
+            "model": transcription_model,
         }
         if config.language:
-            if _openai_realtime_transcription_model() == "gpt-live-transcribe":
+            if transcription_model == "gpt-live-transcribe":
                 transcription["languages"] = [config.language]
                 transcription["delay"] = "low"
             else:
@@ -761,7 +761,9 @@ async def _realtime_handshake(ws: object, config: VoiceConfig) -> None:
                         "format": {"type": "audio/pcm", "rate": 24000},
                         "noise_reduction": {"type": "near_field"},
                         "transcription": transcription,
-                        "turn_detection": {
+                        "turn_detection": None
+                        if transcription_model == "gpt-live-transcribe"
+                        else {
                             "type": "server_vad",
                             "threshold": 0.5,
                             "prefix_padding_ms": 300,
@@ -1210,7 +1212,7 @@ def _realtime_voice_url_from_environment() -> str | None:
         return url
     provider = _voice_provider_from_environment()
     if provider in _OPENAI_REALTIME_VOICE_PROVIDERS:
-        return _openai_realtime_url(_realtime_voice_model_from_environment())
+        return _openai_realtime_url()
     if provider in _HF_REALTIME_VOICE_PROVIDERS:
         return _HF_LOCAL_REALTIME_URL
     if provider in _HF_SPACE_REALTIME_VOICE_PROVIDERS:
@@ -1228,12 +1230,12 @@ def _realtime_voice_model_from_environment() -> str:
     return (
         os.environ.get("AGENT_REALTIME_VOICE_MODEL", "").strip()
         or os.environ.get("AGENT_VOICE_REALTIME_MODEL", "").strip()
-        or _OPENAI_REALTIME_MODEL
+        or _OPENAI_REALTIME_TRANSCRIPTION_MODEL
     )
 
 
-def _openai_realtime_url(model: str) -> str:
-    query = urllib.parse.urlencode({"model": model.strip() or _OPENAI_REALTIME_MODEL})
+def _openai_realtime_url() -> str:
+    query = urllib.parse.urlencode({"intent": "transcription"})
     return f"{_OPENAI_REALTIME_URL}?{query}"
 
 

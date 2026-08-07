@@ -130,7 +130,7 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(config.realtime_provider, "openai-realtime")
         self.assertEqual(
             config.realtime_url,
-            "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+            "wss://api.openai.com/v1/realtime?intent=transcription",
         )
         self.assertEqual(config.language, "en")
         self.assertTrue(status.input_ready)
@@ -335,11 +335,13 @@ class VoiceTests(unittest.TestCase):
 
         update = json.loads(websocket.sent[0])
         transcription = update["session"]["audio"]["input"]["transcription"]
+        audio_input = update["session"]["audio"]["input"]
         self.assertEqual(update["session"]["type"], "transcription")
         self.assertEqual(transcription["model"], "gpt-live-transcribe")
         self.assertEqual(transcription["languages"], ["en"])
         self.assertEqual(transcription["delay"], "low")
         self.assertIn("English only", transcription["prompt"])
+        self.assertIsNone(audio_input["turn_detection"])
 
     def test_voice_language_can_use_automatic_detection(self) -> None:
         with patch.dict(
