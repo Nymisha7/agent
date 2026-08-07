@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .process_env import credential_free_environment
+
 DESKTOP_CAPABILITIES_CACHE_SECONDS = 300
 DESKTOP_APPLICATION_RESOLVE_CACHE_SECONDS = 60
 
@@ -92,6 +94,7 @@ class RustTools:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=credential_free_environment(),
         )
         with self._lock:
             self._active_process = process
@@ -147,6 +150,7 @@ class RustTools:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=1,
+            env=credential_free_environment(),
         )
         self._worker_process = process
         self._worker_reader = threading.Thread(

@@ -822,7 +822,17 @@ def _desktop_target_dicts(value: Any) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         record: dict[str, str] = {}
-        for key in ("kind", "id", "target", "name", "action", "source", "snapshot_id"):
+        for key in (
+            "kind",
+            "id",
+            "target",
+            "name",
+            "title",
+            "query",
+            "action",
+            "source",
+            "snapshot_id",
+        ):
             text = _optional_str(item.get(key))
             if text:
                 record[key] = text
@@ -1408,13 +1418,31 @@ def _resolve_desktop_application_target(
     if not target:
         return None
     query = target.strip()
-    try:
-        observation = tool_ctx.rust.desktop_resolve(
-            query=query,
-            kind="application",
-            limit=5,
-        )
-    except Exception as exc:
+    resolution_queries = [query]
+    remembered_query = _remembered_closed_application_query(session, query)
+    if remembered_query and remembered_query.casefold() != query.casefold():
+        resolution_queries.append(remembered_query)
+
+    observation: Any = None
+    resolution_error: Exception | None = None
+    for resolution_query in resolution_queries:
+        try:
+            observation = tool_ctx.rust.desktop_resolve(
+                query=resolution_query,
+                kind="application",
+                limit=5,
+            )
+        except Exception as exc:
+            resolution_error = exc
+            continue
+        if isinstance(observation, dict) and session is not None:
+            _apply_desktop_resolve(session, observation)
+        resolved_target = _resolved_desktop_application_target(observation, resolution_query)
+        if resolved_target:
+            call.arguments["target"] = resolved_target
+            return None
+
+    if resolution_error is not None and observation is None:
         return {
             "ok": False,
             "tool": call.name,
@@ -1423,26 +1451,8 @@ def _resolve_desktop_application_target(
             "recoverable": True,
             "reason": "desktop_application_resolution_failed",
             "operation": "desktop",
-            "guidance": f"Could not resolve the requested application before launch: {exc}",
+            "guidance": f"Could not resolve the requested application before launch: {resolution_error}",
         }
-    if isinstance(observation, dict) and session is not None:
-        _apply_desktop_resolve(session, observation)
-    observation_dict = observation if isinstance(observation, dict) else {}
-    candidates = observation_dict.get("candidates")
-    candidates = candidates if isinstance(candidates, list) else []
-    if len(candidates) == 1 and not bool(observation_dict.get("ambiguous")):
-        candidate = candidates[0]
-        if isinstance(candidate, dict):
-            resolved_target = _optional_str(candidate.get("target")) or _optional_str(candidate.get("id"))
-            if resolved_target and _valid_desktop_application_id(resolved_target):
-                call.arguments["target"] = resolved_target
-                return None
-    candidate = _single_clear_desktop_application_candidate(candidates, query)
-    if candidate is not None:
-        resolved_target = _optional_str(candidate.get("target")) or _optional_str(candidate.get("id"))
-        if resolved_target and _valid_desktop_application_id(resolved_target):
-            call.arguments["target"] = resolved_target
-            return None
     return {
         "ok": False,
         "tool": call.name,
@@ -1458,6 +1468,52 @@ def _resolve_desktop_application_target(
             "If it returned none or multiple candidates, ask the user which application to open."
         ),
     }
+
+
+def _resolved_desktop_application_target(observation: Any, query: str) -> str | None:
+    observation_dict = observation if isinstance(observation, dict) else {}
+    candidates = observation_dict.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    candidate: dict[str, Any] | None = None
+    if len(candidates) == 1 and not bool(observation_dict.get("ambiguous")):
+        if isinstance(candidates[0], dict):
+            candidate = candidates[0]
+    if candidate is None:
+        candidate = _single_clear_desktop_application_candidate(candidates, query)
+    if candidate is None:
+        return None
+    resolved_target = _optional_str(candidate.get("target")) or _optional_str(candidate.get("id"))
+    return resolved_target if resolved_target and _valid_desktop_application_id(resolved_target) else None
+
+
+def _remembered_closed_application_query(
+    session: AgentSession | None,
+    reference: str,
+) -> str | None:
+    if session is None:
+        return None
+    normalized_reference = reference.strip().casefold()
+    if not normalized_reference:
+        return None
+    for item in reversed(session.desktop_targets):
+        if item.get("kind") != "window" or item.get("action") != "close_window":
+            continue
+        aliases = [
+            value.strip().casefold()
+            for key in ("query", "name", "title")
+            if (value := _optional_str(item.get(key)))
+        ]
+        if not any(_desktop_reference_matches(normalized_reference, alias) for alias in aliases):
+            continue
+        return _optional_str(item.get("name")) or _optional_str(item.get("title"))
+    return None
+
+
+def _desktop_reference_matches(reference: str, alias: str) -> bool:
+    return reference == alias or (
+        min(len(reference), len(alias)) >= 3
+        and (reference in alias or alias in reference)
+    )
 
 
 def _single_clear_desktop_application_candidate(
@@ -1683,6 +1739,10 @@ def _update_session_from_tool_result(
 
     if tool == "desktop_resolve":
         _apply_desktop_resolve(session, observation)
+        return
+
+    if tool == "desktop_action":
+        _apply_desktop_action(session, args, observation)
         return
 
 
@@ -2007,6 +2067,7 @@ def _apply_process_list(session: AgentSession, observation: dict[str, Any]) -> N
 
 def _apply_desktop_resolve(session: AgentSession, observation: dict[str, Any]) -> None:
     targets: list[dict[str, str]] = []
+    query = _optional_str(observation.get("query"))
     for item in observation.get("candidates", []):
         if not isinstance(item, dict):
             continue
@@ -2024,6 +2085,11 @@ def _apply_desktop_resolve(session: AgentSession, observation: dict[str, Any]) -
         name = _optional_str(item.get("name"))
         if name:
             record["name"] = name
+        title = _optional_str(item.get("title"))
+        if title:
+            record["title"] = title
+        if query:
+            record["query"] = query
         if kind == "window":
             process = _optional_str(item.get("process"))
             if process:
@@ -2031,6 +2097,36 @@ def _apply_desktop_resolve(session: AgentSession, observation: dict[str, Any]) -
         targets.append(record)
     if targets:
         _remember_desktop_targets(session, targets)
+
+
+def _apply_desktop_action(
+    session: AgentSession,
+    args: dict[str, Any],
+    observation: dict[str, Any],
+) -> None:
+    if observation.get("ok") is not True:
+        return
+    action = _optional_str(observation.get("action")) or _optional_str(args.get("action"))
+    target = _optional_str(observation.get("target")) or _optional_str(args.get("target"))
+    if action != "close_window" or not target:
+        return
+    normalized_target = _normalize_desktop_window_id(target)
+    if normalized_target is None:
+        return
+    for item in reversed(session.desktop_targets):
+        if item.get("kind") != "window":
+            continue
+        if not any(
+            isinstance(item.get(key), str)
+            and _normalize_desktop_window_id(item[key]) == normalized_target
+            for key in ("target", "id")
+        ):
+            continue
+        closed = dict(item)
+        closed["action"] = "close_window"
+        closed["source"] = "desktop_action"
+        _remember_desktop_targets(session, [closed])
+        return
 
 
 def _remember_desktop_targets(session: AgentSession, targets: list[dict[str, str]]) -> None:
@@ -2042,6 +2138,7 @@ def _remember_desktop_targets(session: AgentSession, targets: list[dict[str, str
     for item in targets:
         key = (item.get("kind", ""), item.get("target") or item.get("id", ""))
         if key[0] and key[1]:
+            merged.pop(key, None)
             merged[key] = dict(item)
     session.desktop_targets = list(merged.values())[-50:]
 

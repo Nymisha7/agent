@@ -42,6 +42,19 @@ class AttachmentStoreTests(unittest.TestCase):
             self.assertEqual(report["removed"], 1)
             self.assertEqual(report["bytes_removed"], len("expired"))
 
+    def test_reused_attachment_is_resecured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.txt"
+            source.write_text("private", encoding="utf-8")
+            with patch.dict("os.environ", {"XDG_DATA_HOME": str(root / "data")}, clear=True):
+                attachment = import_attachment(source, source="test")
+                stored = Path(attachment.storage_path)
+                os.chmod(stored, 0o644)
+                import_attachment(source, source="test")
+
+            self.assertEqual(stored.stat().st_mode & 0o777, 0o600)
+
     def test_maintenance_enforces_configured_store_quota(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

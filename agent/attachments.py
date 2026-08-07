@@ -203,6 +203,7 @@ def import_attachment(path: Path | str, *, source: str) -> Attachment:
             temporary.unlink(missing_ok=True)
             raise
     else:
+        _set_private_permissions(destination, 0o600)
         try:
             os.utime(destination)
         except OSError:

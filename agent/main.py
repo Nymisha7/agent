@@ -354,6 +354,8 @@ def _credential_cipher() -> Fernet:
     key_path = _credential_key_path()
     try:
         key = key_path.read_bytes()
+        os.chmod(key_path.parent, 0o700)
+        os.chmod(key_path, 0o600)
     except FileNotFoundError:
         key = Fernet.generate_key()
         key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

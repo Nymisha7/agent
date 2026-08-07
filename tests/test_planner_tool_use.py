@@ -1381,6 +1381,111 @@ class PlannerToolUseTests(unittest.TestCase):
         _attach_approval_display_path(session, request)
         self.assertEqual(request["display_path"], "desktop terminate_process Code")
 
+    def test_reopen_resolves_the_application_from_the_closed_window_alias(self) -> None:
+        session = AgentSession()
+        _update_session_from_tool_result(
+            session,
+            tool="desktop_resolve",
+            args={"query": "browser", "kind": "window"},
+            observation={
+                "ok": True,
+                "tool": "desktop_resolve",
+                "query": "browser",
+                "kind": "window",
+                "candidates": [{
+                    "kind": "window",
+                    "id": "0x3a00007",
+                    "target": "0x3a00007",
+                    "title": "New tab",
+                    "process": "msedge",
+                    "action": "close_window",
+                }],
+            },
+            workspace_root=Path("/workspace"),
+        )
+        _update_session_from_tool_result(
+            session,
+            tool="desktop_action",
+            args={"action": "close_window", "target": "0x3a00007"},
+            observation={
+                "ok": True,
+                "verified": True,
+                "tool": "desktop_action",
+                "action": "close_window",
+                "target": "0x3a00007",
+            },
+            workspace_root=Path("/workspace"),
+        )
+
+        closed = session.desktop_targets[-1]
+        self.assertEqual(closed["query"], "browser")
+        self.assertEqual(closed["name"], "msedge")
+        self.assertEqual(closed["action"], "close_window")
+        self.assertEqual(closed["source"], "desktop_action")
+
+        class FakeRust:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+
+            def desktop_resolve(self, *, query: str, kind: str, limit: int) -> dict[str, Any]:
+                self.queries.append(query)
+                candidates = []
+                if query == "msedge":
+                    candidates = [{
+                        "kind": "application",
+                        "id": "windows-app:microsoft-edge",
+                        "target": "windows-app:microsoft-edge",
+                        "name": "Microsoft Edge",
+                    }]
+                return {
+                    "ok": True,
+                    "tool": "desktop_resolve",
+                    "query": query,
+                    "kind": kind,
+                    "ambiguous": False,
+                    "candidates": candidates,
+                }
+
+        rust = FakeRust()
+        call = ModelToolCall(
+            name="desktop_action",
+            call_id="reopen-browser",
+            arguments={"action": "launch_application", "target": "browser"},
+        )
+        result = _preflight_tool_call(
+            call,
+            tool_ctx=ToolContext(
+                rust=rust,  # type: ignore[arg-type]
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=session,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(rust.queries, ["browser", "msedge"])
+        self.assertEqual(call.arguments["target"], "windows-app:microsoft-edge")
+        restored = agent_session_from_dict(agent_session_to_dict(session))
+        self.assertTrue(any(item.get("query") == "browser" for item in restored.desktop_targets))
+
+        rust.queries.clear()
+        unrelated = ModelToolCall(
+            name="desktop_action",
+            call_id="open-calculator",
+            arguments={"action": "launch_application", "target": "calculator"},
+        )
+        blocked = _preflight_tool_call(
+            unrelated,
+            tool_ctx=ToolContext(
+                rust=rust,  # type: ignore[arg-type]
+                workspace_root=Path("/workspace"),
+                search_roots=[],
+            ),
+            session=session,
+        )
+        self.assertEqual(blocked["reason"], "desktop_application_target_not_resolved")
+        self.assertEqual(rust.queries, ["calculator"])
+
     def test_session_remembers_snapshot_bound_ui_elements(self) -> None:
         session = AgentSession()
 

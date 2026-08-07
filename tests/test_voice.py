@@ -360,6 +360,13 @@ class VoiceTests(unittest.TestCase):
             "wss://voice.example/realtime",
         )
 
+    def test_openai_realtime_rejects_insecure_websocket(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "secure wss"):
+            _realtime_connect_url(
+                "ws://voice.example/realtime",
+                require_secure_transport=True,
+            )
+
     def test_transcript_fragment_accepts_only_input_transcription_events(self) -> None:
         self.assertEqual(
             _transcript_fragment({

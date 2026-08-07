@@ -2121,12 +2121,7 @@ fn selected_transcript_text(app: &TuiApp, selection: TranscriptSelection) -> Opt
     if lines.is_empty() {
         return None;
     }
-    let (start, end) =
-        if (selection.start.row, selection.start.col) <= (selection.end.row, selection.end.col) {
-            (selection.start, selection.end)
-        } else {
-            (selection.end, selection.start)
-        };
+    let (start, end) = ordered_transcript_selection(selection);
     let start_row = start.row.min(lines.len().saturating_sub(1));
     let end_row = end.row.min(lines.len().saturating_sub(1));
     Some(
@@ -2147,6 +2142,16 @@ fn selected_transcript_text(app: &TuiApp, selection: TranscriptSelection) -> Opt
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+fn ordered_transcript_selection(
+    selection: TranscriptSelection,
+) -> (SelectionPoint, SelectionPoint) {
+    if (selection.start.row, selection.start.col) <= (selection.end.row, selection.end.col) {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    }
 }
 
 fn insert_composer_paste(app: &mut TuiApp, text: &str) {
@@ -3634,8 +3639,59 @@ fn render_transcript(
 
     if let Some(cache) = app.transcript_cache.as_ref() {
         cache.paragraph.render_ref(area, frame.buffer_mut());
+        if let Some(selection) = app.transcript_selection {
+            render_transcript_selection(
+                frame.buffer_mut(),
+                cache.area,
+                &cache.selection_lines,
+                selection,
+            );
+        }
         app.attachment_hit_areas
             .extend(cache.attachment_hit_areas.iter().cloned());
+    }
+}
+
+fn render_transcript_selection(
+    buffer: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    lines: &[String],
+    selection: TranscriptSelection,
+) {
+    if selection.start == selection.end || lines.is_empty() {
+        return;
+    }
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    if inner_width == 0 || inner_height == 0 {
+        return;
+    }
+    let (start, end) = ordered_transcript_selection(selection);
+    let start_row = start.row.min(lines.len().saturating_sub(1));
+    let end_row = end
+        .row
+        .min(lines.len().saturating_sub(1))
+        .min(inner_height.saturating_sub(1));
+    for row in start_row..=end_row {
+        let line_width = lines[row].chars().count().min(inner_width);
+        let first = if row == start_row { start.col } else { 0 }.min(line_width);
+        let last = if row == end_row {
+            end.col.saturating_add(1)
+        } else {
+            line_width
+        }
+        .min(line_width);
+        for col in first..last {
+            if let Some(cell) = buffer.cell_mut((
+                inner_x.saturating_add(col as u16),
+                inner_y.saturating_add(row as u16),
+            )) {
+                cell.set_bg(Color::Rgb(52, 78, 110));
+                cell.set_fg(Color::White);
+            }
+        }
     }
 }
 
@@ -7024,6 +7080,41 @@ mod tui_tests {
         assert!(rendered.contains("YOU"));
         assert!(rendered.contains("listening"));
         assert!(rendered.contains("hello from the microphone"));
+    }
+
+    #[test]
+    fn transcript_drag_selection_has_visible_background() {
+        let area = Rect::new(2, 3, 10, 5);
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 20, 10));
+        let lines = vec![String::from("abcdef"), String::from("ghij")];
+        render_transcript_selection(
+            &mut buffer,
+            area,
+            &lines,
+            TranscriptSelection {
+                start: SelectionPoint { row: 1, col: 2 },
+                end: SelectionPoint { row: 0, col: 1 },
+            },
+        );
+
+        let selected = Color::Rgb(52, 78, 110);
+        assert_eq!(
+            buffer.cell((4, 4)).expect("selected first row").bg,
+            selected
+        );
+        assert_eq!(
+            buffer.cell((3, 5)).expect("selected second row").bg,
+            selected
+        );
+        assert_eq!(buffer.cell((5, 5)).expect("selected end cell").bg, selected);
+        assert_eq!(
+            buffer.cell((3, 4)).expect("unselected cell").bg,
+            Color::Reset
+        );
+        assert_eq!(
+            buffer.cell((6, 5)).expect("cell after selection").bg,
+            Color::Reset
+        );
     }
 
     #[test]

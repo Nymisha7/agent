@@ -557,6 +557,7 @@ async def _transcribe_realtime_chunks(
     connect_url = _realtime_connect_url(
         config.realtime_url or "",
         api_key=config.realtime_api_key,
+        require_secure_transport=_is_openai_realtime_provider(config),
     )
     try:
         import websockets
@@ -628,6 +629,7 @@ async def _transcribe_realtime_microphone(
     connect_url = _realtime_connect_url(
         config.realtime_url,
         api_key=config.realtime_api_key,
+        require_secure_transport=_is_openai_realtime_provider(config),
     )
     headers = _realtime_headers(config)
     try:
@@ -820,15 +822,24 @@ def _realtime_input_sample_rate(config: VoiceConfig) -> int:
     return 24000 if _is_openai_realtime_provider(config) else 16000
 
 
-def _realtime_connect_url(raw_url: str, *, api_key: str | None = None) -> str:
+def _realtime_connect_url(
+    raw_url: str,
+    *,
+    api_key: str | None = None,
+    require_secure_transport: bool = False,
+) -> str:
     url = raw_url.strip()
     if not url:
         raise RuntimeError("AGENT_REALTIME_VOICE_URL is not configured.")
     if url.startswith(("ws://", "wss://")):
+        if require_secure_transport and not url.startswith("wss://"):
+            raise RuntimeError("OpenAI Realtime requires a secure wss:// endpoint.")
         return url
 
     errors: list[str] = []
     for session_url in _realtime_session_url_candidates(url):
+        if require_secure_transport and not session_url.startswith("https://"):
+            raise RuntimeError("OpenAI Realtime requires a secure https:// session endpoint.")
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -857,7 +868,10 @@ def _realtime_connect_url(raw_url: str, *, api_key: str | None = None) -> str:
             continue
         connect_url = payload.get("connect_url") or payload.get("websocket_url")
         if isinstance(connect_url, str) and connect_url.strip():
-            return connect_url.strip()
+            connect_url = connect_url.strip()
+            if require_secure_transport and not connect_url.startswith("wss://"):
+                raise RuntimeError("OpenAI Realtime requires a secure wss:// endpoint.")
+            return connect_url
         errors.append(f"{session_url}: response did not include connect_url")
 
     detail = "; ".join(errors) if errors else "no session endpoints were tried"

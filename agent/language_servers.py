@@ -9,6 +9,8 @@ import subprocess
 import time
 from typing import Any
 
+from .process_env import credential_free_environment
+
 
 @dataclass(frozen=True)
 class LanguageServerSpec:
@@ -139,6 +141,7 @@ class LanguageServerManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                env=credential_free_environment(),
             )
         except OSError as exc:
             return {
