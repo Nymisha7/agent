@@ -599,6 +599,40 @@ LOCAL_INSTALL_CATALOG = (
     {"provider": "ollama", "model": "gemma3", "install_id": "gemma3:4b", "parameters": "4B", "size": "~3.3 GB", "memory": "6 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "stable-code", "install_id": "stable-code:3b", "parameters": "3B", "size": "~1.6 GB", "memory": "4 GB+ RAM", "context": "16K", "quantization": "Ollama default"},
 )
+
+
+@dataclass(frozen=True, slots=True)
+class LocalRuntimeRequirement:
+    executable: str
+    download_url: str
+    install_command: str | None = None
+
+
+LOCAL_RUNTIME_REQUIREMENTS = {
+    "ollama": LocalRuntimeRequirement(
+        executable="ollama",
+        download_url="https://docs.ollama.com/linux",
+        install_command="curl -fsSL https://ollama.com/install.sh | sh",
+    ),
+    "lmstudio": LocalRuntimeRequirement(
+        executable="lms",
+        download_url="https://lmstudio.ai/download",
+    ),
+    "llamacpp": LocalRuntimeRequirement(
+        executable="llama-cli",
+        download_url="https://github.com/ggml-org/llama.cpp/releases",
+    ),
+    "vllm": LocalRuntimeRequirement(
+        executable="vllm",
+        download_url="https://docs.vllm.ai/en/latest/getting_started/installation/",
+    ),
+    "localai": LocalRuntimeRequirement(
+        executable="local-ai",
+        download_url="https://localai.io/installation/",
+    ),
+}
+
+
 COLOR_HEADER = 1
 COLOR_USER = 2
 COLOR_ASSISTANT = 3
@@ -628,6 +662,7 @@ class AppContext:
     tool_allowlist: tuple[str, ...] | None = None
     route_key: str | None = None
     config_path: Path | None = None
+    model_required: bool = False
 
     pending_provider: str | None = None
     pending_model: str | None = None
@@ -647,6 +682,8 @@ class LocalCommandText(str):
         error: bool = False,
         secret_provider: str | None = None,
         next_command: str | None = None,
+        transient: bool = False,
+        pending_action: dict[str, str] | None = None,
     ) -> "LocalCommandText":
         value = super().__new__(cls, text)
         value.command_result = {
@@ -655,6 +692,8 @@ class LocalCommandText(str):
             "error": error,
             **({"secret_provider": secret_provider} if secret_provider else {}),
             **({"next_command": next_command} if next_command else {}),
+            **({"transient": True} if transient else {}),
+            **({"pending_action": pending_action} if pending_action else {}),
         }
         return value
 
@@ -667,6 +706,8 @@ def _command_text(
     error: bool = False,
     secret_provider: str | None = None,
     next_command: str | None = None,
+    transient: bool = False,
+    pending_action: dict[str, str] | None = None,
 ) -> LocalCommandText:
     return LocalCommandText(
         text,
@@ -675,6 +716,8 @@ def _command_text(
         error=error,
         secret_provider=secret_provider,
         next_command=next_command,
+        transient=transient,
+        pending_action=pending_action,
     )
 
 
@@ -685,6 +728,19 @@ def _prepend_command_text(prefix: str, result: str) -> LocalCommandText:
         {"code": "ok", "setup_required": False, "error": False},
     )
     return _command_text(f"{prefix}\n{result}", **metadata)
+
+
+def _transient_command_text(result: str) -> LocalCommandText:
+    metadata = dict(
+        getattr(
+            result,
+            "command_result",
+            {"code": "ok", "setup_required": False, "error": False},
+        )
+    )
+    metadata["transient"] = True
+    return _command_text(str(result), **metadata)
+
 
 @dataclass(frozen=True)
 class PaletteEntry:
@@ -1238,10 +1294,13 @@ def build_context(
     ).text
     provider = getattr(args, "provider", None) or session_info.provider
     model = _selected_model(args, session_info)
+    model_required = provider is None and model is None
     llm = LLMClient(model=model, provider=provider)
     if session.reasoning_effort and llm.reasoning_effort is not None:
         llm.reasoning_effort = session.reasoning_effort
-    if session_info.provider != llm.provider or session_info.model != llm.model:
+    if not model_required and (
+        session_info.provider != llm.provider or session_info.model != llm.model
+    ):
         store.update_llm_config(session_info.id, provider=llm.provider, model=llm.model)
 
     return AppContext(
@@ -1268,6 +1327,7 @@ def build_context(
         tool_allowlist=tool_allowlist,
         route_key=_session_route_key(store, session_info.id),
         config_path=config_path,
+        model_required=model_required,
     )
 
 
@@ -1342,6 +1402,8 @@ def handle_prompt(
     stream_event: Callable[[dict[str, Any]], None] | None = None,
     approval_requester: Callable[[dict[str, Any]], str] | None = None,
 ) -> str:
+    if getattr(ctx, "model_required", False):
+        raise RuntimeError("Choose a model with /model before sending a message.")
     gateway = getattr(ctx, "gateway", None)
     lease = (
         gateway.session_lease(ctx.session_id)
@@ -1528,6 +1590,8 @@ def _emit_transcript_update(ctx: AppContext, messages: list[Any]) -> None:
 
 def _record_local_command_exchange(ctx: AppContext, prompt: str, answer: str) -> None:
     """Persist slash-command output so every UI sees the same transcript."""
+    if (getattr(ctx, "last_local_command_result", None) or {}).get("transient"):
+        return
     # Composer controls use these commands as a private bridge protocol.  They
     # should update the pending-attachment state without making a command
     # exchange look like part of the user's conversation.
@@ -1870,14 +1934,19 @@ def _dispatch_local_command(
         return _switch_model(ctx, model=model, provider=provider)
 
     if command == "/install":
-        if len(parts) not in {3, 4} or (len(parts) == 4 and parts[3].casefold() not in {"--yes", "--confirm"}):
+        if len(parts) not in {3, 4} or (
+            len(parts) == 4
+            and parts[3].casefold() not in {"--yes", "--confirm"}
+        ):
             return "Usage: /install <provider> <model> [--yes]"
-        return _install_local_model(
-            ctx,
-            provider=parts[1],
-            model=parts[2],
-            progress=install_progress,
-            confirmed=len(parts) == 4,
+        return _transient_command_text(
+            _install_local_model(
+                ctx,
+                provider=parts[1],
+                model=parts[2],
+                progress=install_progress,
+                confirmed=len(parts) == 4,
+            )
         )
 
     if command == "/reasoning":
@@ -2232,11 +2301,14 @@ def _switch_model(
         # in-memory-only pending selection would snap back to the prior model
         # as soon as this command completes.
         previous_llm = ctx.llm
+        previous_model_required = getattr(ctx, "model_required", False)
         try:
             ctx.llm = candidate
+            ctx.model_required = False
             _persist_llm_config(ctx)
         except Exception as exc:
             ctx.llm = previous_llm
+            ctx.model_required = previous_model_required
             return _command_text(
                 f"Could not save model `{model}`: {exc}",
                 code="unavailable",
@@ -2297,14 +2369,17 @@ def _switch_model(
         )
 
     previous_llm = ctx.llm
+    previous_model_required = getattr(ctx, "model_required", False)
 
     try:
         ctx.llm = candidate
+        ctx.model_required = False
         ctx.pending_provider = None
         ctx.pending_model = None
         _persist_llm_config(ctx)
     except Exception as exc:
         ctx.llm = previous_llm
+        ctx.model_required = previous_model_required
         return _command_text(
             f"Could not save model `{model}`: {exc}",
             code="unavailable",
@@ -2353,6 +2428,10 @@ def _install_local_model(
         )
     install_id = str(install_entry["install_id"])
 
+    runtime_error = _missing_local_runtime_text(normalized, model)
+    if runtime_error is not None:
+        return runtime_error
+
     if not confirmed:
         return _local_install_preview(normalized, model, install_entry)
 
@@ -2363,20 +2442,6 @@ def _install_local_model(
             model=model,
             install_id=install_id,
             progress=progress,
-        )
-
-    if shutil.which("ollama") is None:
-        return _command_text(
-            "Status: runtime not installed\n"
-            "Ollama runtime is not installed.\n"
-            "Install Ollama in Ubuntu, then return to Nym:\n"
-            "curl -fsSL https://ollama.com/install.sh | sh\n"
-            "Instructions: https://docs.ollama.com/linux\n"
-            "Start Ollama, then run this command again:\n"
-            f"/install ollama {model}",
-            code="runtime_not_installed",
-            setup_required=True,
-            next_command=f"/install ollama {model}",
         )
 
     if progress is not None:
@@ -2428,7 +2493,6 @@ def _install_local_model(
             code="install_failed",
             setup_required=True,
             error=True,
-            next_command=f"/install ollama {model}",
         )
 
     verification_error = _verify_local_model_ready(ctx, "ollama", model)
@@ -2441,7 +2505,6 @@ def _install_local_model(
             code="install_unverified",
             setup_required=True,
             error=True,
-            next_command=f"/install ollama {model}",
         )
 
     if progress is not None:
@@ -2455,7 +2518,6 @@ def _local_install_preview(
     model: str,
     entry: dict[str, str] | None,
 ) -> str:
-    source = _model_source_label(provider)
     metadata = entry or {
         "install_id": model,
         "parameters": "unknown",
@@ -2466,37 +2528,20 @@ def _local_install_preview(
     }
     next_command = f"/install {provider} {model} --yes"
     lines = [
-        "Local model install preview",
-        f"Model: {model}",
-        f"Provider: {source}",
-        f"Exact artifact: {metadata['install_id']}",
-        f"Parameters: {metadata['parameters']}",
-        f"Download: {metadata['size']}",
-        f"Recommended memory: {metadata['memory']}",
-        f"Context: {metadata['context']}",
-        f"Quantization: {metadata['quantization']}",
-        "Location: local runtime storage on this computer",
-        "Authentication: none",
+        f"{model} via {_model_source_label(provider)}",
+        f"Download {metadata['size']} · Memory {metadata['memory']}",
+        f"Parameters {metadata['parameters']} · Context {metadata['context']}",
+        "Nothing has been downloaded.",
     ]
-    if provider == "ollama" and shutil.which("ollama") is None:
-        lines.extend([
-            "",
-            "Warning: Ollama runtime is not installed.",
-            "Nym can install this model from inside the TUI only after Ollama is installed once in Ubuntu.",
-            "Install Ollama outside Nym: curl -fsSL https://ollama.com/install.sh | sh",
-            "The model download will not start until this prerequisite is available.",
-        ])
-    lines.extend([
-        "",
-        f"Confirm download: {next_command}",
-        "The confirmation command is prefilled in the TUI; press Enter to start the download.",
-        "Nothing has been downloaded yet.",
-        "During installation, press Esc or Ctrl+C to stop without closing Agent.",
-    ])
     return _command_text(
         "\n".join(lines),
         code="install_confirmation_required",
-        next_command=next_command,
+        transient=True,
+        pending_action={
+            "kind": "install_model",
+            "label": "Install",
+            "command": next_command,
+        },
     )
 
 
@@ -2559,7 +2604,6 @@ def _install_non_ollama_model(
                 f"Install huggingface_hub, then retry: /install {provider} {model}",
                 code="runtime_unavailable",
                 setup_required=True,
-                next_command=f"/install {provider} {model}",
             )
         command = [hf_cli, "download", install_id]
         runtime_url = "https://docs.vllm.ai/en/latest/models/supported_models/"
@@ -2597,7 +2641,6 @@ def _install_non_ollama_model(
             f"Then select it with: /model {provider} {model}",
             code="install_not_ready",
             setup_required=True,
-            next_command=f"/model {provider} {model}",
         )
 
     verification_error = _verify_local_model_ready(ctx, provider, model)
@@ -2610,7 +2653,6 @@ def _install_non_ollama_model(
             code="install_unverified",
             setup_required=True,
             error=True,
-            next_command=f"/install {provider} {model}",
         )
 
     if progress is not None:
@@ -2669,14 +2711,32 @@ def _runtime_not_installed_text(
     provider: str,
     model: str,
 ) -> str:
+    retry_command = f"/install {provider} {model}"
     return _command_text(
-        "Status: runtime not installed\n"
-        f"{source} is not installed on this computer.\n"
-        f"Install the local runtime: {download_url}\n"
-        f"Then retry: /install {provider} {model}",
+        f"{source} is required before this model can be downloaded.\n"
+        f"Install it once: {download_url}\n"
+        f"Then retry {retry_command}.",
         code="runtime_not_installed",
         setup_required=True,
-        next_command=f"/install {provider} {model}",
+        transient=True,
+    )
+
+
+def _missing_local_runtime_text(provider: str, model: str) -> str | None:
+    requirement = LOCAL_RUNTIME_REQUIREMENTS.get(provider)
+    if requirement is None or shutil.which(requirement.executable) is not None:
+        return None
+    source = _model_source_label(provider)
+    lines = [f"{source} is required before this model can be downloaded."]
+    if requirement.install_command:
+        lines.append(f"Install it once: {requirement.install_command}")
+    lines.append(f"Instructions: {requirement.download_url}")
+    lines.append(f"Then retry /install {provider} {model}.")
+    return _command_text(
+        "\n".join(lines),
+        code="runtime_not_installed",
+        setup_required=True,
+        transient=True,
     )
 
 
@@ -3888,11 +3948,15 @@ def _llm_endpoint(ctx: AppContext) -> str:
 
 
 def _llm_configuration(ctx: AppContext) -> str:
+    if getattr(ctx, "model_required", False):
+        return "No model selected."
     error = getattr(getattr(ctx, "llm", None), "configuration_error", None)
     return str(error) if error else "ready"
 
 
 def _llm_configuration_state(ctx: AppContext) -> str:
+    if getattr(ctx, "model_required", False):
+        return "model_required"
     llm = getattr(ctx, "llm", None)
     explicit = getattr(llm, "configuration_state", None)
     if isinstance(explicit, str) and explicit:
@@ -4340,7 +4404,14 @@ def _run_tui_stream_submit(ctx: AppContext, prompt: str) -> int:
                 )
             else:
                 _record_local_command_exchange(ctx, prompt, answer)
-            if os.environ.get("AGENT_TTS_ENABLED") == "1" and answer:
+            command_is_transient = bool(
+                (ctx.last_local_command_result or {}).get("transient")
+            )
+            if (
+                os.environ.get("AGENT_TTS_ENABLED") == "1"
+                and answer
+                and not command_is_transient
+            ):
                 try:
                     from .voice import speak
                     import threading as _threading
@@ -4496,6 +4567,7 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             "updated_at": session.updated_at,
             "provider": _active_provider(ctx),
             "model": ctx.llm.model,
+            "model_selected": not getattr(ctx, "model_required", False),
             "mode": _llm_mode(ctx),
             "configuration": _llm_configuration(ctx),
             "configuration_state": _llm_configuration_state(ctx),

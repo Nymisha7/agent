@@ -589,6 +589,22 @@ class TuiRenderingTests(unittest.TestCase):
             ),
         )
 
+    def test_transient_install_state_is_not_persisted_as_conversation(self) -> None:
+        store = SimpleNamespace(add_messages=Mock())
+        ctx = SimpleNamespace(
+            session_id="abc123",
+            store=store,
+            last_local_command_result={"transient": True},
+        )
+
+        _record_local_command_exchange(
+            ctx,
+            "/install ollama qwen2.5:0.5b",
+            "Ollama is required before this model can be downloaded.",
+        )
+
+        store.add_messages.assert_not_called()
+
     def test_local_command_exchange_uses_route_guard_when_available(self) -> None:
         store = SimpleNamespace(
             add_messages=Mock(return_value=[
@@ -830,6 +846,36 @@ class TuiRenderingTests(unittest.TestCase):
         snapshot = _tui_bridge_snapshot(ctx)
 
         self.assertEqual(snapshot["agent_name"], "Nymi")
+
+    def test_tui_bridge_snapshot_keeps_unselected_model_neutral(self) -> None:
+        ctx = SimpleNamespace(
+            session_id="new-session",
+            model_required=True,
+            llm=SimpleNamespace(
+                model="gpt-4o-mini",
+                provider="openai",
+                mode="hosted",
+                configuration_error="OpenAI is not configured.",
+            ),
+            session=SimpleNamespace(pending_approvals=[]),
+            store=SimpleNamespace(
+                get_session=lambda _: SimpleNamespace(
+                    id="new-session",
+                    title="New session",
+                    workspace_root="/workspace",
+                    updated_at="now",
+                    cost_usd=0.0,
+                    tokens=TokenUsage(),
+                ),
+                list_messages=lambda _session_id, limit=None: [],
+            ),
+        )
+
+        snapshot = _tui_bridge_snapshot(ctx)
+
+        self.assertFalse(snapshot["session"]["model_selected"])
+        self.assertEqual(snapshot["session"]["configuration_state"], "model_required")
+        self.assertEqual(snapshot["session"]["configuration"], "No model selected.")
 
     def test_voice_snapshot_falls_back_when_voice_module_fails(self) -> None:
         with patch("agent.voice.voice_status", side_effect=RuntimeError("boom")):
@@ -1395,16 +1441,22 @@ class LocalCommandTests(unittest.TestCase):
     def test_install_requires_metadata_preview_before_download(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
-        with patch("agent.main.subprocess.Popen") as popen:
+        with (
+            patch("agent.main.shutil.which", return_value="/usr/bin/ollama"),
+            patch("agent.main.subprocess.Popen") as popen,
+        ):
             result = _handle_local_command(ctx, "/install ollama llama3.3")
 
         popen.assert_not_called()
-        self.assertIn("Parameters: 70B", result)
-        self.assertIn("Exact artifact: llama3.3:70b", result)
-        self.assertIn("Download: ~43 GB", result)
-        self.assertIn("Recommended memory: 48 GB+ RAM", result)
-        self.assertIn("/install ollama llama3.3 --yes", result)
-        self.assertIn("Nothing has been downloaded yet", result)
+        self.assertIn("Parameters 70B", result)
+        self.assertIn("Download ~43 GB", result)
+        self.assertIn("Memory 48 GB+ RAM", result)
+        self.assertNotIn("/install ollama llama3.3 --yes", result)
+        self.assertIn("Nothing has been downloaded", result)
+        self.assertEqual(
+            ctx.last_local_command_result["pending_action"]["command"],
+            "/install ollama llama3.3 --yes",
+        )
 
     def test_reasoning_effort_is_persisted_for_supported_model(self) -> None:
         ctx = SimpleNamespace(
@@ -1924,26 +1976,25 @@ class LocalCommandTests(unittest.TestCase):
     def test_qwen_coder_install_preview_has_concrete_ollama_size(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
-        result = _handle_local_command(ctx, "/install ollama qwen2.5-coder")
+        with patch("agent.main.shutil.which", return_value="/usr/bin/ollama"):
+            result = _handle_local_command(ctx, "/install ollama qwen2.5-coder")
 
-        self.assertIn("Local model install preview", result)
-        self.assertIn("Exact artifact: qwen2.5-coder:7b", result)
-        self.assertIn("Parameters: 7B", result)
-        self.assertIn("Download: ~4.7 GB", result)
-        self.assertIn("Confirm download: /install ollama qwen2.5-coder --yes", result)
+        self.assertIn("qwen2.5-coder via Ollama", result)
+        self.assertIn("Parameters 7B", result)
+        self.assertIn("Download ~4.7 GB", result)
+        self.assertNotIn("/install", result)
 
     def test_qwen_half_billion_install_preview_is_public_and_small(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
-        result = _handle_local_command(ctx, "/install ollama qwen2.5:0.5b")
+        with patch("agent.main.shutil.which", return_value="/usr/bin/ollama"):
+            result = _handle_local_command(ctx, "/install ollama qwen2.5:0.5b")
 
-        self.assertIn("Exact artifact: qwen2.5:0.5b", result)
-        self.assertIn("Parameters: 0.5B", result)
-        self.assertIn("Download: ~398 MB", result)
-        self.assertIn("Context: 32K", result)
-        self.assertIn("Quantization: Q4_K_M", result)
-        self.assertIn("Authentication: none", result)
-        self.assertIn("/install ollama qwen2.5:0.5b --yes", result)
+        self.assertIn("qwen2.5:0.5b via Ollama", result)
+        self.assertIn("Parameters 0.5B", result)
+        self.assertIn("Download ~398 MB", result)
+        self.assertIn("Context 32K", result)
+        self.assertTrue(ctx.last_local_command_result["transient"])
         self.assertEqual(_context_window_for_model("qwen2.5:0.5b"), 32_000)
         self.assertEqual(_context_window_for_model("qwen2.5-coder:7b"), 128_000)
 
@@ -1953,10 +2004,10 @@ class LocalCommandTests(unittest.TestCase):
         with patch("agent.main.shutil.which", return_value=None):
             result = _handle_local_command(ctx, "/install ollama qwen2.5:0.5b")
 
-        self.assertIn("Warning: Ollama runtime is not installed.", result)
-        self.assertIn("only after Ollama is installed once in Ubuntu", result)
+        self.assertIn("Ollama is required", result)
         self.assertIn("curl -fsSL https://ollama.com/install.sh | sh", result)
-        self.assertIn("model download will not start", result)
+        self.assertNotIn("Download ~398 MB", result)
+        self.assertNotIn("pending_action", ctx.last_local_command_result)
 
     def test_unknown_localai_install_does_not_preview_unknown_size_download(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
@@ -2034,6 +2085,7 @@ class LocalCommandTests(unittest.TestCase):
         process.wait.assert_called_once_with()
         switch.assert_called_once_with(ctx, model="llama3.3", provider="ollama")
         self.assertIn("Installed `llama3.3`", result)
+        self.assertTrue(ctx.last_local_command_result["transient"])
         self.assertIn("Ollama · checking local runtime", progress)
         self.assertTrue(any("pulling manifest" in item for item in progress))
         self.assertIn("Ollama · installed llama3.3; selecting model", progress)
@@ -2064,8 +2116,7 @@ class LocalCommandTests(unittest.TestCase):
         with patch("agent.main.shutil.which", return_value=None):
             result = _handle_local_command(ctx, "/install llamacpp gemma-3-1b-it --yes")
 
-        self.assertIn("Status: runtime not installed", result)
-        self.assertIn("llama.cpp is not installed", result)
+        self.assertIn("llama.cpp is required", result)
         self.assertIn("ggml-org/llama.cpp/releases", result)
         self.assertNotIn("login", result.casefold())
 
@@ -2078,7 +2129,7 @@ class LocalCommandTests(unittest.TestCase):
                 "/install ollama qwen2.5:0.5b --yes",
             )
 
-        self.assertIn("Status: runtime not installed", result)
+        self.assertIn("Ollama is required", result)
         self.assertIn("curl -fsSL https://ollama.com/install.sh | sh", result)
         self.assertIn("/install ollama qwen2.5:0.5b", result)
         self.assertNotIn("API key", result)

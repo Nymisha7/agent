@@ -528,6 +528,25 @@ struct BridgeCommandResult {
     secret_provider: Option<String>,
     #[serde(default)]
     next_command: Option<String>,
+    #[serde(default)]
+    transient: bool,
+    #[serde(default)]
+    pending_action: Option<BridgePendingAction>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct BridgePendingAction {
+    kind: BridgePendingActionKind,
+    label: String,
+    command: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BridgePendingActionKind {
+    InstallModel,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -716,6 +735,8 @@ struct BridgeSession {
     configuration: String,
     #[serde(default = "ready_configuration_state")]
     configuration_state: String,
+    #[serde(default = "default_true")]
+    model_selected: bool,
     #[serde(default, rename = "context_limit")]
     _context_limit: Option<i64>,
     #[serde(default)]
@@ -728,6 +749,10 @@ struct BridgeSession {
 
 fn ready_configuration_state() -> String {
     String::from("ready")
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -898,6 +923,14 @@ struct UiNotice {
 }
 
 #[derive(Debug, Clone)]
+struct UiSetupSurface {
+    title: String,
+    text: String,
+    error: bool,
+    pending_action: Option<BridgePendingAction>,
+}
+
+#[derive(Debug, Clone)]
 struct AttachmentHitArea {
     area: Rect,
     filename: String,
@@ -945,6 +978,7 @@ struct TuiApp {
     attachment_path_mode: bool,
     attachment_button_area: Option<Rect>,
     mic_button_area: Option<Rect>,
+    pending_action_area: Option<Rect>,
     attachment_hit_areas: Vec<AttachmentHitArea>,
     palette_hit_areas: Vec<PaletteHitArea>,
     attachment_preview: Option<AttachmentPreview>,
@@ -971,6 +1005,7 @@ struct TuiApp {
     secret_input: String,
     notices: VecDeque<UiNotice>,
     setup_required: bool,
+    setup_surface: Option<UiSetupSurface>,
     gateway_view: Option<GatewayViewState>,
     voice_recording: bool,
     voice_input_prefix: Option<String>,
@@ -1405,7 +1440,9 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Bridge did not return a snapshot."))?;
     let initial_needs_setup = snapshot.session.configuration_state != "ready";
     let initial_secret_provider = None;
-    let initial_status = if initial_needs_setup {
+    let initial_status = if !snapshot.session.model_selected {
+        String::from("Choose a model to start")
+    } else if initial_needs_setup {
         format!(
             "{} needs setup",
             provider_display_name(&snapshot.session.provider)
@@ -1413,15 +1450,7 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
     } else {
         String::from("Ready")
     };
-    let initial_notices = if initial_needs_setup {
-        vec![provider_setup_notice(
-            &snapshot.session.provider,
-            &snapshot.session.configuration,
-            &snapshot.session.configuration_state,
-        )]
-    } else {
-        Vec::new()
-    };
+    let initial_setup_surface = session_setup_surface(&snapshot.session);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1445,6 +1474,7 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
             attachment_path_mode: false,
             attachment_button_area: None,
             mic_button_area: None,
+            pending_action_area: None,
             attachment_hit_areas: Vec::new(),
             palette_hit_areas: Vec::new(),
             attachment_preview: None,
@@ -1469,8 +1499,9 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
             running_prompt: None,
             secret_provider: initial_secret_provider,
             secret_input: String::new(),
-            notices: initial_notices.into(),
+            notices: VecDeque::new(),
             setup_required: initial_needs_setup,
+            setup_surface: initial_setup_surface,
             gateway_view: None,
             voice_recording: false,
             voice_input_prefix: None,
@@ -1544,6 +1575,14 @@ fn run_tui_loop(
             Event::Key(key) => key,
             Event::Mouse(mouse) => {
                 match mouse.kind {
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                        if !app.submitting
+                            && app.pending_action_area.is_some_and(|area| {
+                                mouse_in_rect(mouse.column, mouse.row, area)
+                            }) =>
+                    {
+                        submit_pending_action(&runtime, &args, &tx, &mut app);
+                    }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left)
                         if app.secret_provider.is_none()
                             && app.snapshot.approvals.is_empty()
@@ -1726,6 +1765,16 @@ fn run_tui_loop(
 
         match key.code {
             KeyCode::Esc => {
+                if app
+                    .setup_surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.pending_action.is_some())
+                {
+                    app.setup_surface = session_setup_surface(&app.snapshot.session);
+                    app.pending_action_area = None;
+                    app.status = String::from("Local model installation cancelled");
+                    continue;
+                }
                 if app.secret_provider.is_some() {
                     app.secret_provider = None;
                     app.secret_input.clear();
@@ -1823,6 +1872,15 @@ fn run_tui_loop(
                 }
             }
             KeyCode::Enter => {
+                if app
+                    .setup_surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.pending_action.is_some())
+                    && !app.submitting
+                {
+                    submit_pending_action(&runtime, &args, &tx, &mut app);
+                    continue;
+                }
                 if let Some(provider) = app.secret_provider.take() {
                     let api_key = app.secret_input.trim().to_string();
                     app.secret_input.clear();
@@ -1927,6 +1985,12 @@ fn run_tui_loop(
                     continue;
                 }
                 if !prompt.starts_with('/') {
+                    if !app.snapshot.session.model_selected {
+                        app.setup_required = true;
+                        app.setup_surface = session_setup_surface(&app.snapshot.session);
+                        app.status = String::from("Choose a model before sending a message");
+                        continue;
+                    }
                     if let Some(provider) = required_text_api_key_provider(&app.snapshot.session) {
                         app.secret_provider = Some(provider.clone());
                         app.secret_input.clear();
@@ -2670,15 +2734,40 @@ fn start_prompt_submission(
     });
 }
 
+fn submit_pending_action(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    app: &mut TuiApp,
+) {
+    let Some(action) = app
+        .setup_surface
+        .as_mut()
+        .and_then(|surface| surface.pending_action.take())
+    else {
+        return;
+    };
+    if action.kind == BridgePendingActionKind::Unknown {
+        app.status = String::from("This action is not supported by this version of Nym");
+        return;
+    }
+    app.setup_surface = None;
+    app.pending_action_area = None;
+    start_prompt_submission(runtime, args, tx, app, action.command);
+}
+
 fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     app.attachment_hit_areas.clear();
     app.palette_hit_areas.clear();
+    app.pending_action_area = None;
     let area = frame.area();
-    let [header_area, content_area, status_area, composer_area] = Layout::default()
+    let setup_height = setup_surface_height(app.setup_surface.as_ref(), area.width);
+    let [header_area, content_area, setup_area, status_area, composer_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
+            Constraint::Length(setup_height),
             Constraint::Length(1),
             Constraint::Length(4),
         ])
@@ -2697,6 +2786,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     };
 
     render_transcript(frame, conversation_area, app, true);
+    render_setup_surface(frame, setup_area, app);
 
     let session = &app.snapshot.session;
     let agent_badge = agent_label(&app.snapshot.agent_name);
@@ -2727,7 +2817,11 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             Span::styled(session.id.as_str(), Style::default().fg(Color::Gray)),
             Span::styled("  model ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{}/{}", session.provider, session.model),
+                if session.model_selected {
+                    format!("{}/{}", session.provider, session.model)
+                } else {
+                    String::from("not selected")
+                },
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled("  mode ", Style::default().fg(Color::DarkGray)),
@@ -2977,6 +3071,72 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         && app.attachment_preview.is_none()
     {
         frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(2)), cursor_y));
+    }
+}
+
+fn setup_surface_height(surface: Option<&UiSetupSurface>, width: u16) -> u16 {
+    let Some(surface) = surface else {
+        return 0;
+    };
+    let text_height = Paragraph::new(surface.text.as_str())
+        .wrap(Wrap { trim: false })
+        .line_count(width.saturating_sub(2).max(1))
+        .min(u16::MAX as usize) as u16;
+    let action_height = u16::from(surface.pending_action.is_some());
+    text_height
+        .saturating_add(action_height)
+        .saturating_add(2)
+        .clamp(3, 8)
+}
+
+fn render_setup_surface(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let Some(surface) = app.setup_surface.as_ref() else {
+        return;
+    };
+    let color = if surface.error {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(format!(" {} ", surface.title));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [text_area, action_area] = if surface.pending_action.is_some() && inner.height > 1 {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .areas(inner)
+    } else {
+        [inner, Rect::default()]
+    };
+    frame.render_widget(
+        Paragraph::new(surface.text.as_str())
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false }),
+        text_area,
+    );
+    if let Some(action) = surface.pending_action.as_ref() {
+        app.pending_action_area = Some(action_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" [ {} ] ", action.label),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  Enter confirms · Esc cancels",
+                    Style::default().fg(Color::Gray),
+                ),
+            ])),
+            action_area,
+        );
     }
 }
 
@@ -5348,7 +5508,10 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             "final" => {
                 let completed_prompt = app.running_prompt.clone();
                 let command_result = frame.command_result.as_ref();
-                let next_command = command_result.and_then(|result| result.next_command.clone());
+                let transient = command_result.is_some_and(|result| result.transient);
+                let next_command = command_result
+                    .filter(|result| !result.transient)
+                    .and_then(|result| result.next_command.clone());
                 let key_prompt_provider =
                     command_result.and_then(|result| result.secret_provider.clone());
                 app.submitting = false;
@@ -5357,11 +5520,13 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     let max_index = app.snapshot.approvals.len().saturating_sub(1);
                     app.approval_selected = app.approval_selected.min(max_index);
                 }
-                ensure_final_frame_messages_visible(
-                    app,
-                    completed_prompt.as_deref(),
-                    frame.answer.as_deref(),
-                );
+                if !transient {
+                    ensure_final_frame_messages_visible(
+                        app,
+                        completed_prompt.as_deref(),
+                        frame.answer.as_deref(),
+                    );
+                }
                 clear_live_turn_display(app);
                 if app.cancel_requested {
                     app.cancel_requested = false;
@@ -5378,9 +5543,22 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                         command_result.is_some_and(|result| result.setup_required);
                     app.setup_required =
                         app.snapshot.session.configuration_state != "ready" || command_needs_setup;
-                    if app.snapshot.session.configuration_state == "ready" && !command_needs_setup {
+                    if transient {
+                        let result = command_result.expect("transient command has a result");
+                        app.setup_surface = Some(UiSetupSurface {
+                            title: command_result_surface_title(result).to_string(),
+                            text: frame.answer.clone().unwrap_or_default(),
+                            error: result.error,
+                            pending_action: result.pending_action.clone(),
+                        });
+                    } else if app.snapshot.session.configuration_state == "ready"
+                        && !command_needs_setup
+                    {
+                        app.setup_surface = None;
                         app.notices
                             .retain(|notice| notice.title == "Update available");
+                    } else {
+                        app.setup_surface = session_setup_surface(&app.snapshot.session);
                     }
                     app.status = if completed_prompt
                         .as_deref()
@@ -5803,11 +5981,11 @@ fn provider_setup_url(provider: &str) -> Option<&'static str> {
     }
 }
 
-fn provider_setup_notice(
+fn provider_setup_surface(
     provider: &str,
     configuration: &str,
     configuration_state: &str,
-) -> UiNotice {
+) -> UiSetupSurface {
     let mut text = configuration.to_string();
     if configuration_state == "api_key_required" {
         text.push_str("\nPaste your own API key in the masked field below.");
@@ -5818,11 +5996,30 @@ fn provider_setup_notice(
         text.push_str("\nAccount/API keys: ");
         text.push_str(url);
     }
-    UiNotice {
+    UiSetupSurface {
         title: format!("{} setup", provider_display_name(provider)),
         text,
         error: false,
+        pending_action: None,
     }
+}
+
+fn session_setup_surface(session: &BridgeSession) -> Option<UiSetupSurface> {
+    if !session.model_selected || session.configuration_state == "model_required" {
+        return Some(UiSetupSurface {
+            title: String::from("Choose a model"),
+            text: String::from("Open /model and select a hosted or local model to start."),
+            error: false,
+            pending_action: None,
+        });
+    }
+    (session.configuration_state != "ready").then(|| {
+        provider_setup_surface(
+            &session.provider,
+            &session.configuration,
+            &session.configuration_state,
+        )
+    })
 }
 
 fn required_text_api_key_provider(session: &BridgeSession) -> Option<String> {
@@ -5873,6 +6070,13 @@ fn ui_state_badge(app: &TuiApp) -> (&'static str, Color) {
     if app.secret_provider.is_some() {
         return ("setup", Color::Yellow);
     }
+    if app
+        .setup_surface
+        .as_ref()
+        .is_some_and(|surface| surface.pending_action.is_some())
+    {
+        return ("confirm", Color::Yellow);
+    }
     if app.status.starts_with("Error") || app.status.starts_with("Could not") {
         return ("error", Color::Red);
     }
@@ -5909,6 +6113,20 @@ fn command_result_status(result: &BridgeCommandResult) -> String {
                 String::from("Ready")
             }
         }
+    }
+}
+
+fn command_result_surface_title(result: &BridgeCommandResult) -> &'static str {
+    match result.code {
+        BridgeCommandCode::InstallConfirmationRequired => "Install local model",
+        BridgeCommandCode::RuntimeNotInstalled | BridgeCommandCode::RuntimeUnavailable => {
+            "Local runtime required"
+        }
+        BridgeCommandCode::InstallFailed | BridgeCommandCode::InstallUnverified => {
+            "Local model install failed"
+        }
+        BridgeCommandCode::Ok => "Local model ready",
+        _ => "Setup required",
     }
 }
 
@@ -6409,6 +6627,7 @@ mod tui_tests {
             mode: String::from("hosted"),
             configuration: String::from("Anthropic is not configured. Set ANTHROPIC_API_KEY."),
             configuration_state: String::from("api_key_required"),
+            model_selected: true,
             _context_limit: Some(128_000),
             pending_attachments: Vec::new(),
             _tokens: BridgeTokens {
@@ -6440,6 +6659,7 @@ mod tui_tests {
             attachment_path_mode: false,
             attachment_button_area: None,
             mic_button_area: None,
+            pending_action_area: None,
             attachment_hit_areas: Vec::new(),
             palette_hit_areas: Vec::new(),
             attachment_preview: None,
@@ -6466,6 +6686,7 @@ mod tui_tests {
             secret_input: String::new(),
             notices: VecDeque::new(),
             setup_required: false,
+            setup_surface: None,
             gateway_view: None,
             voice_recording: false,
             voice_input_prefix: None,
@@ -7082,6 +7303,8 @@ mod tui_tests {
             error: false,
             secret_provider: Some(String::from("openai")),
             next_command: None,
+            transient: false,
+            pending_action: None,
         };
 
         assert_eq!(result.secret_provider.as_deref(), Some("openai"));
@@ -7712,6 +7935,8 @@ mod tui_tests {
             error: true,
             secret_provider: None,
             next_command: None,
+            transient: false,
+            pending_action: None,
         };
 
         assert!(result.setup_required);
@@ -7722,17 +7947,39 @@ mod tui_tests {
     }
 
     #[test]
-    fn install_preview_uses_typed_next_command() {
+    fn unselected_model_uses_neutral_startup_surface() {
+        let mut session = anthropic_session();
+        session.model_selected = false;
+        session.configuration_state = String::from("model_required");
+
+        let surface = session_setup_surface(&session).expect("model setup surface");
+
+        assert_eq!(surface.title, "Choose a model");
+        assert!(surface.text.contains("/model"));
+        assert!(!surface.text.contains("API key"));
+    }
+
+    #[test]
+    fn install_preview_uses_typed_pending_action() {
         let result = BridgeCommandResult {
             code: BridgeCommandCode::InstallConfirmationRequired,
             setup_required: false,
             error: false,
             secret_provider: None,
-            next_command: Some(String::from("/install ollama qwen3 --yes")),
+            next_command: None,
+            transient: true,
+            pending_action: Some(BridgePendingAction {
+                kind: BridgePendingActionKind::InstallModel,
+                label: String::from("Install"),
+                command: String::from("/install ollama qwen3 --yes"),
+            }),
         };
 
         assert_eq!(
-            result.next_command.as_deref(),
+            result
+                .pending_action
+                .as_ref()
+                .map(|action| action.command.as_str()),
             Some("/install ollama qwen3 --yes")
         );
     }
@@ -7767,9 +8014,8 @@ mod tui_tests {
         let mut app = test_app();
         app.submitting = true;
         app.running_prompt = Some(String::from("/install ollama qwen3"));
-        let answer = "Local model install preview\nDownload: ~5.2 GB\n\
-                      Confirm download: /install ollama qwen3 --yes\n\
-                      Nothing has been downloaded yet.";
+        let answer = "qwen3 via Ollama\nDownload ~5.2 GB · Memory 8 GB+ RAM\n\
+                      Nothing has been downloaded.";
 
         handle_app_event(
             &mut app,
@@ -7785,13 +8031,28 @@ mod tui_tests {
                     setup_required: false,
                     error: false,
                     secret_provider: None,
-                    next_command: Some(String::from("/install ollama qwen3 --yes")),
+                    next_command: None,
+                    transient: true,
+                    pending_action: Some(BridgePendingAction {
+                        kind: BridgePendingActionKind::InstallModel,
+                        label: String::from("Install"),
+                        command: String::from("/install ollama qwen3 --yes"),
+                    }),
                 }),
             })),
         );
 
         assert!(!app.submitting);
-        assert_eq!(app.input, "/install ollama qwen3 --yes");
+        assert!(app.input.is_empty());
+        assert_eq!(app.snapshot.messages.len(), 0);
+        assert_eq!(
+            app.setup_surface
+                .as_ref()
+                .and_then(|surface| surface.pending_action.as_ref())
+                .map(|action| action.command.as_str()),
+            Some("/install ollama qwen3 --yes")
+        );
+        assert_eq!(ui_state_badge(&app).0, "confirm");
         assert!(app.status.contains("press Enter to install"));
     }
 
