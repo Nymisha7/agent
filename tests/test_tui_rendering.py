@@ -23,6 +23,7 @@ from agent.main import (
     _ensure_ollama_running,
     _expire_orphaned_approvals,
     _exclusive_bridge_turn,
+    _get_json,
     _handle_local_command,
     _is_exit_command,
     _local_runtime_status_lines,
@@ -1913,14 +1914,23 @@ class LocalCommandTests(unittest.TestCase):
     def test_missing_ollama_model_offers_install_action_without_login(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
-        with patch(
-            "agent.main._discover_provider_models",
-            return_value=(["qwen3:latest"], None),
+        with (
+            patch("agent.main.shutil.which", return_value="/usr/bin/ollama"),
+            patch("agent.main._ensure_ollama_running", return_value=None) as ensure_running,
+            patch(
+                "agent.main._discover_provider_models",
+                return_value=(["qwen3:latest"], None),
+            ),
         ):
             result = _handle_local_command(ctx, "/model ollama llama3.3")
 
-        self.assertIn("Status: model not installed", result)
-        self.assertIn("/install ollama llama3.3", result)
+        self.assertIn("llama3.3 via Ollama", result)
+        self.assertNotIn("/install ollama llama3.3", result)
+        self.assertEqual(
+            ctx.last_local_command_result["pending_action"]["command"],
+            "/install ollama llama3.3 --yes",
+        )
+        ensure_running.assert_called_once_with(ctx, progress=None)
         self.assertNotIn("login", result.casefold())
 
     def test_missing_cataloged_vllm_model_offers_local_install_action(self) -> None:
@@ -1935,24 +1945,30 @@ class LocalCommandTests(unittest.TestCase):
                 "/model vllm Qwen/Qwen2.5-Coder-32B-Instruct",
             )
 
-        self.assertIn("Status: model not installed", result)
-        self.assertIn(
-            "/install vllm Qwen/Qwen2.5-Coder-32B-Instruct",
-            result,
+        self.assertIn("Qwen/Qwen2.5-Coder-32B-Instruct via vLLM", result)
+        self.assertNotIn("/install vllm", result)
+        self.assertEqual(
+            ctx.last_local_command_result["pending_action"]["command"],
+            "/install vllm Qwen/Qwen2.5-Coder-32B-Instruct --yes",
         )
 
     def test_offline_ollama_runtime_is_reported_as_unavailable(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
-        with patch(
-            "agent.main._discover_provider_models",
-            return_value=([], "connection refused"),
+        with (
+            patch("agent.main.shutil.which", return_value="/usr/bin/ollama"),
+            patch(
+                "agent.main._discover_provider_models",
+                return_value=([], "connection refused"),
+            ),
+            patch("agent.main._provider_base_url", return_value="http://localhost:11434"),
+            patch("agent.main.subprocess.Popen", side_effect=OSError("cannot start")),
         ):
             result = _handle_local_command(ctx, "/model ollama llama3.3")
 
         self.assertIn("Status: runtime unavailable", result)
-        self.assertIn("https://ollama.com/download", result)
-        self.assertIn("/install ollama llama3.3", result)
+        self.assertIn("Could not start Ollama locally", result)
+        self.assertNotIn("another terminal", result)
 
     def test_offline_cataloged_llamacpp_model_points_to_install_preview(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
@@ -2233,6 +2249,11 @@ class LocalCommandTests(unittest.TestCase):
         )
         self.assertIn("Ollama · starting local runtime", progress)
         self.assertIn("Ollama · local runtime started", progress)
+
+    def test_local_runtime_timeout_is_reported_as_configuration_error(self) -> None:
+        with patch("agent.main.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaisesRegex(RuntimeError, "Could not connect.*timed out"):
+                _get_json("http://localhost:11434/api/tags")
 
     def test_vllm_install_activation_starts_selected_model_locally(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))

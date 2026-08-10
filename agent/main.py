@@ -606,6 +606,9 @@ class LocalRuntimeRequirement:
     executable: str
     download_url: str
     install_command: str | None = None
+    start_command: tuple[str, ...] | None = None
+    startup_timeout: float = 30.0
+    poll_interval: float = 0.25
 
 
 LOCAL_RUNTIME_REQUIREMENTS = {
@@ -613,6 +616,7 @@ LOCAL_RUNTIME_REQUIREMENTS = {
         executable="ollama",
         download_url="https://docs.ollama.com/linux",
         install_command="curl -fsSL https://ollama.com/install.sh | sh",
+        start_command=("ollama", "serve"),
     ),
     "lmstudio": LocalRuntimeRequirement(
         executable="lms",
@@ -1931,7 +1935,12 @@ def _dispatch_local_command(
                 model = parts[1]
         else:
             model = parts[1]
-        return _switch_model(ctx, model=model, provider=provider)
+        return _switch_model(
+            ctx,
+            model=model,
+            provider=provider,
+            progress=install_progress,
+        )
 
     if command == "/install":
         if len(parts) not in {3, 4} or (
@@ -2112,7 +2121,17 @@ def _resolve_local_model_name(
     ctx: Any,
     provider: str,
     requested_model: str,
+    *,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[str | None, str | None]:
+    if provider == "ollama":
+        runtime_error = _missing_local_runtime_text(provider, requested_model)
+        if runtime_error is not None:
+            return None, runtime_error
+        startup_error = _ensure_ollama_running(ctx, progress=progress)
+        if startup_error is not None:
+            return None, startup_error
+
     discovered, discovery_error = _discover_provider_models(
         ctx,
         provider,
@@ -2157,13 +2176,8 @@ def _resolve_local_model_name(
     )
     install_entry = _local_install_entry(provider, requested_model)
     if install_entry is not None:
-        message = (
-            f"{message}\n"
-            f"Install locally now: /install {provider} {requested_model}"
-        )
-        if provider == "ollama":
-            message = f"{message}\nTerminal alternative: ollama pull {requested_model}"
-    elif provider == "lmstudio":
+        return None, _local_install_preview(provider, requested_model, install_entry)
+    if provider == "lmstudio":
         message = f"{message}\nDownload or load it in LM Studio first; no login is required."
     else:
         message = f"{message}\n{_manual_local_install_text(provider, requested_model)}"
@@ -2171,11 +2185,6 @@ def _resolve_local_model_name(
         message,
         code="model_not_installed",
         setup_required=True,
-        next_command=(
-            f"/install {provider} {requested_model}"
-            if install_entry is not None
-            else None
-        ),
     )
 
 
@@ -2196,12 +2205,16 @@ def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
         text = (
             f"{source} · {model}\n"
             "Status: runtime unavailable\n"
-            "Start Ollama if it is installed. Otherwise install it from:\n"
-            "https://ollama.com/download\n"
-            f"Once it is running, install the model here: /install ollama {model}\n"
+            "Nym could not start the installed Ollama runtime automatically.\n"
+            "Check the Ollama installation and retry the model selection in Nym.\n"
             f"Details: {detail}"
         )
-        return _command_text(text, code="runtime_unavailable", setup_required=True)
+        return _command_text(
+            text,
+            code="runtime_unavailable",
+            setup_required=True,
+            transient=True,
+        )
     if provider == "lmstudio":
         text = (
             f"{source} · {model}\n"
@@ -2234,6 +2247,7 @@ def _switch_model(
     *,
     model: str,
     provider: str | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> str:
     resolved_provider = provider or _provider_for_model(
         model,
@@ -2259,6 +2273,7 @@ def _switch_model(
             ctx,
             resolved_provider,
             model,
+            progress=progress,
         )
         if setup_error:
             return setup_error
@@ -2770,13 +2785,25 @@ def _ensure_ollama_running(
             f"Details: {discovery_error}",
             code="runtime_unavailable",
             setup_required=True,
+            transient=True,
         )
 
     if progress is not None:
         progress("Ollama · starting local runtime")
+    requirement = LOCAL_RUNTIME_REQUIREMENTS["ollama"]
+    start_command = requirement.start_command
+    if start_command is None:
+        return _command_text(
+            "Status: runtime unavailable\n"
+            "This Nym build cannot start Ollama automatically.",
+            code="runtime_unavailable",
+            setup_required=True,
+            error=True,
+            transient=True,
+        )
     try:
-        subprocess.Popen(
-            ["ollama", "serve"],
+        process = subprocess.Popen(
+            list(start_command),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -2787,24 +2814,42 @@ def _ensure_ollama_running(
             code="runtime_unavailable",
             setup_required=True,
             error=True,
+            transient=True,
         )
 
     last_error = discovery_error
-    for _attempt in range(40):
-        time.sleep(0.25)
+    deadline = time.monotonic() + requirement.startup_timeout
+    while time.monotonic() < deadline:
+        time.sleep(requirement.poll_interval)
         _models, last_error = _discover_provider_models(ctx, "ollama")
         if not last_error:
             if progress is not None:
                 progress("Ollama · local runtime started")
             return None
+        returncode = process.poll()
+        if isinstance(returncode, int):
+            _models, final_error = _discover_provider_models(ctx, "ollama")
+            if not final_error:
+                return None
+            return _command_text(
+                "Status: runtime unavailable\n"
+                "Nym started Ollama, but the runtime stopped before becoming ready.\n"
+                "Check the Ollama installation and retry in Nym.\n"
+                f"Details: {final_error}",
+                code="runtime_unavailable",
+                setup_required=True,
+                error=True,
+                transient=True,
+            )
 
     return _command_text(
         "Status: runtime unavailable\n"
-        "Ollama is installed but its local server did not start.\n"
-        "Run `ollama serve` in another terminal, then retry the install.\n"
+        "Nym started Ollama, but it did not become ready in time.\n"
+        "Retry in Nym; it will start the runtime automatically.\n"
         f"Details: {last_error}",
         code="runtime_unavailable",
         setup_required=True,
+        transient=True,
     )
 
 
@@ -3043,7 +3088,7 @@ def _get_json(
             f"Endpoint returned HTTP {exc.code}: {body}"
         ) from exc
 
-    except urllib.error.URLError as exc:
+    except (TimeoutError, urllib.error.URLError) as exc:
         reason = getattr(exc, "reason", exc)
 
         raise RuntimeError(
@@ -3327,7 +3372,7 @@ def _handle_model_setup(candidate: Any) -> str:
     if provider == "ollama":
         return (
             f"`{model}` is not ready locally.\n"
-            f"Start Ollama, then install it with: ollama pull {model}"
+            "Retry the model selection in Nym; Nym starts Ollama automatically."
         )
 
     if provider == "lmstudio":
