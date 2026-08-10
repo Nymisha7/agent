@@ -33,12 +33,20 @@ installation. To install into a checkout-local `.venv` instead, run:
 ```
 
 Before starting the TUI, Nym checks its tracked Git checkout once. When a newer
-revision is available, Nym prints the installer command and exits; update the runtime,
-then run `nym --tui` again. The TUI does not poll for updates and has no `/update`
-command.
+revision is available, Nym exits and asks you to run:
 
-Installations created before the startup gate was released need one final manual
-installer run to receive it:
+```bash
+nym --update
+nym --tui
+```
+
+The updater fast-forwards the existing checkout and refreshes the package in its
+current Python environment. It does not rerun operating-system setup, reinstall local
+models, or remove configuration, credentials, and conversations. The TUI does not
+poll for updates and has no `/update` command.
+
+Existing installations that report `unrecognized arguments: --update` need one final
+manual installer run to receive the dedicated updater:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install-wsl.sh | bash

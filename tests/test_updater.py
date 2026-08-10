@@ -9,7 +9,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent.main import _tui_update_required, main
-from agent.updater import UPDATE_INSTALL_COMMAND, UpdateStatus, check_for_update, update_source_root
+from agent.updater import (
+    UPDATE_COMMAND,
+    UpdateStatus,
+    apply_update,
+    check_for_update,
+    update_source_root,
+)
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -83,7 +89,7 @@ class UpdaterTests(unittest.TestCase):
             with patch.dict("os.environ", {"AGENT_UPDATE_ROOT": str(root)}, clear=False):
                 self.assertEqual(update_source_root(), root.resolve())
 
-    def test_startup_gate_prints_installer_command_for_outdated_tui(self) -> None:
+    def test_startup_gate_prints_update_command_for_outdated_tui(self) -> None:
         status = UpdateStatus(
             supported=True,
             available=True,
@@ -100,8 +106,58 @@ class UpdaterTests(unittest.TestCase):
             blocked = _tui_update_required()
 
         self.assertTrue(blocked)
-        self.assertIn(UPDATE_INSTALL_COMMAND, output.getvalue())
+        self.assertIn(UPDATE_COMMAND, output.getvalue())
         self.assertIn("nym --tui", output.getvalue())
+
+    def test_apply_update_fast_forwards_and_refreshes_current_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            author, checkout = self._repositories(Path(tmp))
+            (author / "change.txt").write_text("new behavior\n")
+            _git("add", "change.txt", cwd=author)
+            _git("commit", "-m", "ship update command", cwd=author)
+            _git("push", cwd=author)
+
+            with (
+                patch.dict("os.environ", {"AGENT_UPDATE_ROOT": str(checkout)}, clear=False),
+                patch(
+                    "agent.updater._install_updated_runtime",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ) as install,
+                redirect_stdout(io.StringIO()),
+            ):
+                result = apply_update()
+
+            author_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=author,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            checkout_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(checkout_head, author_head)
+        install.assert_called_once_with(checkout)
+
+    def test_update_cli_runs_before_tui_or_session_startup(self) -> None:
+        with (
+            patch("agent.updater.apply_update", return_value=0) as update,
+            patch("agent.main._tui_update_required") as update_gate,
+            patch("agent.main.SessionStore.default") as open_store,
+        ):
+            result = main(["--update"])
+
+        self.assertEqual(result, 0)
+        update.assert_called_once_with()
+        update_gate.assert_not_called()
+        open_store.assert_not_called()
 
     def test_startup_gate_allows_current_or_unverifiable_install(self) -> None:
         for status in (

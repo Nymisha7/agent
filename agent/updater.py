@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,11 +16,9 @@ from .process_env import credential_free_environment
 
 UPDATE_REMOTE = "origin"
 UPDATE_COMMAND_TIMEOUT_SECONDS = 12
-UPDATE_INSTALL_COMMAND = (
-    "curl -fsSL "
-    "https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install-wsl.sh "
-    "| bash"
-)
+UPDATE_COMMAND = "nym --update"
+# Kept as an import-compatible alias for older integrations.
+UPDATE_INSTALL_COMMAND = UPDATE_COMMAND
 
 
 @dataclass(frozen=True)
@@ -33,6 +32,87 @@ class UpdateStatus:
     source_root: str | None = None
     upstream: str | None = None
     error: str | None = None
+
+
+def apply_update() -> int:
+    status = check_for_update()
+    if not status.supported:
+        print(f"Nym cannot update this installation automatically: {status.error}")
+        return 1
+    if status.error:
+        print(f"Nym update could not start: {status.error}")
+        return 1
+    if not status.available:
+        current = f" ({status.current})" if status.current else ""
+        print(f"Nym is already up to date{current}.")
+        return 0
+    if not status.source_root or not status.upstream:
+        print("Nym update could not identify the managed checkout or upstream branch.")
+        return 1
+
+    root = Path(status.source_root)
+    dirty = _git_output(root, "status", "--porcelain", "--untracked-files=all")
+    preserved_changes = bool(dirty)
+    if preserved_changes:
+        stash = _run_git(
+            root,
+            "stash",
+            "push",
+            "--include-untracked",
+            "-m",
+            "Nym automatic update backup",
+        )
+        if stash.returncode != 0:
+            print(f"Nym could not preserve local checkout changes: {_command_error(stash, 'git stash failed.')}")
+            return 1
+        print("Preserved local checkout changes in the Git stash.")
+
+    print(f"Updating Nym: {status.current or 'current'} -> {status.latest or 'latest'}")
+    merge = _run_git(root, "merge", "--ff-only", status.upstream)
+    if merge.returncode != 0:
+        print(f"Nym could not update its checkout: {_command_error(merge, 'git merge failed.')}")
+        return 1
+
+    print("Refreshing the installed Nym runtime...")
+    install = _install_updated_runtime(root)
+    if install.returncode != 0:
+        print("Nym files were downloaded, but the installed runtime could not be refreshed.")
+        print("Run `nym --update` again after resolving the installation error above.")
+        return 1
+
+    revision = _git_output(root, "rev-parse", "--short=12", "HEAD")
+    print(f"Nym update complete{f' ({revision})' if revision else ''}.")
+    if preserved_changes:
+        print(f"Your previous checkout changes remain available with: git -C {root} stash list")
+    print("Run: nym --tui")
+    return 0
+
+
+def _install_updated_runtime(root: Path) -> subprocess.CompletedProcess[str]:
+    environment = credential_free_environment()
+    revision = _git_output(root, "rev-parse", "HEAD")
+    if revision:
+        environment["NYM_BUILD_REVISION"] = revision
+    try:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--upgrade-strategy",
+                "only-if-needed",
+                "--no-cache-dir",
+                str(root),
+            ],
+            cwd=root,
+            env=environment,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess([sys.executable, "-m", "pip"], 1, "", str(exc))
 
 def check_for_update() -> UpdateStatus:
     root = update_source_root()

@@ -1119,6 +1119,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Update the existing Nym installation and exit.",
+    )
+
+    parser.add_argument(
         "--tui-bridge",
         choices=(
             "snapshot", "submit", "stream-submit", "complete", "gateway",
@@ -4122,7 +4128,7 @@ def truncate(value: str | None, limit: int) -> str:
 
 
 def _tui_update_required() -> bool:
-    from .updater import UPDATE_INSTALL_COMMAND, check_for_update
+    from .updater import UPDATE_COMMAND, check_for_update
 
     status = check_for_update()
     if not status.available:
@@ -4133,7 +4139,7 @@ def _tui_update_required() -> bool:
         print(f"Installed: {status.current}")
         print(f"Available: {status.latest}")
     print("\nRun this command:\n")
-    print(f"  {UPDATE_INSTALL_COMMAND}")
+    print(f"  {UPDATE_COMMAND}")
     print("\nThen start Nym again:\n\n  nym --tui")
     return True
 
@@ -4144,6 +4150,11 @@ def main(argv: list[str] | None = None) -> int:
     command = args.session_command.strip() if args.session_command else None
     session_arg = args.session_id.strip() if args.session_id else None
     use_tui = args.tui or bool(command and command.lower() == "tui")
+
+    if args.update:
+        from .updater import apply_update
+
+        return apply_update()
 
     if not args.tui_bridge and use_tui and _tui_update_required():
         return 3
