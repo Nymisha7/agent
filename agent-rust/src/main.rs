@@ -906,6 +906,12 @@ struct AttachmentHitArea {
     storage_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PaletteHitArea {
+    area: Rect,
+    index: usize,
+}
+
 #[derive(Debug, Clone)]
 struct AttachmentPreview {
     filename: String,
@@ -940,6 +946,7 @@ struct TuiApp {
     attachment_button_area: Option<Rect>,
     mic_button_area: Option<Rect>,
     attachment_hit_areas: Vec<AttachmentHitArea>,
+    palette_hit_areas: Vec<PaletteHitArea>,
     attachment_preview: Option<AttachmentPreview>,
     status: String,
     scroll: u16,
@@ -1439,6 +1446,7 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
             attachment_button_area: None,
             mic_button_area: None,
             attachment_hit_areas: Vec::new(),
+            palette_hit_areas: Vec::new(),
             attachment_preview: None,
             status: initial_status,
             scroll: 0,
@@ -1536,6 +1544,24 @@ fn run_tui_loop(
             Event::Key(key) => key,
             Event::Mouse(mouse) => {
                 match mouse.kind {
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                        if app.secret_provider.is_none()
+                            && app.snapshot.approvals.is_empty()
+                            && app.attachment_preview.is_none()
+                            && app.gateway_view.is_none()
+                            && palette_index_for_mouse(&app, mouse.column, mouse.row).is_some() =>
+                    {
+                        let index = palette_index_for_mouse(&app, mouse.column, mouse.row)
+                            .expect("palette click guard resolved an entry");
+                        activate_palette_mouse_entry(
+                            &runtime,
+                            &args,
+                            &tx,
+                            &palette_tx,
+                            &mut app,
+                            index,
+                        );
+                    }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left)
                         if app.snapshot.approvals.is_empty()
                             && app.attachment_preview.is_none()
@@ -2052,6 +2078,45 @@ fn enqueue_prompt(queue: &mut VecDeque<String>, prompt: String) -> usize {
 
 fn mouse_in_rect(column: u16, row: u16, area: Rect) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn palette_index_for_mouse(app: &TuiApp, column: u16, row: u16) -> Option<usize> {
+    app.palette_hit_areas
+        .iter()
+        .find(|target| mouse_in_rect(column, row, target.area))
+        .map(|target| target.index)
+}
+
+fn activate_palette_mouse_entry(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    palette_tx: &watch::Sender<Option<Arc<str>>>,
+    app: &mut TuiApp,
+    index: usize,
+) {
+    let Some(entry) = app.palette.entries.get(index).cloned() else {
+        return;
+    };
+    if !palette_entry_selectable(&entry) {
+        return;
+    }
+    app.palette_selected = index;
+    app.input = entry.complete_to;
+    if !entry.execute {
+        request_palette_refresh(palette_tx, app);
+        return;
+    }
+
+    let prompt = app.input.trim().to_string();
+    if app.submitting || bridge_process_active(app) {
+        app.input.clear();
+        let queued_count = enqueue_prompt(&mut app.queued_prompts, prompt);
+        clear_palette(app);
+        app.status = format!("Queued {queued_count} prompt(s)");
+        return;
+    }
+    start_prompt_submission(runtime, args, tx, app, prompt);
 }
 
 fn transcript_point_for_mouse(app: &TuiApp, column: u16, row: u16) -> Option<SelectionPoint> {
@@ -2607,6 +2672,7 @@ fn start_prompt_submission(
 
 fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     app.attachment_hit_areas.clear();
+    app.palette_hit_areas.clear();
     let area = frame.area();
     let [header_area, content_area, status_area, composer_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -2859,6 +2925,13 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             width: conversation_area.width.min(input_area.width).max(20),
             height: popup_height,
         };
+        app.palette_hit_areas = palette_hit_areas(
+            &app.palette,
+            query,
+            app.palette_selected,
+            line_budget,
+            popup_area,
+        );
         frame.render_widget(Clear, popup_area);
         let popup = Paragraph::new(palette_text(
             &app.palette,
@@ -4826,6 +4899,42 @@ fn palette_entry_height(entry: &BridgeCompletionEntry) -> usize {
     1 + usize::from(is_model_palette_entry(entry) && !entry.description.is_empty())
 }
 
+fn palette_hit_areas(
+    palette: &BridgeCompletions,
+    query: &str,
+    selected: usize,
+    line_budget: usize,
+    popup_area: Rect,
+) -> Vec<PaletteHitArea> {
+    let (start, end, _) = palette_visible_window(palette, query, selected, line_budget);
+    let mut row = popup_area.y.saturating_add(1);
+    let mut remaining_lines = line_budget.max(1);
+    let mut targets = Vec::new();
+    for (index, entry) in visible_palette_entries(palette, query)
+        .skip(start)
+        .take(end.saturating_sub(start))
+    {
+        if remaining_lines == 0 {
+            break;
+        }
+        let height = palette_entry_height(entry).min(remaining_lines) as u16;
+        if palette_entry_selectable(entry) {
+            targets.push(PaletteHitArea {
+                area: Rect::new(
+                    popup_area.x.saturating_add(1),
+                    row,
+                    popup_area.width.saturating_sub(2),
+                    height,
+                ),
+                index,
+            });
+        }
+        row = row.saturating_add(height);
+        remaining_lines = remaining_lines.saturating_sub(height as usize);
+    }
+    targets
+}
+
 fn palette_visible_window(
     palette: &BridgeCompletions,
     query: &str,
@@ -6332,6 +6441,7 @@ mod tui_tests {
             attachment_button_area: None,
             mic_button_area: None,
             attachment_hit_areas: Vec::new(),
+            palette_hit_areas: Vec::new(),
             attachment_preview: None,
             status: String::from("Ready"),
             scroll: 0,
@@ -7409,6 +7519,52 @@ mod tui_tests {
         assert_eq!(app.palette_selected, 3);
         scroll_active_view(&mut app, false);
         assert_eq!(app.palette_selected, 0);
+    }
+
+    #[test]
+    fn model_palette_mouse_targets_cover_labels_and_descriptions() {
+        let palette = BridgeCompletions {
+            title: String::from("Models"),
+            selected_index: None,
+            entries: vec![
+                BridgeCompletionEntry {
+                    value: String::from("section:ollama"),
+                    label: String::from("Ollama"),
+                    description: String::new(),
+                    complete_to: String::from("/model "),
+                    execute: false,
+                },
+                BridgeCompletionEntry {
+                    value: String::from("ollama/qwen2.5:0.5b"),
+                    label: String::from("qwen2.5:0.5b"),
+                    description: String::from("Ollama · Ready · local"),
+                    complete_to: String::from("/model ollama qwen2.5:0.5b"),
+                    execute: true,
+                },
+                BridgeCompletionEntry {
+                    value: String::from("ollama/qwen3"),
+                    label: String::from("qwen3"),
+                    description: String::from("Ollama · Not installed"),
+                    complete_to: String::from("/model ollama qwen3"),
+                    execute: true,
+                },
+            ],
+        };
+        let targets = palette_hit_areas(&palette, "", 1, 6, Rect::new(10, 5, 80, 8));
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].index, 1);
+        assert_eq!(targets[0].area, Rect::new(11, 7, 78, 2));
+        assert_eq!(targets[1].index, 2);
+        assert_eq!(targets[1].area, Rect::new(11, 9, 78, 2));
+
+        let mut app = test_app();
+        app.palette = palette;
+        app.palette_hit_areas = targets;
+        assert_eq!(palette_index_for_mouse(&app, 20, 7), Some(1));
+        assert_eq!(palette_index_for_mouse(&app, 20, 8), Some(1));
+        assert_eq!(palette_index_for_mouse(&app, 20, 9), Some(2));
+        assert_eq!(palette_index_for_mouse(&app, 20, 6), None);
     }
 
     #[test]
