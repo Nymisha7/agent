@@ -94,6 +94,7 @@ class VoiceConfig:
     realtime_url: str | None
     realtime_provider: str | None
     realtime_model: str
+    realtime_transcription_delay: str
     realtime_session_update: dict[str, object] | None
     realtime_timeout_seconds: int
     realtime_api_key: str | None
@@ -125,6 +126,11 @@ class VoiceConfig:
             mode=_voice_mode_from_environment(),
             realtime_provider=_voice_provider_from_environment(),
             realtime_model=_realtime_voice_model_from_environment(),
+            realtime_transcription_delay=_environment_choice(
+                "AGENT_REALTIME_VOICE_TRANSCRIPTION_DELAY",
+                default="low",
+                choices={"minimal", "low", "medium", "high", "xhigh"},
+            ),
             realtime_url=_realtime_voice_url_from_environment(),
             realtime_session_update=_environment_json_object(
                 "AGENT_REALTIME_VOICE_SESSION_UPDATE_JSON"
@@ -748,6 +754,8 @@ async def _realtime_handshake(ws: object, config: VoiceConfig) -> None:
                 transcription["languages"] = [config.language]
             else:
                 transcription["language"] = config.language
+        if transcription_model == "gpt-live-transcribe":
+            transcription["delay"] = config.realtime_transcription_delay
         update = {
             "type": "session.update",
             "session": {

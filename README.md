@@ -106,6 +106,9 @@ user is speaking, but only the completed transcript is submitted through the nor
 agent runtime. English is the default recognition language; set
 `AGENT_VOICE_LANGUAGE` to another supported language code, or to `auto` for automatic
 detection.
+Realtime partials default to the `low` latency profile. Set
+`AGENT_REALTIME_VOICE_TRANSCRIPTION_DELAY` to `minimal`, `low`, `medium`, `high`, or
+`xhigh` to tune the latency and accuracy tradeoff without changing the voice pipeline.
 
 An environment-based setup can provide the key before launch:
 

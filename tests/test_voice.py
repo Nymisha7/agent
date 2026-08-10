@@ -339,10 +339,44 @@ class VoiceTests(unittest.TestCase):
         self.assertEqual(update["session"]["type"], "transcription")
         self.assertEqual(transcription["model"], "gpt-live-transcribe")
         self.assertEqual(transcription["languages"], ["en"])
-        self.assertNotIn("delay", transcription)
+        self.assertEqual(transcription["delay"], "low")
         self.assertNotIn("keywords", transcription)
         self.assertNotIn("prompt", transcription)
         self.assertIsNone(audio_input["turn_detection"])
+
+    def test_openai_realtime_transcription_delay_is_configurable(self) -> None:
+        class WebSocket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            async def send(self, value: str) -> None:
+                self.sent.append(value)
+
+        websocket = WebSocket()
+        with patch.dict(
+            "os.environ",
+            {
+                "OPENAI_API_KEY": "user-key",
+                "AGENT_REALTIME_VOICE_TRANSCRIPTION_DELAY": "minimal",
+            },
+            clear=True,
+        ):
+            config = VoiceConfig.from_environment()
+            asyncio.run(_realtime_handshake(websocket, config))
+
+        update = json.loads(websocket.sent[0])
+        transcription = update["session"]["audio"]["input"]["transcription"]
+        self.assertEqual(transcription["delay"], "minimal")
+
+    def test_invalid_openai_realtime_transcription_delay_uses_safe_default(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"AGENT_REALTIME_VOICE_TRANSCRIPTION_DELAY": "instant"},
+            clear=True,
+        ):
+            config = VoiceConfig.from_environment()
+
+        self.assertEqual(config.realtime_transcription_delay, "low")
 
     def test_voice_language_can_use_automatic_detection(self) -> None:
         with patch.dict(
