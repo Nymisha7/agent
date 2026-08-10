@@ -6,19 +6,20 @@ import os
 import platform
 import re
 import subprocess
-import sys
-import tempfile
 import urllib.parse
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from .process_env import credential_free_environment
 
 
 UPDATE_REMOTE = "origin"
 UPDATE_COMMAND_TIMEOUT_SECONDS = 12
-UPDATE_INSTALL_TIMEOUT_SECONDS = 30 * 60
+UPDATE_INSTALL_COMMAND = (
+    "curl -fsSL "
+    "https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install-wsl.sh "
+    "| bash"
+)
 
 
 @dataclass(frozen=True)
@@ -33,18 +34,6 @@ class UpdateStatus:
     upstream: str | None = None
     error: str | None = None
 
-    def as_dict(self) -> dict[str, object]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class UpdateResult:
-    ok: bool
-    updated: bool
-    status: UpdateStatus
-    error: str | None = None
-
-
 def check_for_update() -> UpdateStatus:
     root = update_source_root()
     if root is None:
@@ -53,7 +42,7 @@ def check_for_update() -> UpdateStatus:
             error="This installation is not connected to an update checkout.",
         )
 
-    current_ref = _installed_revision(root) or "HEAD"
+    current_ref = _installed_revision(root)
     current = _git_output(root, "rev-parse", "--short=12", current_ref)
     if current is None:
         return _status_error(root, "Could not read the installed revision.")
@@ -84,7 +73,7 @@ def check_for_update() -> UpdateStatus:
             latest=latest,
             source_root=str(root),
             upstream=upstream,
-            error="The local checkout and upstream branch have diverged; automatic update is unavailable.",
+            error="The local checkout and upstream branch have diverged.",
         )
 
     changes: tuple[str, ...] = ()
@@ -101,77 +90,6 @@ def check_for_update() -> UpdateStatus:
         source_root=str(root),
         upstream=upstream,
     )
-
-
-def apply_update(progress: Callable[[str], None] | None = None) -> UpdateResult:
-    status = check_for_update()
-    if not status.supported or status.error:
-        return UpdateResult(False, False, status, status.error)
-    if not status.available:
-        return UpdateResult(True, False, status)
-
-    root = Path(status.source_root or "")
-    dirty_result = _run_git(root, "status", "--porcelain", "--untracked-files=all")
-    if dirty_result.returncode != 0:
-        return UpdateResult(
-            False,
-            False,
-            status,
-            _command_error(dirty_result, "Could not inspect the update checkout."),
-        )
-    dirty = bool(dirty_result.stdout.strip())
-    install_root = root
-    temporary_root: tempfile.TemporaryDirectory[str] | None = None
-    if dirty:
-        if progress:
-            progress("Local checkout has changes; preparing an isolated update")
-        temporary_root = tempfile.TemporaryDirectory(prefix="nym-update-")
-        install_root = Path(temporary_root.name) / "checkout"
-        worktree = _run_git(root, "worktree", "add", "--detach", str(install_root), status.upstream or "")
-        if worktree.returncode != 0:
-            temporary_root.cleanup()
-            return UpdateResult(
-                False,
-                False,
-                status,
-                _command_error(worktree, "Could not prepare an isolated update checkout."),
-            )
-    else:
-        if progress:
-            progress(f"Updating source to {status.latest}")
-        merge = _run_git(root, "merge", "--ff-only", status.upstream or "")
-        if merge.returncode != 0:
-            return UpdateResult(False, False, status, _command_error(merge, "Fast-forward update failed."))
-
-    if progress:
-        progress("Rebuilding the Nym runtime")
-    install = _run_install(install_root)
-    if temporary_root is not None:
-        _run_git(root, "worktree", "remove", "--force", str(install_root))
-        temporary_root.cleanup()
-    if install.returncode != 0:
-        return UpdateResult(
-            False,
-            False,
-            status,
-            _command_error(install, "The update was prepared, but runtime installation failed."),
-        )
-
-    latest_revision = _git_output(root, "rev-parse", status.upstream or "")
-    if latest_revision:
-        _write_installed_revision(root, latest_revision)
-    installed = UpdateStatus(
-        supported=True,
-        available=False,
-        current=status.latest,
-        latest=status.latest,
-        source_root=status.source_root,
-        upstream=status.upstream,
-    )
-    if progress:
-        progress("Update installed; restart Nym to use it")
-    return UpdateResult(True, True, installed)
-
 
 def update_source_root() -> Path | None:
     candidates: list[Path] = []
@@ -213,51 +131,22 @@ def _direct_url_source_root() -> Path | None:
     return Path(path)
 
 
-def _update_state_path() -> Path:
-    state_home = Path(
-        os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
-    ).expanduser()
-    return state_home / "agent" / "update.json"
-
-
-def _installed_revision(root: Path) -> str | None:
-    try:
-        payload = json.loads(_update_state_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("source_root") != str(root):
-        return None
-    revision = payload.get("revision")
-    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
-        return None
+def _installed_revision(root: Path) -> str:
+    revision = _build_revision_marker()
+    if revision is None:
+        return "HEAD"
     exists = _run_git(root, "cat-file", "-e", f"{revision}^{{commit}}")
-    return revision if exists.returncode == 0 else None
+    return revision if exists.returncode == 0 else "HEAD"
 
 
-def _write_installed_revision(root: Path, revision: str) -> None:
-    path = _update_state_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+def _build_revision_marker() -> str | None:
     try:
-        os.chmod(path.parent, 0o700)
+        revision = Path(__file__).with_name("_build_revision").read_text(encoding="ascii").strip()
     except OSError:
-        pass
-    temporary = path.with_suffix(".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump({"source_root": str(root), "revision": revision}, handle)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        temporary.replace(path)
-        os.chmod(path, 0o600)
-    except Exception:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-        raise
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        return None
+    return revision
 
 
 def _upstream_ref(root: Path) -> str | None:
@@ -300,30 +189,6 @@ def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(["git", *args], 1, "", str(exc))
-
-
-def _run_install(root: Path) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "--force-reinstall",
-                "--no-cache-dir",
-                str(root),
-            ],
-            env=credential_free_environment(),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=UPDATE_INSTALL_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return subprocess.CompletedProcess([sys.executable, "-m", "pip"], 1, "", str(exc))
-
 
 def _command_error(result: subprocess.CompletedProcess[str], fallback: str) -> str:
     detail = " ".join((result.stderr or result.stdout).split())

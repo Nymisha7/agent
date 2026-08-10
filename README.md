@@ -32,14 +32,17 @@ installation. To install into a checkout-local `.venv` instead, run:
 ./scripts/install-wsl.sh --path "$PWD" --venv
 ```
 
-After installation, Nym checks its tracked Git checkout for updates in the background.
-When a newer commit is available, the TUI shows an `UPDATE` notice. Run `/update` to
-review the incoming commits, then press Enter on the prepared `/update --yes` command
-to install them. Restart Nym after installation; no installer script is required.
+Before starting the TUI, Nym checks its tracked Git checkout once. When a newer
+revision is available, Nym prints the installer command and exits; update the runtime,
+then run `nym --tui` again. The TUI does not poll for updates and has no `/update`
+command.
 
-Clean installation checkouts are fast-forwarded normally. If the checkout contains
-local changes, Nym preserves them and builds the update from an isolated temporary
-worktree. Diverged branches are left unchanged and reported for manual review.
+Installations created before the startup gate was released need one final manual
+installer run to receive it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Nymisha7/agent/main/scripts/install-wsl.sh | bash
+```
 
 Portable local run:
 

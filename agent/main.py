@@ -125,7 +125,6 @@ DEFAULT_CONTEXT_WINDOWS = {
 LOCAL_COMMANDS = (
     ("/model", "Choose a model or local runtime"),
     ("/name", "Show or change this agent's name"),
-    ("/update", "Check for and install Agent updates"),
     ("/install", "Install an open-source/open-weight model locally"),
     ("/reasoning", "Set reasoning effort for supported models"),
     ("/skills", "Show layered workspace and personal skills"),
@@ -1120,7 +1119,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tui-bridge",
         choices=(
             "snapshot", "submit", "stream-submit", "complete", "gateway",
-            "approve", "deny", "voice-record", "voice-stream", "voice-speak", "update-check",
+            "approve", "deny", "voice-record", "voice-stream", "voice-speak",
         ),
         help=argparse.SUPPRESS,
     )
@@ -1867,11 +1866,6 @@ def _dispatch_local_command(
             confirmed=len(parts) == 4,
         )
 
-    if command == "/update":
-        if len(parts) not in {1, 2} or (len(parts) == 2 and parts[1].casefold() not in {"--yes", "--confirm"}):
-            return "Usage: /update [--yes]"
-        return _update_agent(confirmed=len(parts) == 2, progress=install_progress)
-
     if command == "/reasoning":
         if len(parts) == 1:
             effort = getattr(getattr(ctx, "llm", None), "reasoning_effort", None)
@@ -1921,66 +1915,6 @@ def _slash_help_text() -> str:
     lines.append("Type / to open the command menu. Use Up/Down to select and Tab to complete.")
     lines.append("Enter sends · Esc exits · PgUp/PgDn scrolls")
     return "\n".join(lines)
-
-
-def _update_agent(
-    *,
-    confirmed: bool,
-    progress: Callable[[str], None] | None = None,
-) -> LocalCommandText:
-    from .updater import apply_update, check_for_update
-
-    if confirmed:
-        result = apply_update(progress)
-        if not result.ok:
-            return _command_text(
-                "Update failed\n" + (result.error or "The update could not be completed."),
-                code="update_failed",
-                error=True,
-            )
-        if not result.updated:
-            revision = result.status.current or "current revision"
-            return _command_text(f"Nym is already up to date · {revision}", code="ok")
-        return _command_text(
-            f"Update installed · {result.status.current}\nRestart Nym to use the new version.",
-            code="update_complete",
-        )
-
-    status = check_for_update()
-    if not status.supported:
-        return _command_text(
-            "Automatic updates are unavailable for this installation.\n"
-            + (status.error or "Install Nym from its Git checkout to enable updates."),
-            code="update_unavailable",
-            error=True,
-        )
-    if status.error:
-        return _command_text(
-            f"Could not check for updates\n{status.error}",
-            code="update_failed",
-            error=True,
-        )
-    if not status.available:
-        return _command_text(f"Nym is up to date · {status.current or 'current revision'}", code="ok")
-
-    changes = "\n".join(f"- {change}" for change in status.changes)
-    if status.count > len(status.changes):
-        changes += f"\n- {status.count - len(status.changes)} more change(s)"
-    next_command = "/update --yes"
-    return _command_text(
-        "\n".join([
-            "Update available",
-            f"Current: {status.current}",
-            f"Latest:  {status.latest}",
-            f"Changes: {status.count}",
-            changes,
-            "",
-            "Nothing has been changed yet.",
-            f"Confirm update: {next_command}",
-        ]),
-        code="update_confirmation_required",
-        next_command=next_command,
-    )
 
 
 def _provider_switch_text(ctx: AppContext) -> str:
@@ -4188,9 +4122,33 @@ def truncate(value: str | None, limit: int) -> str:
     return f"{text[: limit - 1]}..."
 
 
+def _tui_update_required() -> bool:
+    from .updater import UPDATE_INSTALL_COMMAND, check_for_update
+
+    status = check_for_update()
+    if not status.available:
+        return False
+
+    print("Nym must be updated before the terminal UI can start.")
+    if status.current and status.latest:
+        print(f"Installed: {status.current}")
+        print(f"Available: {status.latest}")
+    print("\nRun this command:\n")
+    print(f"  {UPDATE_INSTALL_COMMAND}")
+    print("\nThen start Nym again:\n\n  nym --tui")
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    command = args.session_command.strip() if args.session_command else None
+    session_arg = args.session_id.strip() if args.session_id else None
+    use_tui = args.tui or bool(command and command.lower() == "tui")
+
+    if not args.tui_bridge and use_tui and _tui_update_required():
+        return 3
+
     _load_persisted_api_keys()
     try:
         store = SessionStore.default()
@@ -4208,15 +4166,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.tui_bridge:
         return _run_tui_bridge(args, store)
 
-    command = args.session_command.strip() if args.session_command else None
-    session_arg = args.session_id.strip() if args.session_id else None
-
     if command and command.lower() == "list":
         if session_arg:
             parser.error("'list' does not accept a session id.")
         return list_sessions(store)
-
-    use_tui = args.tui or (command and command.lower() == "tui")
 
     if command and command.lower() == "tui":
         command = None
@@ -4435,13 +4388,6 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
             "ok": True,
             "completions": _tui_bridge_completions(prompt, ctx=completion_ctx),
         }
-        print(json.dumps(payload, ensure_ascii=False))
-        return 0
-
-    if args.tui_bridge == "update-check":
-        from .updater import check_for_update
-
-        payload = {"ok": True, "update": check_for_update().as_dict()}
         print(json.dumps(payload, ensure_ascii=False))
         return 0
 

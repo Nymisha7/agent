@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - build_py still works without wheel insta
 
 ROOT = Path(__file__).resolve().parent
 RUST_MANIFEST = ROOT / "agent-rust" / "Cargo.toml"
+BUILD_REVISION_FILE = "_build_revision"
 
 
 class build_py(_build_py):
@@ -25,6 +26,24 @@ class build_py(_build_py):
     def run(self) -> None:
         self._build_rust_backend()
         super().run()
+        self._write_build_revision()
+
+    def _write_build_revision(self) -> None:
+        revision = os.environ.get("NYM_BUILD_REVISION", "").strip()
+        if not revision:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            revision = result.stdout.strip() if result.returncode == 0 else ""
+        if len(revision) != 40 or any(char not in "0123456789abcdefABCDEF" for char in revision):
+            return
+        target_dir = Path(self.build_lib) / "agent"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / BUILD_REVISION_FILE).write_text(revision.lower() + "\n", encoding="ascii")
 
     def _build_rust_backend(self) -> None:
         if os.environ.get("AGENT_SKIP_RUST_BUILD") == "1":

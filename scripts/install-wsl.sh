@@ -130,6 +130,10 @@ checkout_repo() {
     return
   fi
   if [ -d "$INSTALL_ROOT/.git" ]; then
+    if [ -n "$(git -C "$INSTALL_ROOT" status --porcelain --untracked-files=all)" ]; then
+      git -C "$INSTALL_ROOT" stash push --include-untracked -m "Nym installer backup"
+      echo "Preserved local checkout changes in the Git stash."
+    fi
     git -C "$INSTALL_ROOT" pull --ff-only
   else
     mkdir -p "$(dirname "$INSTALL_ROOT")"
