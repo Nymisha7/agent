@@ -2465,7 +2465,7 @@ def _local_install_preview(
         "quantization": "provider default",
     }
     next_command = f"/install {provider} {model} --yes"
-    return _command_text("\n".join([
+    lines = [
         "Local model install preview",
         f"Model: {model}",
         f"Provider: {source}",
@@ -2477,12 +2477,27 @@ def _local_install_preview(
         f"Quantization: {metadata['quantization']}",
         "Location: local runtime storage on this computer",
         "Authentication: none",
+    ]
+    if provider == "ollama" and shutil.which("ollama") is None:
+        lines.extend([
+            "",
+            "Warning: Ollama runtime is not installed.",
+            "Nym can install this model from inside the TUI only after Ollama is installed once in Ubuntu.",
+            "Install Ollama outside Nym: curl -fsSL https://ollama.com/install.sh | sh",
+            "The model download will not start until this prerequisite is available.",
+        ])
+    lines.extend([
         "",
         f"Confirm download: {next_command}",
         "The confirmation command is prefilled in the TUI; press Enter to start the download.",
         "Nothing has been downloaded yet.",
         "During installation, press Esc or Ctrl+C to stop without closing Agent.",
-    ]), code="install_confirmation_required", next_command=next_command)
+    ])
+    return _command_text(
+        "\n".join(lines),
+        code="install_confirmation_required",
+        next_command=next_command,
+    )
 
 
 def _install_non_ollama_model(

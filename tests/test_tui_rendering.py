@@ -1947,6 +1947,17 @@ class LocalCommandTests(unittest.TestCase):
         self.assertEqual(_context_window_for_model("qwen2.5:0.5b"), 32_000)
         self.assertEqual(_context_window_for_model("qwen2.5-coder:7b"), 128_000)
 
+    def test_ollama_install_preview_warns_when_runtime_is_missing(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        with patch("agent.main.shutil.which", return_value=None):
+            result = _handle_local_command(ctx, "/install ollama qwen2.5:0.5b")
+
+        self.assertIn("Warning: Ollama runtime is not installed.", result)
+        self.assertIn("only after Ollama is installed once in Ubuntu", result)
+        self.assertIn("curl -fsSL https://ollama.com/install.sh | sh", result)
+        self.assertIn("model download will not start", result)
+
     def test_unknown_localai_install_does_not_preview_unknown_size_download(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
