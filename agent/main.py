@@ -1672,7 +1672,12 @@ def _latest_workspace_llm_config(
         if _effective_session_agent_id(session, config) != agent_id:
             continue
         if session.provider or session.model:
-            return session.provider, session.model
+            try:
+                candidate = LLMClient(model=session.model, provider=session.provider)
+            except Exception:
+                continue
+            if _candidate_configuration_state(candidate) == "ready":
+                return session.provider, session.model
     return None
 
 
@@ -2364,7 +2369,9 @@ def _install_local_model(
         return _command_text(
             "Status: runtime not installed\n"
             "Ollama runtime is not installed.\n"
-            "Install Ollama: https://ollama.com/download\n"
+            "Install Ollama in Ubuntu, then return to Nym:\n"
+            "curl -fsSL https://ollama.com/install.sh | sh\n"
+            "Instructions: https://docs.ollama.com/linux\n"
             "Start Ollama, then run this command again:\n"
             f"/install ollama {model}",
             code="runtime_not_installed",
@@ -2472,6 +2479,7 @@ def _local_install_preview(
         "Authentication: none",
         "",
         f"Confirm download: {next_command}",
+        "The confirmation command is prefilled in the TUI; press Enter to start the download.",
         "Nothing has been downloaded yet.",
         "During installation, press Esc or Ctrl+C to stop without closing Agent.",
     ]), code="install_confirmation_required", next_command=next_command)

@@ -843,6 +843,29 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertEqual(session.provider, "ollama")
         self.assertEqual(session.model, "llama3.1")
 
+    def test_new_session_does_not_inherit_unconfigured_hosted_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root / "sessions.sqlite3")
+            store.create_session(
+                workspace_root=root,
+                provider="glm",
+                model="glm-5",
+            )
+            args = SimpleNamespace(
+                root=str(root),
+                config=None,
+                channel=None,
+                provider=None,
+                model=None,
+            )
+
+            with patch.dict("os.environ", {"GLM_API_KEY": ""}, clear=False):
+                session = create_new_session(args, store)
+
+        self.assertIsNone(session.provider)
+        self.assertIsNone(session.model)
+
     def test_new_session_ignores_last_model_from_other_agent_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -907,7 +930,8 @@ class ModelSelectionTests(unittest.TestCase):
                 model=None,
             )
 
-            session = create_new_session(args, store)
+            with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}, clear=False):
+                session = create_new_session(args, store)
 
         self.assertEqual(session.agent, "docs")
         self.assertEqual(session.provider, "anthropic")

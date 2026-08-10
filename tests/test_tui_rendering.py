@@ -2058,6 +2058,20 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("ggml-org/llama.cpp/releases", result)
         self.assertNotIn("login", result.casefold())
 
+    def test_install_ollama_model_without_runtime_shows_ubuntu_command(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        with patch("agent.main.shutil.which", return_value=None):
+            result = _handle_local_command(
+                ctx,
+                "/install ollama qwen2.5:0.5b --yes",
+            )
+
+        self.assertIn("Status: runtime not installed", result)
+        self.assertIn("curl -fsSL https://ollama.com/install.sh | sh", result)
+        self.assertIn("/install ollama qwen2.5:0.5b", result)
+        self.assertNotIn("API key", result)
+
     def test_non_ollama_install_uses_selected_provider_backend(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
         cases = (

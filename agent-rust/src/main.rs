@@ -1397,10 +1397,8 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
         .snapshot
         .ok_or_else(|| anyhow::anyhow!("Bridge did not return a snapshot."))?;
     let initial_needs_setup = snapshot.session.configuration_state != "ready";
-    let initial_secret_provider = required_text_api_key_provider(&snapshot.session);
-    let initial_status = if let Some(provider) = initial_secret_provider.as_deref() {
-        api_key_prompt_status(provider)
-    } else if initial_needs_setup {
+    let initial_secret_provider = None;
+    let initial_status = if initial_needs_setup {
         format!(
             "{} needs setup",
             provider_display_name(&snapshot.session.provider)
@@ -1408,7 +1406,7 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
     } else {
         String::from("Ready")
     };
-    let mut initial_notices = if initial_needs_setup {
+    let initial_notices = if initial_needs_setup {
         vec![provider_setup_notice(
             &snapshot.session.provider,
             &snapshot.session.configuration,
@@ -1417,9 +1415,6 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
     } else {
         Vec::new()
     };
-    if let Some(notice) = voice_setup_notice(&snapshot.voice) {
-        initial_notices.push(notice);
-    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2221,6 +2216,10 @@ fn start_voice_recording(
     }
     if !app.snapshot.voice.input_ready {
         if let Some(provider) = app.snapshot.voice.input_secret_provider.clone() {
+            if let Some(notice) = voice_setup_notice(&app.snapshot.voice) {
+                app.notices.retain(|item| item.title != "Voice setup");
+                push_notice(app, &notice.title, &notice.text, notice.error);
+            }
             app.secret_provider = Some(provider);
             app.secret_input.clear();
             app.status = api_key_prompt_status("voice");
