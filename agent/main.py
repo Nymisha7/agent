@@ -93,6 +93,7 @@ DEFAULT_CONTEXT_WINDOWS = {
     "claude-3-5-haiku-latest": 200_000,
     "llama3.1": 128_000,
     "llama3.3": 128_000,
+    "qwen2.5:0.5b": 32_000,
     "qwen2.5-coder": 128_000,
     "qwen2.5-coder-7b-instruct": 128_000,
     "qwen3": 128_000,
@@ -538,6 +539,7 @@ PROVIDER_MODEL_HINTS = {
         "claude-opus-4.1",
     ),
     "ollama": (
+        "qwen2.5:0.5b",
         "qwen2.5-coder",
         "qwen3-coder",
         "qwen3",
@@ -579,6 +581,7 @@ PROVIDER_MODEL_HINTS = {
     "glm": ("glm-5.1", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4", "glm-4.5"),
 }
 LOCAL_INSTALL_CATALOG = (
+    {"provider": "ollama", "model": "qwen2.5:0.5b", "install_id": "qwen2.5:0.5b", "parameters": "0.5B", "size": "~398 MB", "memory": "2 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
     {"provider": "ollama", "model": "qwen3", "install_id": "qwen3:8b", "parameters": "8B", "size": "~5.2 GB", "memory": "8 GB+ RAM", "context": "40K", "quantization": "Ollama default"},
     {"provider": "lmstudio", "model": "gpt-oss-20b", "install_id": "openai/gpt-oss-20b", "parameters": "20B (3.6B active)", "size": "varies by quantization", "memory": "16 GB+ RAM", "context": "128K", "quantization": "choose in LM Studio"},
     {"provider": "llamacpp", "model": "gemma-3-1b-it", "install_id": "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M", "parameters": "1B", "size": "~1 GB", "memory": "4 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
@@ -2321,27 +2324,23 @@ def _install_local_model(
         )
 
     install_entry = _local_install_entry(normalized, model)
-    if install_entry is None and normalized in {"llamacpp", "localai", "vllm"} and "/" not in model:
+    if install_entry is None:
         source = _model_source_label(normalized)
         available = ", ".join(
             entry["model"]
             for entry in LOCAL_INSTALL_CATALOG
             if entry["provider"] == normalized
         )
-        identifier_kind = {
-            "llamacpp": "Hugging Face GGUF repository",
-            "localai": "LocalAI gallery entry with known size metadata",
-            "vllm": "Hugging Face model repository",
-        }[normalized]
         return _command_text(
             "Status: model is not in the install catalog\n"
             f"Choose a listed {source} model: {available or 'none'}\n"
-            f"Or provide a full {identifier_kind} identifier after `/install {normalized}`.\n"
-            "Agent will not preview or start an unknown-size local download.",
+            "Agent will not preview or start an unverified download.\n"
+            f"Custom models can still be installed directly with {source}, then selected with "
+            f"`/model {normalized} <model>`.",
             code="model_not_installed",
             setup_required=True,
         )
-    install_id = str(install_entry["install_id"] if install_entry else model)
+    install_id = str(install_entry["install_id"])
 
     if not confirmed:
         return _local_install_preview(normalized, model, install_entry)

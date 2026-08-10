@@ -19,6 +19,7 @@ from agent.main import (
     _cli_approval_requester,
     _compact_usage_text,
     _complete_slash_command,
+    _context_window_for_model,
     _ensure_ollama_running,
     _expire_orphaned_approvals,
     _exclusive_bridge_turn,
@@ -714,7 +715,7 @@ class TuiRenderingTests(unittest.TestCase):
         ollama_section = labels.index("── Ollama ──")
         self.assertEqual(
             labels[ollama_section + 1 : ollama_section + 4],
-            ["qwen2.5-coder", "qwen3-coder", "qwen3"],
+            ["qwen2.5:0.5b", "qwen2.5-coder", "qwen3-coder"],
         )
 
     def test_model_completions_are_grouped_by_provider_ranked_models_first(self) -> None:
@@ -740,7 +741,8 @@ class TuiRenderingTests(unittest.TestCase):
 
         values = [entry["value"] for entry in payload["entries"] if entry["execute"]]
         self.assertLess(values.index("openai/gpt-5.5"), values.index("anthropic/claude-sonnet-4.5"))
-        self.assertLess(values.index("anthropic/claude-sonnet-4.5"), values.index("ollama/qwen2.5-coder"))
+        self.assertLess(values.index("anthropic/claude-sonnet-4.5"), values.index("ollama/qwen2.5:0.5b"))
+        self.assertLess(values.index("ollama/qwen2.5:0.5b"), values.index("ollama/qwen2.5-coder"))
         self.assertLess(values.index("ollama/qwen2.5-coder"), values.index("ollama/qwen3-coder"))
         self.assertLess(values.index("ollama/qwen3-coder"), values.index("ollama/qwen3"))
         self.assertLess(values.index("ollama/qwen3"), values.index("ollama/custom-local:latest"))
@@ -1332,14 +1334,14 @@ class TuiRenderingTests(unittest.TestCase):
     def test_install_palette_offers_explicit_ollama_download_action(self) -> None:
         entries = _slash_palette_entries("/install ollama")
 
-        self.assertEqual(entries[0].value, "ollama/qwen3")
-        self.assertEqual(entries[0].complete_to, "/install ollama qwen3")
+        self.assertEqual(entries[0].value, "ollama/qwen2.5:0.5b")
+        self.assertEqual(entries[0].complete_to, "/install ollama qwen2.5:0.5b")
         self.assertTrue(entries[0].execute)
         self.assertIn("Open-source/open-weight", entries[0].description)
         self.assertIn("Provider: Ollama", entries[0].description)
-        self.assertIn("8B params", entries[0].description)
-        self.assertIn("~5.2 GB", entries[0].description)
-        self.assertIn("8 GB+ RAM", entries[0].description)
+        self.assertIn("0.5B params", entries[0].description)
+        self.assertIn("~398 MB", entries[0].description)
+        self.assertIn("2 GB+ RAM", entries[0].description)
         self.assertIn("preview first", entries[0].description)
         self.assertIn("installs locally", entries[0].description)
         self.assertIn("no login", entries[0].description)
@@ -1350,10 +1352,6 @@ class TuiRenderingTests(unittest.TestCase):
 
         self.assertEqual(
             providers,
-            {"ollama", "lmstudio", "llamacpp", "vllm", "localai"},
-        )
-        self.assertEqual(
-            {entry.value.split("/", 1)[0] for entry in entries[:5]},
             {"ollama", "lmstudio", "llamacpp", "vllm", "localai"},
         )
         self.assertTrue(all("installs locally" in entry.description for entry in entries))
@@ -1934,15 +1932,66 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("Download: ~4.7 GB", result)
         self.assertIn("Confirm download: /install ollama qwen2.5-coder --yes", result)
 
+    def test_qwen_half_billion_install_preview_is_public_and_small(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        result = _handle_local_command(ctx, "/install ollama qwen2.5:0.5b")
+
+        self.assertIn("Exact artifact: qwen2.5:0.5b", result)
+        self.assertIn("Parameters: 0.5B", result)
+        self.assertIn("Download: ~398 MB", result)
+        self.assertIn("Context: 32K", result)
+        self.assertIn("Quantization: Q4_K_M", result)
+        self.assertIn("Authentication: none", result)
+        self.assertIn("/install ollama qwen2.5:0.5b --yes", result)
+        self.assertEqual(_context_window_for_model("qwen2.5:0.5b"), 32_000)
+        self.assertEqual(_context_window_for_model("qwen2.5-coder:7b"), 128_000)
+
     def test_unknown_localai_install_does_not_preview_unknown_size_download(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
         result = _handle_local_command(ctx, "/install localai qwen2.5-coder")
 
         self.assertIn("Status: model is not in the install catalog", result)
-        self.assertIn("Agent will not preview or start an unknown-size local download.", result)
+        self.assertIn("Agent will not preview or start an unverified download.", result)
         self.assertNotIn("Parameters: varies", result)
         self.assertNotIn("Confirm download:", result)
+
+    def test_unknown_hugging_face_identifier_cannot_bypass_install_catalog(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        with patch("agent.main.subprocess.Popen") as popen:
+            result = _handle_local_command(
+                ctx,
+                "/install vllm unknown-owner/unknown-model --yes",
+            )
+
+        popen.assert_not_called()
+        self.assertIn("Status: model is not in the install catalog", result)
+        self.assertIn("installed directly with vLLM", result)
+        self.assertNotIn("Authentication: none", result)
+
+    def test_qwen_half_billion_install_pulls_exact_public_artifact(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+        process = SimpleNamespace(
+            stdout=io.BytesIO(b"pulling manifest\nsuccess\n"),
+            wait=Mock(return_value=0),
+        )
+
+        with (
+            patch("agent.main.shutil.which", return_value="/usr/bin/ollama"),
+            patch("agent.main._ensure_ollama_running", return_value=None),
+            patch("agent.main.subprocess.Popen", return_value=process) as popen,
+            patch("agent.main._verify_local_model_ready", return_value=None),
+            patch("agent.main._switch_model", return_value="Ollama · qwen2.5:0.5b"),
+        ):
+            result = _handle_local_command(
+                ctx,
+                "/install ollama qwen2.5:0.5b --yes",
+            )
+
+        self.assertEqual(popen.call_args.args[0], ["ollama", "pull", "qwen2.5:0.5b"])
+        self.assertIn("Installed `qwen2.5:0.5b`", result)
 
     def test_install_ollama_model_pulls_then_selects_it(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))

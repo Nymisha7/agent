@@ -196,7 +196,7 @@ an account page or ask for an Agent login:
 
 | Provider | Default endpoint | Example |
 | --- | --- | --- |
-| Ollama | `http://localhost:11434/v1` | `/model ollama qwen3` |
+| Ollama | `http://localhost:11434/v1` | `/model ollama qwen2.5:0.5b` |
 | LM Studio | `http://localhost:1234/v1` | `/model lmstudio <loaded-model>` |
 | llama.cpp | `http://localhost:8080/v1` | `/model llamacpp <loaded-model>` |
 | vLLM | `http://localhost:8000/v1` | `/model vllm <served-model>` |
@@ -206,6 +206,11 @@ The runtime owns model downloads and storage; Agent discovers models from its lo
 model-list endpoint. Override endpoints with `AGENT_OLLAMA_BASE_URL`,
 `AGENT_LMSTUDIO_BASE_URL`, `AGENT_LLAMACPP_BASE_URL`, `AGENT_VLLM_BASE_URL`, or
 `AGENT_LOCALAI_BASE_URL`.
+
+For the smallest built-in option, use `/install ollama qwen2.5:0.5b`. It downloads
+about 398 MB, runs without an account or API key, and is selected automatically after
+Agent verifies it through the local Ollama API. Hosted copies of open-weight models
+still require the hosting provider's API key; choose the Ollama entry for no-login use.
 
 Selecting a local model checks the runtime and installed-model list first. If an
 Ollama model is missing, preview it from the TUI with `/install ollama <model>`.
@@ -218,7 +223,9 @@ downloads and local server startup; Agent verifies that the selected model appea
 the provider API before reporting it ready.
 The `/install` picker contains open-source/open-weight models for Ollama, LM Studio,
 llama.cpp, vLLM, and LocalAI. Each download is stored and served locally by the
-selected provider runtime, not by Agent.
+selected provider runtime, not by Agent. Only curated public artifacts can be
+downloaded through `/install`; load custom models directly in the runtime and select
+them with `/model <provider> <model>`.
 
 For models that expose configurable reasoning effort, use `/reasoning` and choose
 `minimal`, `low`, `medium`, or `high`. Agent shows concise activity and tool results;
