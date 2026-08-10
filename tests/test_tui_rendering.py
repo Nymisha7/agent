@@ -1911,6 +1911,40 @@ class LocalCommandTests(unittest.TestCase):
         self.assertEqual(ctx.llm.provider, "ollama")
         self.assertEqual(result, "Ollama · llama3.1")
 
+    def test_model_command_preloads_selected_ollama_model(self) -> None:
+        warm = Mock()
+        progress = []
+        candidate = SimpleNamespace(
+            provider="ollama",
+            model="qwen2.5:0.5b",
+            configuration_error=None,
+            warm=warm,
+        )
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        with (
+            patch(
+                "agent.main._resolve_local_model_name",
+                return_value=("qwen2.5:0.5b", None),
+            ),
+            patch("agent.main.LLMClient", return_value=candidate),
+        ):
+            result = _handle_local_command(
+                ctx,
+                "/model ollama qwen2.5:0.5b",
+                install_progress=progress.append,
+            )
+
+        warm.assert_called_once_with()
+        self.assertEqual(
+            progress,
+            [
+                "Ollama · loading qwen2.5:0.5b into memory",
+                "Ollama · qwen2.5:0.5b is ready",
+            ],
+        )
+        self.assertEqual(result, "Ollama · qwen2.5:0.5b")
+
     def test_missing_ollama_model_offers_install_action_without_login(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
@@ -2099,7 +2133,12 @@ class LocalCommandTests(unittest.TestCase):
             bufsize=0,
         )
         process.wait.assert_called_once_with()
-        switch.assert_called_once_with(ctx, model="llama3.3", provider="ollama")
+        switch.assert_called_once_with(
+            ctx,
+            model="llama3.3",
+            provider="ollama",
+            progress=progress.append,
+        )
         self.assertIn("Installed `llama3.3`", result)
         self.assertTrue(ctx.last_local_command_result["transient"])
         self.assertIn("Ollama · checking local runtime", progress)

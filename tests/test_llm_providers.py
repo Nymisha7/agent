@@ -1,8 +1,9 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from agent.attachments import import_attachment
 from agent.llm import (
@@ -98,6 +99,147 @@ class LLMProviderTests(unittest.TestCase):
         self.assertTrue(any(event["type"] == "response.output_text.delta" for event in events))
         self.assertFalse(any(event["type"] == "response.reasoning_text.delta" for event in events))
         self.assertEqual(events[-1]["type"], "response.completed")
+
+    def test_local_provider_streams_safe_text_before_tool_capable_response_finishes(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5:0.5b")
+        events = []
+
+        class StreamingChunks:
+            def __init__(self) -> None:
+                self.index = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.index == 0:
+                    self.index += 1
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(
+                            content="Hello",
+                            reasoning_content=None,
+                            tool_calls=[],
+                        ))],
+                        usage=None,
+                    )
+                if self.index == 1:
+                    self.index += 1
+                    self.assert_first_delta_was_emitted()
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(
+                            content=" there.",
+                            reasoning_content=None,
+                            tool_calls=[],
+                        ))],
+                        usage=None,
+                    )
+                raise StopIteration
+
+            @staticmethod
+            def assert_first_delta_was_emitted() -> None:
+                deltas = [
+                    event["delta"]
+                    for event in events
+                    if event["type"] == "response.output_text.delta"
+                ]
+                if deltas != ["Hello"]:
+                    raise AssertionError(f"expected progressive text, got {deltas!r}")
+
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=Mock(return_value=StreamingChunks())),
+            ),
+        )
+
+        response = client.respond(
+            instructions="Use tools when needed",
+            messages=[{"role": "user", "content": "Say hello"}],
+            tools=[{
+                "type": "function",
+                "name": "desktop_action",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            stream=True,
+            event_handler=events.append,
+        )
+
+        self.assertEqual(response.output_text, "Hello there.")
+        self.assertEqual(
+            [
+                event["delta"]
+                for event in events
+                if event["type"] == "response.output_text.delta"
+            ],
+            ["Hello", " there."],
+        )
+
+    def test_local_provider_holds_fragmented_plain_text_tool_call(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5:0.5b")
+        chunks = iter([
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content="desktop_",
+                    reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content='action {"action":"set_mute","value":true}',
+                    reasoning_content=None,
+                    tool_calls=[],
+                ))],
+                usage=None,
+            ),
+        ])
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=Mock(return_value=chunks)),
+            ),
+        )
+        events = []
+
+        response = client.respond(
+            instructions="Use tools",
+            messages=[{"role": "user", "content": "Mute audio"}],
+            tools=[{
+                "type": "function",
+                "name": "desktop_action",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            stream=True,
+            event_handler=events.append,
+        )
+
+        self.assertEqual(response.output_text, "")
+        self.assertEqual(response.output[0]["name"], "desktop_action")
+        self.assertFalse(any(
+            event["type"] == "response.output_text.delta"
+            for event in events
+        ))
+
+    def test_ollama_warm_preloads_model_with_native_api(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5:0.5b")
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"done":true}'
+
+        with (
+            patch.dict("os.environ", {"AGENT_OLLAMA_KEEP_ALIVE": "20m"}, clear=False),
+            patch("agent.llm.urllib.request.urlopen", return_value=response) as urlopen,
+        ):
+            client.warm()
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://localhost:11434/api/generate")
+        self.assertEqual(
+            json.loads(request.data.decode("utf-8")),
+            {
+                "model": "qwen2.5:0.5b",
+                "stream": False,
+                "keep_alive": "20m",
+            },
+        )
 
     def test_local_provider_converts_bare_json_content_into_tool_call(self) -> None:
         client = LLMClient(provider="ollama", model="qwen2.5-coder:7b")

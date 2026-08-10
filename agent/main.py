@@ -2386,6 +2386,19 @@ def _switch_model(
     previous_llm = ctx.llm
     previous_model_required = getattr(ctx, "model_required", False)
 
+    warm_error: str | None = None
+    warm = getattr(candidate, "warm", None)
+    if resolved_provider == "ollama" and callable(warm):
+        if progress is not None:
+            progress(f"Ollama · loading {model} into memory")
+        try:
+            warm()
+        except Exception as exc:
+            warm_error = str(exc)
+        else:
+            if progress is not None:
+                progress(f"Ollama · {model} is ready")
+
     try:
         ctx.llm = candidate
         ctx.model_required = False
@@ -2402,7 +2415,14 @@ def _switch_model(
             error=True,
         )
 
-    return _command_text(_model_switch_text(ctx), code="ok")
+    result = _model_switch_text(ctx)
+    if warm_error:
+        result = (
+            f"{result}\n"
+            "The model was selected, but it could not be preloaded. "
+            f"The first prompt may still include load time: {warm_error}"
+        )
+    return _command_text(result, code="ok")
 
 
 def _install_local_model(
@@ -2524,7 +2544,12 @@ def _install_local_model(
 
     if progress is not None:
         progress(f"Ollama · installed {model}; selecting model")
-    switch_result = _switch_model(ctx, model=model, provider="ollama")
+    switch_result = _switch_model(
+        ctx,
+        model=model,
+        provider="ollama",
+        progress=progress,
+    )
     return _prepend_command_text(f"Installed `{model}` with Ollama.", switch_result)
 
 

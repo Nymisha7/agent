@@ -236,6 +236,61 @@ class LLMClient:
         )
         return _get(response, "output_text", "")
 
+    def warm(self) -> None:
+        """Load a local Ollama model without consuming a user prompt."""
+        if self.provider != "ollama" or not self.model:
+            return
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "stream": False,
+        }
+        keep_alive = os.environ.get("AGENT_OLLAMA_KEEP_ALIVE", "").strip()
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Nym/1.0",
+        }
+        api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        request = urllib.request.Request(
+            _ollama_generate_url(self.endpoint),
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        timeout = _float_env("AGENT_OLLAMA_WARM_TIMEOUT_SECONDS") or _llm_timeout_seconds()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                _friendly_llm_error(
+                    exc,
+                    self.provider,
+                    self.model,
+                    self.endpoint,
+                    self.mode,
+                    body=body,
+                )
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                _friendly_llm_error(
+                    exc,
+                    self.provider,
+                    self.model,
+                    self.endpoint,
+                    self.mode,
+                )
+            ) from exc
+
     def respond(
         self,
         *,
@@ -384,7 +439,7 @@ class LLMClient:
         usage: Any = None
         sequence = 0
         streamed_local_text = False
-        suppress_local_text_stream = False
+        local_text_stream_ready = False
 
         def emit(event: dict[str, Any]) -> None:
             nonlocal sequence
@@ -409,18 +464,20 @@ class LLMClient:
             if isinstance(content, str) and content:
                 text_parts.append(content)
                 output_text = "".join(text_parts)
-                if self.mode != "local" and not text_tool_names:
+                if self.mode != "local":
                     emit({"type": "response.output_text.delta", "delta": content})
-                elif (
-                    self.mode == "local"
-                    and not text_tool_names
-                    and not suppress_local_text_stream
+                elif local_text_stream_ready:
+                    emit({"type": "response.output_text.delta", "delta": content})
+                    streamed_local_text = True
+                elif _local_text_stream_is_safe(
+                    output_text,
+                    allowed_tool_names=text_tool_names,
                 ):
-                    if _safe_local_chat_stream_prefix(output_text):
-                        emit({"type": "response.output_text.delta", "delta": content})
-                        streamed_local_text = True
-                    else:
-                        suppress_local_text_stream = True
+                    # Flush the short ambiguous prefix together. Subsequent
+                    # chunks can pass through without waiting for generation.
+                    emit({"type": "response.output_text.delta", "delta": output_text})
+                    streamed_local_text = True
+                    local_text_stream_ready = True
 
             for call_delta in _get(delta, "tool_calls", []) or []:
                 index = _get(call_delta, "index", 0)
@@ -465,7 +522,7 @@ class LLMClient:
                 output_text,
                 allowed_names=text_tool_names,
             )
-            if fallback_calls and not calls:
+            if fallback_calls and not calls and not streamed_local_text:
                 for index, fallback in enumerate(fallback_calls):
                     call_id = f"call_text_{index}"
                     calls[index] = {
@@ -489,7 +546,11 @@ class LLMClient:
                         "delta": fallback["arguments"],
                     })
                 output_text = visible_text
-            if output_text and not _looks_like_command_envelope(output_text):
+            if (
+                output_text
+                and not streamed_local_text
+                and not _looks_like_command_envelope(output_text)
+            ):
                 emit({"type": "response.output_text.delta", "delta": output_text})
         elif (
             self.mode == "local"
@@ -835,6 +896,13 @@ def _ollama_base_url() -> str:
     if raw.endswith("/v1"):
         return raw
     return f"{raw}/v1"
+
+
+def _ollama_generate_url(base_url: str) -> str:
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3].rstrip("/")
+    return f"{root}/api/generate"
 
 
 def _responses_input_messages(messages: list[dict[str, Any]], *, provider: str) -> list[dict[str, Any]]:
@@ -1278,16 +1346,46 @@ def _looks_like_command_envelope(content: str) -> bool:
     return any(_is_command_envelope_object(candidate) for candidate in candidates)
 
 
-def _safe_local_chat_stream_prefix(content: str) -> bool:
+def _local_text_stream_is_safe(
+    content: str,
+    *,
+    allowed_tool_names: set[str],
+) -> bool:
     text = content.strip()
     if not text:
-        return True
+        return False
     lowered = text.casefold()
-    if "<tool_call" in lowered or "```" in lowered:
+
+    structural_prefixes = ("```", "<tool_call>")
+    if any(
+        lowered.startswith(prefix) or prefix.startswith(lowered)
+        for prefix in structural_prefixes
+    ):
         return False
     if text.startswith("{") or text.startswith("["):
         return False
+
+    word_match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text)
+    if word_match is not None:
+        word = word_match.group(0)
+        matching_names = {
+            name
+            for name in allowed_tool_names
+            if name.casefold().startswith(word.casefold())
+        }
+        if matching_names:
+            rest = text[word_match.end():]
+            if not rest:
+                return False
+            if any(name.casefold() == word.casefold() for name in matching_names):
+                if not rest.strip() or rest.lstrip().startswith("{"):
+                    return False
+
     return not _looks_like_command_envelope(text)
+
+
+def _safe_local_chat_stream_prefix(content: str) -> bool:
+    return _local_text_stream_is_safe(content, allowed_tool_names=set())
 
 
 def _is_command_envelope_object(payload: str) -> bool:
