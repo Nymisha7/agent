@@ -1371,6 +1371,13 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual(entries[0].value, "openai/gpt-5.5")
         self.assertIn("sign in or API key", entries[0].description)
 
+    def test_command_palette_exposes_native_update(self) -> None:
+        entries = _slash_palette_entries("/")
+
+        update = next(entry for entry in entries if entry.value == "/update")
+        self.assertTrue(update.execute)
+        self.assertEqual(update.complete_to, "/update")
+
     def test_model_palette_scrolls_to_selected_entry(self) -> None:
         entries = _slash_palette_entries("/model ")
         selected_index = 12

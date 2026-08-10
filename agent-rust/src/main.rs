@@ -515,6 +515,22 @@ struct BridgeResponse {
     gateway: Option<BridgeGatewaySnapshot>,
     #[serde(default)]
     command_result: Option<BridgeCommandResult>,
+    #[serde(default)]
+    update: Option<BridgeUpdate>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BridgeUpdate {
+    #[serde(default)]
+    available: bool,
+    #[serde(default)]
+    current: Option<String>,
+    #[serde(default)]
+    latest: Option<String>,
+    #[serde(default)]
+    count: usize,
+    #[serde(default)]
+    changes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -544,6 +560,10 @@ enum BridgeCommandCode {
     InstallUnverified,
     InstallNotReady,
     ManualSetupRequired,
+    UpdateConfirmationRequired,
+    UpdateComplete,
+    UpdateFailed,
+    UpdateUnavailable,
     Unavailable,
     #[serde(other)]
     Unknown,
@@ -921,6 +941,7 @@ struct AttachmentPreview {
 enum AppEvent {
     StreamFrame(Result<BridgeStreamFrame>),
     VoiceFrame(Result<BridgeVoiceFrame>),
+    UpdateCheck(Result<BridgeResponse>),
 }
 
 struct TranscriptCache {
@@ -1504,6 +1525,7 @@ fn run_tui_loop(
     let (palette_result_tx, palette_result_rx) =
         mpsc::channel::<(Arc<str>, Result<BridgeResponse>)>();
     spawn_palette_worker(&runtime, Arc::clone(&args), palette_rx, palette_result_tx);
+    spawn_update_check(&runtime, Arc::clone(&args), tx.clone());
     request_palette_refresh(&palette_tx, &mut app);
     let mut needs_redraw = true;
 
@@ -2746,6 +2768,8 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         String::from(" attach file path · Enter adds it · Esc cancels ")
     } else if install_command_is_confirmed(&app.input) {
         String::from(" confirm local install · Enter starts · Esc cancels ")
+    } else if update_command_is_confirmed(&app.input) {
+        String::from(" confirm Agent update · Enter installs · Esc cancels ")
     } else if app.submitting {
         String::from(" message (agent working · Enter queues) ")
     } else if !app.palette.entries.is_empty() && app.input.starts_with('/') {
@@ -4583,9 +4607,16 @@ fn transcript_text(
         } else {
             Color::Cyan
         };
+        let badge = if notice.error {
+            " ERROR "
+        } else if notice.title == "Update available" {
+            " UPDATE "
+        } else {
+            " SETUP "
+        };
         lines.push(Line::from(vec![
             Span::styled(
-                if notice.error { " ERROR " } else { " SETUP " },
+                badge,
                 Style::default()
                     .fg(Color::Black)
                     .bg(color)
@@ -5129,6 +5160,18 @@ fn spawn_palette_worker(
     });
 }
 
+fn spawn_update_check(runtime: &RuntimeHandle, args: Arc<TuiArgs>, events: mpsc::Sender<AppEvent>) {
+    runtime.spawn(async move {
+        loop {
+            let result = call_bridge_async(args.as_ref(), "update-check", None).await;
+            if events.send(AppEvent::UpdateCheck(result)).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+        }
+    });
+}
+
 fn clear_palette(app: &mut TuiApp) {
     app.palette = BridgeCompletions::default();
     app.palette_source = None;
@@ -5195,11 +5238,17 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     let install_preview = prompt.trim_start().starts_with("/install ")
                         && !install_command_is_confirmed(&prompt);
                     let installing = install_command_is_confirmed(&prompt);
+                    let update_preview = prompt.trim() == "/update";
+                    let updating = update_command_is_confirmed(&prompt);
                     app.running_prompt = Some(prompt);
                     if installing {
                         app.status = String::from("Starting local model installation");
                     } else if install_preview {
                         app.status = String::from("Preparing local model install preview");
+                    } else if updating {
+                        app.status = String::from("Installing Agent update");
+                    } else if update_preview {
+                        app.status = String::from("Checking for Agent updates");
                     }
                 }
                 if let Some(snapshot) = frame.snapshot {
@@ -5270,7 +5319,8 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                     app.setup_required =
                         app.snapshot.session.configuration_state != "ready" || command_needs_setup;
                     if app.snapshot.session.configuration_state == "ready" && !command_needs_setup {
-                        app.notices.clear();
+                        app.notices
+                            .retain(|notice| notice.title == "Update available");
                     }
                     app.status = if completed_prompt
                         .as_deref()
@@ -5293,6 +5343,12 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                 if let Some(command) = next_command {
                     app.input = command;
                     clear_palette(app);
+                }
+                if command_result
+                    .is_some_and(|result| result.code == BridgeCommandCode::UpdateComplete)
+                {
+                    app.notices
+                        .retain(|notice| notice.title != "Update available");
                 }
                 if let Some(provider) = key_prompt_provider {
                     app.secret_provider = Some(provider.clone());
@@ -5354,6 +5410,25 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             push_notice(app, "Bridge failed", &err.to_string(), true);
             app.status = String::from("Error — details shown in conversation");
         }
+        AppEvent::UpdateCheck(Ok(response)) => {
+            if let Some(update) = response.update.filter(|update| update.available) {
+                let current = update.current.as_deref().unwrap_or("installed");
+                let latest = update.latest.as_deref().unwrap_or("latest");
+                let summary = update
+                    .changes
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("New changes are ready.");
+                let text = format!(
+                    "{current} → {latest} · {} change(s)\n{summary}\nRun /update to review and install.",
+                    update.count
+                );
+                app.notices
+                    .retain(|notice| notice.title != "Update available");
+                push_notice(app, "Update available", &text, false);
+            }
+        }
+        AppEvent::UpdateCheck(Err(_)) => {}
     }
 }
 
@@ -5789,6 +5864,12 @@ fn command_result_status(result: &BridgeCommandResult) -> String {
         BridgeCommandCode::InstallNotReady | BridgeCommandCode::ManualSetupRequired => {
             String::from("Local model setup incomplete — details shown above")
         }
+        BridgeCommandCode::UpdateConfirmationRequired => {
+            String::from("Review the update above, then press Enter to install")
+        }
+        BridgeCommandCode::UpdateComplete => String::from("Update installed — restart Nym"),
+        BridgeCommandCode::UpdateFailed => String::from("Error — Agent update failed"),
+        BridgeCommandCode::UpdateUnavailable => String::from("Automatic updates unavailable"),
         BridgeCommandCode::ApiKeyRequired => String::from("API key required"),
         BridgeCommandCode::CredentialsRequired => String::from("Provider credentials required"),
         BridgeCommandCode::Unavailable => String::from("Requested model is unavailable"),
@@ -5809,6 +5890,11 @@ fn install_command_is_confirmed(command: &str) -> bool {
         && parts.next().is_some()
         && parts.next() == Some("--yes")
         && parts.next().is_none()
+}
+
+fn update_command_is_confirmed(command: &str) -> bool {
+    let mut parts = command.split_whitespace();
+    parts.next() == Some("/update") && parts.next() == Some("--yes") && parts.next().is_none()
 }
 
 fn apply_bridge_credentials(command: &mut ProcessCommand, args: &TuiArgs) {
@@ -7636,6 +7722,43 @@ mod tui_tests {
         assert!(!app.submitting);
         assert_eq!(app.input, "/install ollama qwen3 --yes");
         assert!(app.status.contains("press Enter to install"));
+    }
+
+    #[test]
+    fn background_update_check_adds_actionable_notice() {
+        let mut app = test_app();
+
+        handle_app_event(
+            &mut app,
+            AppEvent::UpdateCheck(Ok(BridgeResponse {
+                ok: true,
+                error: None,
+                answer: None,
+                snapshot: None,
+                completions: None,
+                gateway: None,
+                command_result: None,
+                update: Some(BridgeUpdate {
+                    available: true,
+                    current: Some(String::from("111111111111")),
+                    latest: Some(String::from("222222222222")),
+                    count: 2,
+                    changes: vec![String::from("2222222 improve updates")],
+                }),
+            })),
+        );
+
+        let notice = app.notices.back().expect("update notice");
+        assert_eq!(notice.title, "Update available");
+        assert!(notice.text.contains("111111111111 → 222222222222"));
+        assert!(notice.text.contains("Run /update"));
+    }
+
+    #[test]
+    fn update_confirmation_is_a_single_exact_command() {
+        assert!(update_command_is_confirmed("/update --yes"));
+        assert!(!update_command_is_confirmed("/update"));
+        assert!(!update_command_is_confirmed("/update --yes extra"));
     }
 
     #[test]
