@@ -7,6 +7,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,7 @@ class UpdateStatus:
     changes: tuple[str, ...] = ()
     source_root: str | None = None
     upstream: str | None = None
+    isolated_install: bool = False
     error: str | None = None
 
 
@@ -52,38 +54,47 @@ def apply_update() -> int:
 
     root = Path(status.source_root)
     dirty = _git_output(root, "status", "--porcelain", "--untracked-files=all")
-    preserved_changes = bool(dirty)
-    if preserved_changes:
-        stash = _run_git(
+    isolated = status.isolated_install or bool(dirty)
+    install_root = root
+    temporary_root: tempfile.TemporaryDirectory[str] | None = None
+    if isolated:
+        print("Local checkout changes detected; updating Nym from an isolated clean revision.")
+        temporary_root = tempfile.TemporaryDirectory(prefix="nym-update-")
+        install_root = Path(temporary_root.name) / "checkout"
+        worktree = _run_git(
             root,
-            "stash",
-            "push",
-            "--include-untracked",
-            "-m",
-            "Nym automatic update backup",
+            "worktree",
+            "add",
+            "--detach",
+            str(install_root),
+            status.upstream,
         )
-        if stash.returncode != 0:
-            print(f"Nym could not preserve local checkout changes: {_command_error(stash, 'git stash failed.')}")
+        if worktree.returncode != 0:
+            temporary_root.cleanup()
+            print(f"Nym could not prepare a clean update: {_command_error(worktree, 'git worktree failed.')}")
             return 1
-        print("Preserved local checkout changes in the Git stash.")
-
-    print(f"Updating Nym: {status.current or 'current'} -> {status.latest or 'latest'}")
-    merge = _run_git(root, "merge", "--ff-only", status.upstream)
-    if merge.returncode != 0:
-        print(f"Nym could not update its checkout: {_command_error(merge, 'git merge failed.')}")
-        return 1
+    else:
+        print(f"Updating Nym: {status.current or 'current'} -> {status.latest or 'latest'}")
+        merge = _run_git(root, "merge", "--ff-only", status.upstream)
+        if merge.returncode != 0:
+            print(f"Nym could not update its checkout: {_command_error(merge, 'git merge failed.')}")
+            return 1
 
     print("Refreshing the installed Nym runtime...")
-    install = _install_updated_runtime(root)
+    install = _install_updated_runtime(install_root)
+    if temporary_root is not None:
+        _run_git(root, "worktree", "remove", "--force", str(install_root))
+        temporary_root.cleanup()
     if install.returncode != 0:
         print("Nym files were downloaded, but the installed runtime could not be refreshed.")
         print("Run `nym --update` again after resolving the installation error above.")
         return 1
 
     revision = _git_output(root, "rev-parse", "--short=12", "HEAD")
-    print(f"Nym update complete{f' ({revision})' if revision else ''}.")
-    if preserved_changes:
-        print(f"Your previous checkout changes remain available with: git -C {root} stash list")
+    installed_revision = status.latest if isolated else revision
+    print(f"Nym update complete{f' ({installed_revision})' if installed_revision else ''}.")
+    if isolated:
+        print(f"Local checkout preserved unchanged: {root}")
     print("Run: nym --tui")
     return 0
 
@@ -146,15 +157,13 @@ def check_for_update() -> UpdateStatus:
     except (TypeError, ValueError):
         return _status_error(root, "Git returned an invalid update comparison.", current=current)
 
-    if ahead and behind:
-        return UpdateStatus(
-            supported=True,
-            current=current,
-            latest=latest,
-            source_root=str(root),
-            upstream=upstream,
-            error="The local checkout and upstream branch have diverged.",
-        )
+    checkout_counts = _git_output(root, "rev-list", "--left-right", "--count", f"HEAD...{upstream}")
+    if checkout_counts is None:
+        return _status_error(root, "Could not compare the update checkout with upstream.", current=current)
+    try:
+        checkout_ahead, _checkout_behind = (int(value) for value in checkout_counts.split())
+    except (TypeError, ValueError):
+        return _status_error(root, "Git returned an invalid checkout comparison.", current=current)
 
     changes: tuple[str, ...] = ()
     if behind:
@@ -169,6 +178,7 @@ def check_for_update() -> UpdateStatus:
         changes=changes,
         source_root=str(root),
         upstream=upstream,
+        isolated_install=checkout_ahead > 0,
     )
 
 def update_source_root() -> Path | None:

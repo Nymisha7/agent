@@ -146,6 +146,69 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(checkout_head, author_head)
         install.assert_called_once_with(checkout)
 
+    def test_diverged_checkout_updates_from_isolated_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            author, checkout = self._repositories(Path(tmp))
+            _git("config", "user.email", "local@example.com", cwd=checkout)
+            _git("config", "user.name", "Local User", cwd=checkout)
+            (checkout / "local.txt").write_text("preserve me\n")
+            _git("add", "local.txt", cwd=checkout)
+            _git("commit", "-m", "local checkout change", cwd=checkout)
+            local_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            (author / "remote.txt").write_text("update\n")
+            _git("add", "remote.txt", cwd=author)
+            _git("commit", "-m", "remote update", cwd=author)
+            _git("push", cwd=author)
+            installed_heads: list[str] = []
+
+            def install(root: Path) -> subprocess.CompletedProcess[str]:
+                installed_heads.append(
+                    subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                )
+                return subprocess.CompletedProcess([], 0)
+
+            with (
+                patch.dict("os.environ", {"AGENT_UPDATE_ROOT": str(checkout)}, clear=False),
+                patch("agent.updater._install_updated_runtime", side_effect=install),
+                redirect_stdout(io.StringIO()),
+            ):
+                status = check_for_update()
+                result = apply_update()
+
+            checkout_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            remote_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=author,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertTrue(status.available)
+        self.assertTrue(status.isolated_install)
+        self.assertEqual(result, 0)
+        self.assertEqual(checkout_head, local_head)
+        self.assertEqual(installed_heads, [remote_head])
+
     def test_update_cli_runs_before_tui_or_session_startup(self) -> None:
         with (
             patch("agent.updater.apply_update", return_value=0) as update,
