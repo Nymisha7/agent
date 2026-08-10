@@ -2284,6 +2284,7 @@ fn insert_composer_paste(app: &mut TuiApp, text: &str) {
     }
     if app.secret_provider.is_some() {
         app.secret_input.push_str(text);
+        app.status = String::from("API key pasted into the protected field");
     } else {
         app.input.push_str(text);
         app.status = String::from("Pasted text — review and press Enter to send");
@@ -2550,7 +2551,13 @@ fn paste_clipboard_into_composer(
     tx: &mpsc::Sender<AppEvent>,
     app: &mut TuiApp,
 ) {
-    if app.secret_provider.is_some() || !app.snapshot.approvals.is_empty() {
+    if !app.snapshot.approvals.is_empty() {
+        return;
+    }
+    if app.secret_provider.is_some() {
+        if !paste_clipboard_text(app) {
+            app.status = String::from("Clipboard does not contain an API key as text");
+        }
         return;
     }
     if app.submitting || bridge_process_active(app) {
@@ -2594,18 +2601,24 @@ fn paste_clipboard_into_composer(
 }
 
 fn paste_clipboard_text(app: &mut TuiApp) -> bool {
-    if let Ok(value) = desktop_clipboard_read_text() {
-        if let Some(text) = value
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            app.input.push_str(text);
-            app.status = String::from("Pasted text from the clipboard");
-            return true;
-        }
+    desktop_clipboard_read_text().is_ok_and(|value| insert_clipboard_text(app, &value))
+}
+
+fn insert_clipboard_text(app: &mut TuiApp, value: &Value) -> bool {
+    let Some(text) = value
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    else {
+        return false;
+    };
+
+    let secret_input = app.secret_provider.is_some();
+    insert_composer_paste(app, text);
+    if !secret_input {
+        app.status = String::from("Pasted text from the clipboard");
     }
-    false
+    true
 }
 
 fn copy_latest_response_to_clipboard(app: &mut TuiApp) {
@@ -7308,6 +7321,30 @@ mod tui_tests {
         };
 
         assert_eq!(result.secret_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn clipboard_text_is_pasted_into_masked_api_key_input() {
+        let mut app = test_app();
+        app.secret_provider = Some(String::from("openai"));
+        let clipboard = json!({"ok": true, "text": "sk-test-secret"});
+
+        assert!(insert_clipboard_text(&mut app, &clipboard));
+        assert_eq!(app.secret_input, "sk-test-secret");
+        assert!(app.input.is_empty());
+        assert_eq!(app.status, "API key pasted into the protected field");
+        assert!(!app.status.contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn clipboard_text_still_uses_the_normal_composer_without_secret_prompt() {
+        let mut app = test_app();
+        let clipboard = json!({"ok": true, "text": "ordinary text"});
+
+        assert!(insert_clipboard_text(&mut app, &clipboard));
+        assert_eq!(app.input, "ordinary text");
+        assert!(app.secret_input.is_empty());
+        assert_eq!(app.status, "Pasted text from the clipboard");
     }
 
     #[test]
