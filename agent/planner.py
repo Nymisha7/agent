@@ -55,6 +55,12 @@ DESKTOP_RETRY_EVIDENCE_TOOLS = frozenset({
 DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT = 1
 DEFAULT_UNEXECUTED_ACTION_RETRY_LIMIT = 1
 REASONING_FAILURE_TEXT_LIMIT = 360
+LOCAL_FILE_MUTATION_TOOLS = frozenset({"write_file", "edit_file"})
+_FILE_MUTATION_INTENT_RE = re.compile(
+    r"\b(?:add|build|change|create|edit|fix|generate|implement|make|modify|patch|"
+    r"refactor|rename|replace|save|scaffold|update|write)\b",
+    flags=re.IGNORECASE,
+)
 EMPTY_RESPONSE_RETRY_INSTRUCTION = (
     "The previous attempt did not produce a user-visible answer. Continue from "
     "the current state and produce the visible answer now. Do not restart from scratch."
@@ -340,11 +346,17 @@ def run_agent(
                     if loop_result is not None and loop_result["level"] == "critical":
                         observation = _tool_loop_block_observation(call, loop_result)
                     else:
-                        observation = _preflight_tool_call(
-                            call,
-                            tool_ctx=tool_ctx,
-                            session=active_session,
+                        observation = (
+                            _local_file_mutation_intent_observation(call, visible_prompt)
+                            if compact_local_context
+                            else None
                         )
+                        if observation is None:
+                            observation = _preflight_tool_call(
+                                call,
+                                tool_ctx=tool_ctx,
+                                session=active_session,
+                            )
             if observation is None:
                 try:
                     observation = tool_registry.execute(call.name, call.arguments, tool_ctx)
@@ -1377,6 +1389,29 @@ def _preflight_tool_call(
             call.arguments["_backend_path"] = element["backend_path"]
 
     return None
+
+
+def _local_file_mutation_intent_observation(
+    call: ModelToolCall,
+    user_prompt: str,
+) -> dict[str, Any] | None:
+    if call.name not in LOCAL_FILE_MUTATION_TOOLS:
+        return None
+    if _FILE_MUTATION_INTENT_RE.search(user_prompt):
+        return None
+    return {
+        "ok": False,
+        "tool": call.name,
+        "args": call.arguments,
+        "blocked": True,
+        "recoverable": True,
+        "reason": "file_mutation_intent_missing",
+        "operation": "write",
+        "guidance": (
+            "The current user request does not explicitly ask to create or modify files. "
+            "Do not retry a file mutation; answer the request without changing the workspace."
+        ),
+    }
 
 
 def _desktop_window_target_observed(session: AgentSession, target: str) -> bool:
@@ -2728,14 +2763,29 @@ def _raw_response_text(response: Any) -> str:
 
 
 def _unwrap_final_text(text: str) -> str:
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        return text
-    if isinstance(value, dict) and value.get("type") == "final":
-        answer = value.get("answer")
-        if isinstance(answer, str) and answer.strip():
-            return answer.strip()
+    candidates = [text.strip()]
+    candidates.extend(
+        match.group("payload")
+        for match in re.finditer(
+            r"(?P<fence>`{1,3})(?:json)?\s*(?P<payload>\{.*?\})\s*(?P=fence)",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+    )
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        if value.get("type") == "final":
+            answer = value.get("answer")
+            if isinstance(answer, str) and answer.strip():
+                return answer.strip()
+        response = value.get("response")
+        if isinstance(response, str) and response.strip():
+            return response.strip()
     return text
 
 
@@ -2777,7 +2827,6 @@ def _is_unexecuted_action_object(payload: str) -> bool:
     return (
         isinstance(name, str)
         and bool(name.strip())
-        and "arguments" in value
     )
 
 

@@ -6,7 +6,14 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.language_servers import default_language_servers, language_server_context_text
-from agent.planner import AgentSession, _approval_was_approved, _bounded_recent_history, run_agent
+from agent.planner import (
+    AgentSession,
+    ModelToolCall,
+    _approval_was_approved,
+    _bounded_recent_history,
+    _local_file_mutation_intent_observation,
+    run_agent,
+)
 
 
 def test_planner_has_no_commented_out_or_rule_router_functions() -> None:
@@ -235,6 +242,38 @@ def test_local_tool_response_protocol_is_recovered_without_leaking() -> None:
     assert answer == "Hello!"
     assert "tool_response" not in answer
     assert len(llm.requests) == 2
+
+
+def test_local_fenced_response_envelope_is_unwrapped() -> None:
+    llm = LocalLLM(['{}\n\n```json\n{"response":"Hello!"}\n```'])
+
+    answer = run_agent(
+        llm=llm,
+        rust=object(),
+        workspace_root=".",
+        user_prompt="hi",
+    )
+
+    assert answer == "Hello!"
+    assert len(llm.requests) == 1
+
+
+def test_local_file_mutation_requires_explicit_current_request() -> None:
+    call = ModelToolCall(
+        name="write_file",
+        call_id="write-hi",
+        arguments={"path": "hi.txt", "content": "Hello"},
+    )
+
+    blocked = _local_file_mutation_intent_observation(call, "hi")
+    allowed = _local_file_mutation_intent_observation(
+        call,
+        "create a task manager app named ctt",
+    )
+
+    assert blocked is not None
+    assert blocked["reason"] == "file_mutation_intent_missing"
+    assert allowed is None
 
 
 def test_local_router_artifact_does_not_leak_to_user() -> None:

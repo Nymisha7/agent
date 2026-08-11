@@ -470,6 +470,46 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(response.output[0]["name"], "inspect_target")
         self.assertEqual(response.output_text, "")
 
+    def test_local_provider_accepts_omitted_zero_argument_object(self) -> None:
+        completion = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='```json\n{"name":"system_info"}\n```',
+                tool_calls=[],
+            ))],
+            usage=None,
+        )
+
+        response = _chat_completion_to_response(
+            completion,
+            text_tool_names={"system_info"},
+        )
+
+        self.assertEqual(response.output[0]["name"], "system_info")
+        self.assertEqual(response.output[0]["arguments"], "{}")
+        self.assertEqual(response.output_text, "")
+
+    def test_local_provider_uses_deterministic_temperature_by_default(self) -> None:
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:3b")
+        completion = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="Hello!",
+                tool_calls=[],
+            ))],
+            usage=None,
+        )
+        create = Mock(return_value=completion)
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+
+        client.respond(
+            instructions="Answer directly.",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+        )
+
+        self.assertEqual(create.call_args.kwargs["temperature"], 0.0)
+
     def test_local_provider_executes_plain_text_tool_calls(self) -> None:
         completion = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(

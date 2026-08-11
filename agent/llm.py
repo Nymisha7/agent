@@ -410,6 +410,11 @@ class LLMClient:
         chat_tool_choice = _chat_tool_choice(tool_choice)
         if chat_tool_choice is not None:
             request_args["tool_choice"] = chat_tool_choice
+        if self.mode == "local":
+            local_temperature = _float_env("AGENT_LOCAL_TEMPERATURE")
+            request_args["temperature"] = (
+                local_temperature if local_temperature is not None else 0.0
+            )
         reasoning_effort = _chat_reasoning_effort(self.provider, self.model, self.reasoning_effort)
         if reasoning_effort is not None:
             request_args["reasoning_effort"] = reasoning_effort
@@ -1335,7 +1340,9 @@ def _text_tool_call_object(
     arguments = value.get("arguments")
     if not isinstance(name, str) or name not in allowed_names:
         return None
-    if isinstance(arguments, dict):
+    if "arguments" not in value:
+        serialized_arguments = "{}"
+    elif isinstance(arguments, dict):
         serialized_arguments = json.dumps(arguments, ensure_ascii=False)
     elif isinstance(arguments, str):
         try:
