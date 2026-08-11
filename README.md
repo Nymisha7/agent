@@ -220,8 +220,10 @@ It downloads about 1.9 GB, runs without an account or API key, and is selected
 automatically after Agent verifies it through the local Ollama API. The built-in
 catalog also offers `qwen3.5:4b` for broader coding and reasoning, `granite4:3b`
 for instruction following and tool calling, and `qwen3:4b` as a compact general
-agent model. Higher-memory systems can use `devstral-small-2:24b` (32 GB+ RAM)
-for stronger agentic and coding work. All of these Ollama entries run locally without
+agent model. To use a Llama instruct model through an existing Ollama installation,
+run `/install ollama llama3.2:3b` (about 2 GB, 4 GB+ RAM). Higher-memory systems
+can use `devstral-small-2:24b` (32 GB+ RAM) for stronger agentic and coding work.
+All of these Ollama entries run locally without
 an account or API key. Hosted copies of open-weight models still require the hosting
 provider's API key.
 

@@ -5513,6 +5513,8 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
     match event {
         AppEvent::StreamFrame(Ok(frame)) => match frame.kind.as_str() {
             "submitted" => {
+                app.notices
+                    .retain(|notice| notice.title != "Request failed");
                 if let Some(prompt) = frame.prompt {
                     let install_preview = prompt.trim_start().starts_with("/install ")
                         && !install_command_is_confirmed(&prompt);
@@ -7239,6 +7241,32 @@ mod tui_tests {
 
         assert!(app.notices.is_empty());
         assert_eq!(app.status, "Ready");
+    }
+
+    #[test]
+    fn submitting_a_new_request_clears_the_previous_request_error() {
+        let mut app = test_app();
+        push_notice(
+            &mut app,
+            "Request failed",
+            "The previously selected local model is unavailable.",
+            true,
+        );
+
+        handle_app_event(
+            &mut app,
+            AppEvent::StreamFrame(Ok(BridgeStreamFrame {
+                kind: String::from("submitted"),
+                prompt: Some(String::from("/model ollama qwen2.5:0.5b")),
+                answer: None,
+                error: None,
+                event: None,
+                snapshot: None,
+                command_result: None,
+            })),
+        );
+
+        assert!(app.notices.is_empty());
     }
 
     #[test]

@@ -37,6 +37,7 @@ from agent.main import (
     _persist_agent_name,
     _queue_status,
     _record_local_command_exchange,
+    _refresh_active_local_model_state,
     _redact_local_command,
     _render_tui_transcript,
     _run_tui_bridge,
@@ -888,6 +889,40 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual(snapshot["session"]["configuration_state"], "model_required")
         self.assertEqual(snapshot["session"]["configuration"], "No model selected.")
 
+    def test_restored_missing_local_model_becomes_setup_state(self) -> None:
+        ctx = SimpleNamespace(
+            llm=SimpleNamespace(
+                provider="ollama",
+                model="qwen2.5-coder:0.5b",
+                endpoint="http://localhost:11434/v1",
+                configuration_error=None,
+                configuration_state="ready",
+            )
+        )
+
+        with patch(
+            "agent.main._discover_provider_models",
+            return_value=(["qwen2.5:0.5b"], None),
+        ):
+            _refresh_active_local_model_state(ctx)
+
+        self.assertEqual(ctx.llm.configuration_state, "model_not_installed")
+        self.assertIn("qwen2.5-coder:0.5b", ctx.llm.configuration_error)
+        self.assertIn("qwen2.5:0.5b", ctx.llm.configuration_error)
+        self.assertIn("/install ollama qwen2.5-coder:3b", ctx.llm.configuration_error)
+
+    def test_unavailable_model_is_rejected_before_prompt_turn_is_saved(self) -> None:
+        ctx = SimpleNamespace(
+            model_required=False,
+            llm=SimpleNamespace(configuration_error="Select an installed local model."),
+        )
+
+        with patch("agent.main._run_prompt_turn") as run_turn:
+            with self.assertRaisesRegex(RuntimeError, "Select an installed"):
+                handle_prompt(ctx, "hello")
+
+        run_turn.assert_not_called()
+
     def test_voice_snapshot_falls_back_when_voice_module_fails(self) -> None:
         with patch("agent.voice.voice_status", side_effect=RuntimeError("boom")):
             snapshot = _voice_snapshot()
@@ -1376,9 +1411,9 @@ class TuiRenderingTests(unittest.TestCase):
     def test_model_palette_completes_to_provider_model_pair(self) -> None:
         entries = _slash_palette_entries("/model llama")
 
-        self.assertEqual(entries[0].value, "ollama/llama3.3")
+        self.assertEqual(entries[0].value, "ollama/llama3.2:3b")
         self.assertIn("open source · local runtime/install · no login", entries[0].description)
-        self.assertEqual(_complete_slash_command("/model llama"), "/model ollama llama3.3")
+        self.assertEqual(_complete_slash_command("/model llama"), "/model ollama llama3.2:3b")
 
     def test_model_palette_offers_latest_minimax_coding_model(self) -> None:
         entries = _slash_palette_entries("/model minimax")
@@ -2075,9 +2110,12 @@ class LocalCommandTests(unittest.TestCase):
     def test_offline_uncataloged_llamacpp_model_points_to_manual_setup(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
-        with patch(
-            "agent.main._discover_provider_models",
-            return_value=([], "connection refused"),
+        with (
+            patch(
+                "agent.main._discover_provider_models",
+                return_value=([], "connection refused"),
+            ),
+            patch("agent.main.shutil.which", return_value="/usr/bin/llama-cli"),
         ):
             result = _handle_local_command(
                 ctx,
@@ -2291,6 +2329,28 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("llama.cpp is required", result)
         self.assertIn("ggml-org/llama.cpp/releases", result)
         self.assertNotIn("login", result.casefold())
+
+    def test_missing_llamacpp_runtime_distinguishes_installed_ollama(self) -> None:
+        ctx = SimpleNamespace(
+            llm=SimpleNamespace(
+                provider="ollama",
+                model="qwen2.5:0.5b",
+                endpoint="http://localhost:11434/v1",
+            )
+        )
+
+        def installed_runtime(executable: str) -> str | None:
+            return "/usr/local/bin/ollama" if executable == "ollama" else None
+
+        with (
+            patch("agent.main._discover_provider_models", return_value=([], "offline")),
+            patch("agent.main.shutil.which", side_effect=installed_runtime),
+        ):
+            result = _handle_local_command(ctx, "/model llamacpp gemma-3-1b-it")
+
+        self.assertIn("llama.cpp runtime is not installed", result)
+        self.assertIn("Installed local runtimes: Ollama", result)
+        self.assertIn("runtimes are separate", result)
 
     def test_install_ollama_model_without_runtime_shows_ubuntu_command(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))

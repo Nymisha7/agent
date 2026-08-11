@@ -92,6 +92,7 @@ DEFAULT_CONTEXT_WINDOWS = {
     "claude-3-5-sonnet-latest": 200_000,
     "claude-3-5-haiku-latest": 200_000,
     "llama3.1": 128_000,
+    "llama3.2": 128_000,
     "llama3.3": 128_000,
     "qwen2.5-coder:3b": 32_000,
     "qwen2.5-coder": 32_000,
@@ -564,6 +565,7 @@ PROVIDER_MODEL_HINTS = {
         "qwen3.5:4b",
         "granite4:3b",
         "qwen3:4b",
+        "llama3.2:3b",
         "qwen2.5-coder",
         "devstral-small-2:24b",
         "qwen3-coder",
@@ -606,6 +608,7 @@ LOCAL_INSTALL_CATALOG = (
     {"provider": "ollama", "model": "qwen3.5:4b", "install_id": "qwen3.5:4b", "parameters": "4B", "size": "~3.4 GB", "memory": "6 GB+ RAM", "context": "256K", "quantization": "Q4_K_M"},
     {"provider": "ollama", "model": "granite4:3b", "install_id": "granite4:3b", "parameters": "3.4B", "size": "~2.1 GB", "memory": "4 GB+ RAM", "context": "128K", "quantization": "Q4_K_M"},
     {"provider": "ollama", "model": "qwen3:4b", "install_id": "qwen3:4b", "parameters": "4B", "size": "~2.5 GB", "memory": "6 GB+ RAM", "context": "256K", "quantization": "Ollama default"},
+    {"provider": "ollama", "model": "llama3.2:3b", "install_id": "llama3.2:3b", "parameters": "3B", "size": "~2.0 GB", "memory": "4 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "devstral-small-2:24b", "install_id": "devstral-small-2:24b", "parameters": "24B", "size": "~15 GB", "memory": "32 GB+ RAM", "context": "384K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "qwen3", "install_id": "qwen3:8b", "parameters": "8B", "size": "~5.2 GB", "memory": "8 GB+ RAM", "context": "40K", "quantization": "Ollama default"},
     {"provider": "lmstudio", "model": "gpt-oss-20b", "install_id": "openai/gpt-oss-20b", "parameters": "20B (3.6B active)", "size": "varies by quantization", "memory": "16 GB+ RAM", "context": "128K", "quantization": "choose in LM Studio"},
@@ -1330,7 +1333,7 @@ def build_context(
     ):
         store.update_llm_config(session_info.id, provider=llm.provider, model=llm.model)
 
-    return AppContext(
+    ctx = AppContext(
         workspace_root=workspace_root,
         search_roots=parse_search_roots(workspace_root),
         rust=RustTools(rust_bin=rust_bin),
@@ -1356,6 +1359,55 @@ def build_context(
         config_path=config_path,
         model_required=model_required,
     )
+    _refresh_active_local_model_state(ctx)
+    return ctx
+
+
+def _refresh_active_local_model_state(ctx: Any) -> None:
+    """Validate restored local model state before a prompt reaches the runtime."""
+    llm = getattr(ctx, "llm", None)
+    provider = str(getattr(llm, "provider", "") or "")
+    model = str(getattr(llm, "model", "") or "")
+    if provider not in LOCAL_PROVIDERS or not model:
+        return
+
+    discovered, discovery_error = _discover_provider_models(ctx, provider)
+    if discovery_error:
+        runtime_error = None
+        if _provider_endpoint_is_local(ctx, provider):
+            runtime_error = _missing_local_runtime_text(provider, model)
+        llm.configuration_error = str(
+            runtime_error
+            or _local_model_setup_error(provider, model, discovery_error)
+        )
+        llm.configuration_state = (
+            "runtime_not_installed" if runtime_error else "runtime_unavailable"
+        )
+        return
+
+    if _local_model_is_available(model, discovered):
+        llm.configuration_error = None
+        llm.configuration_state = "ready"
+        return
+
+    installed = ", ".join(discovered) or "none"
+    lines = [
+        f"Saved {_model_source_label(provider)} model `{model}` is not installed.",
+        f"Installed models: {installed}.",
+    ]
+    if discovered:
+        lines.append(f"Select one with: /model {provider} <installed-model>")
+    replacement = next(
+        (entry for entry in LOCAL_INSTALL_CATALOG if entry["provider"] == provider),
+        None,
+    )
+    if replacement is not None:
+        lines.append(
+            "Install a catalog model with: "
+            f"/install {provider} {replacement['model']}"
+        )
+    llm.configuration_error = "\n".join(lines)
+    llm.configuration_state = "model_not_installed"
 
 
 def _session_route_key(store: SessionStore, session_id: str) -> str | None:
@@ -1431,6 +1483,9 @@ def handle_prompt(
 ) -> str:
     if getattr(ctx, "model_required", False):
         raise RuntimeError("Choose a model with /model before sending a message.")
+    configuration_error = getattr(getattr(ctx, "llm", None), "configuration_error", None)
+    if configuration_error:
+        raise RuntimeError(str(configuration_error))
     gateway = getattr(ctx, "gateway", None)
     lease = (
         gateway.session_lease(ctx.session_id)
@@ -2162,6 +2217,10 @@ def _resolve_local_model_name(
     )
 
     if discovery_error:
+        if _provider_endpoint_is_local(ctx, provider):
+            runtime_error = _missing_local_runtime_text(provider, requested_model)
+            if runtime_error is not None:
+                return None, runtime_error
         return None, _local_model_setup_error(provider, requested_model, discovery_error)
 
     # Exact installed model name.
@@ -2786,7 +2845,21 @@ def _missing_local_runtime_text(provider: str, model: str) -> str | None:
     if requirement is None or shutil.which(requirement.executable) is not None:
         return None
     source = _model_source_label(provider)
-    lines = [f"{source} is required before this model can be downloaded."]
+    installed_runtimes = [
+        _model_source_label(name)
+        for name, candidate in LOCAL_RUNTIME_REQUIREMENTS.items()
+        if name != provider and shutil.which(candidate.executable) is not None
+    ]
+    lines = [
+        f"Status: {source} runtime is not installed.",
+        f"{source} is required before this model can be downloaded or served.",
+    ]
+    if installed_runtimes:
+        lines.extend([
+            f"Installed local runtimes: {', '.join(installed_runtimes)}.",
+            "Model families and local runtimes are separate; an installed runtime does not install another runtime.",
+            "Use /model to select a model from an installed runtime instead.",
+        ])
     if requirement.install_command:
         lines.append(f"Install it once: {requirement.install_command}")
     lines.append(f"Instructions: {requirement.download_url}")
@@ -2797,6 +2870,12 @@ def _missing_local_runtime_text(provider: str, model: str) -> str | None:
         setup_required=True,
         transient=True,
     )
+
+
+def _provider_endpoint_is_local(ctx: Any, provider: str) -> bool:
+    base_url = _normalize_base_url(_provider_base_url(ctx, provider))
+    hostname = (urllib.parse.urlparse(base_url).hostname or "").casefold()
+    return hostname in {"localhost", "127.0.0.1", "::1"}
 
 
 def _clean_install_progress(value: str) -> str:
