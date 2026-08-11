@@ -7889,10 +7889,10 @@ mod tui_tests {
                     execute: false,
                 },
                 BridgeCompletionEntry {
-                    value: String::from("ollama/qwen2.5-coder:0.5b"),
-                    label: String::from("qwen2.5-coder:0.5b"),
+                    value: String::from("ollama/qwen2.5-coder:3b"),
+                    label: String::from("qwen2.5-coder:3b"),
                     description: String::from("Ollama · Ready · local"),
-                    complete_to: String::from("/model ollama qwen2.5-coder:0.5b"),
+                    complete_to: String::from("/model ollama qwen2.5-coder:3b"),
                     execute: true,
                 },
                 BridgeCompletionEntry {

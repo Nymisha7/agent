@@ -120,7 +120,7 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "response.completed")
 
     def test_local_provider_streams_safe_text_before_tool_capable_response_finishes(self) -> None:
-        client = LLMClient(provider="ollama", model="qwen2.5-coder:0.5b")
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:3b")
         events = []
 
         class StreamingChunks:
@@ -193,7 +193,7 @@ class LLMProviderTests(unittest.TestCase):
         )
 
     def test_local_provider_holds_fragmented_plain_text_tool_call(self) -> None:
-        client = LLMClient(provider="ollama", model="qwen2.5-coder:0.5b")
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:3b")
         chunks = iter([
             SimpleNamespace(
                 choices=[SimpleNamespace(delta=SimpleNamespace(
@@ -239,7 +239,7 @@ class LLMProviderTests(unittest.TestCase):
         ))
 
     def test_ollama_warm_preloads_model_with_native_api(self) -> None:
-        client = LLMClient(provider="ollama", model="qwen2.5-coder:0.5b")
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:3b")
         response = MagicMock()
         response.__enter__.return_value.read.return_value = b'{"done":true}'
 
@@ -254,7 +254,7 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(
             json.loads(request.data.decode("utf-8")),
             {
-                "model": "qwen2.5-coder:0.5b",
+                "model": "qwen2.5-coder:3b",
                 "stream": False,
                 "keep_alive": "20m",
             },

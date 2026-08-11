@@ -603,7 +603,7 @@ class TuiRenderingTests(unittest.TestCase):
 
         _record_local_command_exchange(
             ctx,
-            "/install ollama qwen2.5-coder:0.5b",
+            "/install ollama qwen2.5-coder:3b",
             "Ollama is required before this model can be downloaded.",
         )
 
@@ -735,7 +735,7 @@ class TuiRenderingTests(unittest.TestCase):
         ollama_section = labels.index("── Ollama ──")
         self.assertEqual(
             labels[ollama_section + 1 : ollama_section + 4],
-            ["qwen2.5-coder:0.5b", "qwen2.5-coder", "qwen3-coder"],
+            ["qwen2.5-coder:3b", "qwen3.5:4b", "granite4:3b"],
         )
 
     def test_model_completions_are_grouped_by_provider_ranked_models_first(self) -> None:
@@ -761,9 +761,13 @@ class TuiRenderingTests(unittest.TestCase):
 
         values = [entry["value"] for entry in payload["entries"] if entry["execute"]]
         self.assertLess(values.index("openai/gpt-5.5"), values.index("anthropic/claude-sonnet-4.5"))
-        self.assertLess(values.index("anthropic/claude-sonnet-4.5"), values.index("ollama/qwen2.5-coder:0.5b"))
-        self.assertLess(values.index("ollama/qwen2.5-coder:0.5b"), values.index("ollama/qwen2.5-coder"))
-        self.assertLess(values.index("ollama/qwen2.5-coder"), values.index("ollama/qwen3-coder"))
+        self.assertLess(values.index("anthropic/claude-sonnet-4.5"), values.index("ollama/qwen2.5-coder:3b"))
+        self.assertLess(values.index("ollama/qwen2.5-coder:3b"), values.index("ollama/qwen3.5:4b"))
+        self.assertLess(values.index("ollama/qwen3.5:4b"), values.index("ollama/granite4:3b"))
+        self.assertLess(values.index("ollama/granite4:3b"), values.index("ollama/qwen3:4b"))
+        self.assertLess(values.index("ollama/qwen3:4b"), values.index("ollama/qwen2.5-coder"))
+        self.assertLess(values.index("ollama/qwen2.5-coder"), values.index("ollama/devstral-small-2:24b"))
+        self.assertLess(values.index("ollama/devstral-small-2:24b"), values.index("ollama/qwen3-coder"))
         self.assertLess(values.index("ollama/qwen3-coder"), values.index("ollama/qwen3"))
         self.assertLess(values.index("ollama/qwen3"), values.index("ollama/custom-local:latest"))
         self.assertLess(values.index("ollama/qwen3:latest"), values.index("ollama/custom-local:latest"))
@@ -771,6 +775,9 @@ class TuiRenderingTests(unittest.TestCase):
             values.index("llamacpp/gemma-3-1b-it"),
             values.index("llamacpp/qwen2.5-coder-7b-instruct"),
         )
+        self.assertNotIn("vllm/meta-llama/Llama-3.3-70B-Instruct", values)
+        self.assertNotIn("vllm/mistralai/Codestral-22B-v0.1", values)
+        self.assertNotIn("llamacpp/codellama-13b-instruct", values)
 
     def test_model_completions_select_current_model_first(self) -> None:
         ctx = SimpleNamespace(
@@ -1390,18 +1397,25 @@ class TuiRenderingTests(unittest.TestCase):
 
     def test_install_palette_offers_explicit_ollama_download_action(self) -> None:
         entries = _slash_palette_entries("/install ollama")
+        by_value = {entry.value: entry for entry in entries}
 
-        self.assertEqual(entries[0].value, "ollama/qwen2.5-coder:0.5b")
-        self.assertEqual(entries[0].complete_to, "/install ollama qwen2.5-coder:0.5b")
+        self.assertEqual(entries[0].value, "ollama/qwen2.5-coder:3b")
+        self.assertEqual(entries[0].complete_to, "/install ollama qwen2.5-coder:3b")
         self.assertTrue(entries[0].execute)
         self.assertIn("Open-source/open-weight", entries[0].description)
         self.assertIn("Provider: Ollama", entries[0].description)
-        self.assertIn("0.5B params", entries[0].description)
-        self.assertIn("~398 MB", entries[0].description)
-        self.assertIn("2 GB+ RAM", entries[0].description)
+        self.assertIn("3B params", entries[0].description)
+        self.assertIn("~1.9 GB", entries[0].description)
+        self.assertIn("4 GB+ RAM", entries[0].description)
         self.assertIn("preview first", entries[0].description)
         self.assertIn("installs locally", entries[0].description)
         self.assertIn("no login", entries[0].description)
+        self.assertIn("4B params", by_value["ollama/qwen3.5:4b"].description)
+        self.assertIn("~3.4 GB", by_value["ollama/qwen3.5:4b"].description)
+        self.assertIn("3.4B params", by_value["ollama/granite4:3b"].description)
+        self.assertIn("~2.1 GB", by_value["ollama/granite4:3b"].description)
+        self.assertIn("~2.5 GB", by_value["ollama/qwen3:4b"].description)
+        self.assertIn("32 GB+ RAM", by_value["ollama/devstral-small-2:24b"].description)
 
     def test_install_palette_contains_every_supported_local_provider(self) -> None:
         entries = _slash_palette_entries("/install ")
@@ -1413,6 +1427,24 @@ class TuiRenderingTests(unittest.TestCase):
         )
         self.assertTrue(all("installs locally" in entry.description for entry in entries))
         self.assertTrue(all("no login" in entry.description for entry in entries))
+
+    def test_install_palette_uses_existing_non_ollama_catalog(self) -> None:
+        entries = {
+            entry.value: entry
+            for entry in _slash_palette_entries("/install ")
+        }
+        expected = {
+            "lmstudio/gpt-oss-20b": "varies by quantization",
+            "llamacpp/gemma-3-1b-it": "~1 GB",
+            "vllm/qwen2.5-1.5b-instruct": "~3 GB",
+            "localai/llama-3.2-1b-instruct": "~1 GB",
+        }
+
+        for value, size in expected.items():
+            with self.subTest(value=value):
+                self.assertIn(value, entries)
+                self.assertIn(size, entries[value].description)
+                self.assertIn("no login", entries[value].description)
 
     def test_reasoning_palette_exposes_effort_without_raw_thinking(self) -> None:
         entries = _slash_palette_entries("/reasoning ")
@@ -1952,7 +1984,7 @@ class LocalCommandTests(unittest.TestCase):
         progress = []
         candidate = SimpleNamespace(
             provider="ollama",
-            model="qwen2.5-coder:0.5b",
+            model="qwen2.5-coder:3b",
             configuration_error=None,
             warm=warm,
         )
@@ -1961,13 +1993,13 @@ class LocalCommandTests(unittest.TestCase):
         with (
             patch(
                 "agent.main._resolve_local_model_name",
-                return_value=("qwen2.5-coder:0.5b", None),
+                return_value=("qwen2.5-coder:3b", None),
             ),
             patch("agent.main.LLMClient", return_value=candidate),
         ):
             result = _handle_local_command(
                 ctx,
-                "/model ollama qwen2.5-coder:0.5b",
+                "/model ollama qwen2.5-coder:3b",
                 install_progress=progress.append,
             )
 
@@ -1975,11 +2007,11 @@ class LocalCommandTests(unittest.TestCase):
         self.assertEqual(
             progress,
             [
-                "Ollama · loading qwen2.5-coder:0.5b into memory",
-                "Ollama · qwen2.5-coder:0.5b is ready",
+                "Ollama · loading qwen2.5-coder:3b into memory",
+                "Ollama · qwen2.5-coder:3b is ready",
             ],
         )
-        self.assertEqual(result, "Ollama · qwen2.5-coder:0.5b")
+        self.assertEqual(result, "Ollama · qwen2.5-coder:3b")
 
     def test_missing_ollama_model_offers_install_action_without_login(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
@@ -2040,7 +2072,7 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("Could not start Ollama locally", result)
         self.assertNotIn("another terminal", result)
 
-    def test_offline_cataloged_llamacpp_model_points_to_install_preview(self) -> None:
+    def test_offline_uncataloged_llamacpp_model_points_to_manual_setup(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
         with patch(
@@ -2053,11 +2085,8 @@ class LocalCommandTests(unittest.TestCase):
             )
 
         self.assertIn("Status: runtime unavailable", result)
-        self.assertIn(
-            "Preview/install locally: /install llamacpp qwen2.5-coder-7b-instruct",
-            result,
-        )
-        self.assertNotIn("Automatic installation is not available", result)
+        self.assertIn("Automatic installation is not available", result)
+        self.assertIn("Then run: /model llamacpp qwen2.5-coder-7b-instruct", result)
 
     def test_qwen_coder_install_preview_has_concrete_ollama_size(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
@@ -2070,30 +2099,81 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("Download ~4.7 GB", result)
         self.assertNotIn("/install", result)
 
-    def test_qwen_coder_half_billion_install_preview_is_public_and_small(self) -> None:
+    def test_qwen_coder_three_billion_install_preview_is_public_and_compact(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
         with patch("agent.main.shutil.which", return_value="/usr/bin/ollama"):
-            result = _handle_local_command(ctx, "/install ollama qwen2.5-coder:0.5b")
+            result = _handle_local_command(ctx, "/install ollama qwen2.5-coder:3b")
 
-        self.assertIn("qwen2.5-coder:0.5b via Ollama", result)
-        self.assertIn("Parameters 0.5B", result)
-        self.assertIn("Download ~398 MB", result)
+        self.assertIn("qwen2.5-coder:3b via Ollama", result)
+        self.assertIn("Parameters 3B", result)
+        self.assertIn("Download ~1.9 GB", result)
         self.assertIn("Context 32K", result)
+        self.assertIn("Quantization Q4_K_M", result)
+        self.assertIn("Authentication: none", result)
         self.assertTrue(ctx.last_local_command_result["transient"])
-        self.assertEqual(_context_window_for_model("qwen2.5-coder:0.5b"), 32_000)
-        self.assertEqual(_context_window_for_model("qwen2.5-coder:7b"), 128_000)
+        self.assertEqual(_context_window_for_model("qwen2.5-coder:3b"), 32_000)
+        self.assertEqual(_context_window_for_model("qwen2.5-coder:7b"), 32_000)
+        self.assertEqual(_context_window_for_model("qwen3.5:4b"), 256_000)
+        self.assertEqual(_context_window_for_model("granite4:3b"), 128_000)
+        self.assertEqual(_context_window_for_model("qwen3:4b"), 256_000)
+        self.assertEqual(_context_window_for_model("qwen3:8b"), 40_000)
+        self.assertEqual(_context_window_for_model("gpt-oss:20b"), 128_000)
+        self.assertEqual(_context_window_for_model("devstral-small-2:24b"), 384_000)
         self.assertEqual(_context_window_for_model("MiniMax-M3"), 1_000_000)
+
+    def test_additional_ollama_models_have_verified_install_previews(self) -> None:
+        cases = (
+            ("qwen3.5:4b", "Parameters 4B", "Download ~3.4 GB", "Context 256K"),
+            ("granite4:3b", "Parameters 3.4B", "Download ~2.1 GB", "Context 128K"),
+            ("qwen3:4b", "Parameters 4B", "Download ~2.5 GB", "Context 256K"),
+            ("devstral-small-2:24b", "Parameters 24B", "Download ~15 GB", "Context 384K"),
+        )
+
+        for model, parameters, download, context in cases:
+            with self.subTest(model=model):
+                ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+                with patch("agent.main.shutil.which", return_value="/usr/bin/ollama"):
+                    result = _handle_local_command(ctx, f"/install ollama {model}")
+
+                self.assertIn(parameters, result)
+                self.assertIn(download, result)
+                self.assertIn(context, result)
+                self.assertNotIn("API key", result)
+
+    def test_existing_non_ollama_models_have_verified_install_previews(self) -> None:
+        cases = (
+            ("lmstudio", "gpt-oss-20b", "Download varies by quantization", "Context 128K"),
+            ("llamacpp", "gemma-3-1b-it", "Download ~1 GB", "Context 32K"),
+            ("vllm", "qwen2.5-1.5b-instruct", "Download ~3 GB", "Context 32K"),
+            ("localai", "llama-3.2-1b-instruct", "Download ~1 GB", "Context 128K"),
+        )
+
+        with patch("agent.main.shutil.which", return_value="/usr/bin/runtime"):
+            for provider, model, download, context in cases:
+                with self.subTest(provider=provider, model=model):
+                    ctx = SimpleNamespace(
+                        llm=SimpleNamespace(provider="openai", model="gpt-4o")
+                    )
+                    result = _handle_local_command(
+                        ctx,
+                        f"/install {provider} {model}",
+                    )
+
+                    self.assertIn(download, result)
+                    self.assertIn(context, result)
+                    self.assertIn("Authentication: none", result)
+                    self.assertNotIn("API key", result)
 
     def test_ollama_install_preview_warns_when_runtime_is_missing(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
         with patch("agent.main.shutil.which", return_value=None):
-            result = _handle_local_command(ctx, "/install ollama qwen2.5-coder:0.5b")
+            result = _handle_local_command(ctx, "/install ollama qwen2.5-coder:3b")
 
         self.assertIn("Ollama is required", result)
         self.assertIn("curl -fsSL https://ollama.com/install.sh | sh", result)
-        self.assertNotIn("Download ~398 MB", result)
+        self.assertNotIn("Download ~1.9 GB", result)
         self.assertNotIn("pending_action", ctx.last_local_command_result)
 
     def test_unknown_localai_install_does_not_preview_unknown_size_download(self) -> None:
@@ -2132,15 +2212,15 @@ class LocalCommandTests(unittest.TestCase):
             patch("agent.main._ensure_ollama_running", return_value=None),
             patch("agent.main.subprocess.Popen", return_value=process) as popen,
             patch("agent.main._verify_local_model_ready", return_value=None),
-            patch("agent.main._switch_model", return_value="Ollama · qwen2.5-coder:0.5b"),
+            patch("agent.main._switch_model", return_value="Ollama · qwen2.5-coder:3b"),
         ):
             result = _handle_local_command(
                 ctx,
-                "/install ollama qwen2.5-coder:0.5b --yes",
+                "/install ollama qwen2.5-coder:3b --yes",
             )
 
-        self.assertEqual(popen.call_args.args[0], ["ollama", "pull", "qwen2.5-coder:0.5b"])
-        self.assertIn("Installed `qwen2.5-coder:0.5b`", result)
+        self.assertEqual(popen.call_args.args[0], ["ollama", "pull", "qwen2.5-coder:3b"])
+        self.assertIn("Installed `qwen2.5-coder:3b`", result)
 
     def test_install_ollama_model_pulls_then_selects_it(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
@@ -2218,12 +2298,12 @@ class LocalCommandTests(unittest.TestCase):
         with patch("agent.main.shutil.which", return_value=None):
             result = _handle_local_command(
                 ctx,
-                "/install ollama qwen2.5-coder:0.5b --yes",
+                "/install ollama qwen2.5-coder:3b --yes",
             )
 
         self.assertIn("Ollama is required", result)
         self.assertIn("curl -fsSL https://ollama.com/install.sh | sh", result)
-        self.assertIn("/install ollama qwen2.5-coder:0.5b", result)
+        self.assertIn("/install ollama qwen2.5-coder:3b", result)
         self.assertNotIn("API key", result)
 
     def test_non_ollama_install_uses_selected_provider_backend(self) -> None:
@@ -2331,19 +2411,27 @@ class LocalCommandTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Could not connect.*timed out"):
                 _get_json("http://localhost:11434/api/tags")
 
-    def test_vllm_install_activation_starts_selected_model_locally(self) -> None:
+    def test_vllm_install_activation_uses_catalog_tool_parser(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+        model = "qwen2.5-1.5b-instruct"
+        install_id = "Qwen/Qwen2.5-1.5B-Instruct"
 
         with (
-            patch("agent.main._provider_base_url", return_value="http://localhost:8000/v1"),
-            patch("agent.main._discover_provider_models", return_value=(["qwen-local"], None)),
+            patch(
+                "agent.main._provider_base_url",
+                return_value="http://localhost:8000/v1",
+            ),
+            patch(
+                "agent.main._discover_provider_models",
+                return_value=([model], None),
+            ),
             patch("agent.main.subprocess.Popen") as popen,
         ):
             result = _activate_local_runtime(
                 ctx,
                 provider="vllm",
-                model="qwen-local",
-                install_id="Qwen/Qwen2.5-1.5B-Instruct",
+                model=model,
+                install_id=install_id,
                 progress=None,
             )
 
@@ -2352,11 +2440,14 @@ class LocalCommandTests(unittest.TestCase):
             [
                 "vllm",
                 "serve",
-                "Qwen/Qwen2.5-1.5B-Instruct",
+                install_id,
                 "--served-model-name",
-                "qwen-local",
+                model,
                 "--port",
                 "8000",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "hermes",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

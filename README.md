@@ -204,7 +204,7 @@ an account page or ask for an Agent login:
 
 | Provider | Default endpoint | Example |
 | --- | --- | --- |
-| Ollama | `http://localhost:11434/v1` | `/model ollama qwen2.5-coder:0.5b` |
+| Ollama | `http://localhost:11434/v1` | `/model ollama qwen2.5-coder:3b` |
 | LM Studio | `http://localhost:1234/v1` | `/model lmstudio <loaded-model>` |
 | llama.cpp | `http://localhost:8080/v1` | `/model llamacpp <loaded-model>` |
 | vLLM | `http://localhost:8000/v1` | `/model vllm <served-model>` |
@@ -215,10 +215,30 @@ model-list endpoint. Override endpoints with `AGENT_OLLAMA_BASE_URL`,
 `AGENT_LMSTUDIO_BASE_URL`, `AGENT_LLAMACPP_BASE_URL`, `AGENT_VLLM_BASE_URL`, or
 `AGENT_LOCALAI_BASE_URL`.
 
-For the smallest built-in option, use `/install ollama qwen2.5-coder:0.5b`. It downloads
-about 398 MB, runs without an account or API key, and is selected automatically after
-Agent verifies it through the local Ollama API. Hosted copies of open-weight models
-still require the hosting provider's API key; choose the Ollama entry for no-login use.
+For the recommended compact coding option, use `/install ollama qwen2.5-coder:3b`.
+It downloads about 1.9 GB, runs without an account or API key, and is selected
+automatically after Agent verifies it through the local Ollama API. The built-in
+catalog also offers `qwen3.5:4b` for broader coding and reasoning, `granite4:3b`
+for instruction following and tool calling, and `qwen3:4b` as a compact general
+agent model. Higher-memory systems can use `devstral-small-2:24b` (32 GB+ RAM)
+for stronger agentic and coding work. All of these Ollama entries run locally without
+an account or API key. Hosted copies of open-weight models still require the hosting
+provider's API key.
+
+Ollama is not required. The same native agent runtime can use public models through
+the other local providers:
+
+| Runtime | Curated public model | Approximate download |
+| --- | --- | --- |
+| LM Studio | `/install lmstudio gpt-oss-20b` | depends on quantization |
+| llama.cpp | `/install llamacpp gemma-3-1b-it` | 1 GB |
+| vLLM | `/install vllm qwen2.5-1.5b-instruct` | 3 GB |
+| LocalAI | `/install localai llama-3.2-1b-instruct` | 1 GB |
+
+LM Studio support was already present; it was not added as a second provider. vLLM
+also offers public Qwen and DeepSeek Coder entries for GPU systems. These local
+providers do not require an Agent account or API key. The selected runtime may still
+need to be installed before its model can be downloaded.
 
 Selecting a local model checks the runtime and installed-model list first. If an
 Ollama model is missing, preview it from the TUI with `/install ollama <model>`.
@@ -232,8 +252,10 @@ the provider API before reporting it ready.
 The `/install` picker contains open-source/open-weight models for Ollama, LM Studio,
 llama.cpp, vLLM, and LocalAI. Each download is stored and served locally by the
 selected provider runtime, not by Agent. Only curated public artifacts can be
-downloaded through `/install`; load custom models directly in the runtime and select
-them with `/model <provider> <model>`.
+downloaded through `/install`; this list is a verified set of useful defaults rather
+than a limit on supported models. Like OpenCode's local-provider flow, Agent discovers
+every model exposed by the configured runtime. Load any other model directly in the
+runtime and select it with `/model <provider> <model>`.
 
 For models that expose configurable reasoning effort, use `/reasoning` and choose
 `minimal`, `low`, `medium`, or `high`. Agent shows concise activity and tool results;

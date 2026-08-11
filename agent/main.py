@@ -93,11 +93,14 @@ DEFAULT_CONTEXT_WINDOWS = {
     "claude-3-5-haiku-latest": 200_000,
     "llama3.1": 128_000,
     "llama3.3": 128_000,
-    "qwen2.5-coder:0.5b": 32_000,
-    "qwen2.5-coder": 128_000,
+    "qwen2.5-coder:3b": 32_000,
+    "qwen2.5-coder": 32_000,
     "qwen2.5-coder-7b-instruct": 128_000,
-    "qwen3": 128_000,
-    "qwen3.5": 128_000,
+    "qwen/qwen3-4b": 32_000,
+    "qwen3-4b": 32_000,
+    "qwen3:4b": 256_000,
+    "qwen3": 40_000,
+    "qwen3.5": 256_000,
     "qwen3.6": 256_000,
     "qwen3-coder": 256_000,
     "qwen3-coder-next": 256_000,
@@ -117,9 +120,11 @@ DEFAULT_CONTEXT_WINDOWS = {
     "MiniMax-M3": 1_000_000,
     "gemma3": 128_000,
     "gemma4": 128_000,
+    "granite4": 128_000,
     "codestral": 128_000,
     "codellama": 128_000,
     "gpt-oss": 128_000,
+    "devstral-small-2": 384_000,
     "starcoder2": 128_000,
 }
 
@@ -555,8 +560,12 @@ PROVIDER_MODEL_HINTS = {
         "claude-opus-4.1",
     ),
     "ollama": (
-        "qwen2.5-coder:0.5b",
+        "qwen2.5-coder:3b",
+        "qwen3.5:4b",
+        "granite4:3b",
+        "qwen3:4b",
         "qwen2.5-coder",
+        "devstral-small-2:24b",
         "qwen3-coder",
         "qwen3",
         "deepseek-r1",
@@ -569,16 +578,11 @@ PROVIDER_MODEL_HINTS = {
     "llamacpp": (
         "gemma-3-1b-it",
         "local-model",
-        "qwen2.5-coder-7b-instruct",
-        "deepseek-coder-v2-lite-instruct",
-        "codellama-13b-instruct",
     ),
     "vllm": (
         "qwen2.5-1.5b-instruct",
         "Qwen/Qwen2.5-Coder-32B-Instruct",
         "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-        "meta-llama/Llama-3.3-70B-Instruct",
-        "mistralai/Codestral-22B-v0.1",
     ),
     "localai": (
         "llama-3.2-1b-instruct",
@@ -598,21 +602,23 @@ PROVIDER_MODEL_HINTS = {
     "minimax": ("MiniMax-M3",),
 }
 LOCAL_INSTALL_CATALOG = (
-    {"provider": "ollama", "model": "qwen2.5-coder:0.5b", "install_id": "qwen2.5-coder:0.5b", "parameters": "0.5B", "size": "~398 MB", "memory": "2 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
+    {"provider": "ollama", "model": "qwen2.5-coder:3b", "install_id": "qwen2.5-coder:3b", "parameters": "3B", "size": "~1.9 GB", "memory": "4 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
+    {"provider": "ollama", "model": "qwen3.5:4b", "install_id": "qwen3.5:4b", "parameters": "4B", "size": "~3.4 GB", "memory": "6 GB+ RAM", "context": "256K", "quantization": "Q4_K_M"},
+    {"provider": "ollama", "model": "granite4:3b", "install_id": "granite4:3b", "parameters": "3.4B", "size": "~2.1 GB", "memory": "4 GB+ RAM", "context": "128K", "quantization": "Q4_K_M"},
+    {"provider": "ollama", "model": "qwen3:4b", "install_id": "qwen3:4b", "parameters": "4B", "size": "~2.5 GB", "memory": "6 GB+ RAM", "context": "256K", "quantization": "Ollama default"},
+    {"provider": "ollama", "model": "devstral-small-2:24b", "install_id": "devstral-small-2:24b", "parameters": "24B", "size": "~15 GB", "memory": "32 GB+ RAM", "context": "384K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "qwen3", "install_id": "qwen3:8b", "parameters": "8B", "size": "~5.2 GB", "memory": "8 GB+ RAM", "context": "40K", "quantization": "Ollama default"},
     {"provider": "lmstudio", "model": "gpt-oss-20b", "install_id": "openai/gpt-oss-20b", "parameters": "20B (3.6B active)", "size": "varies by quantization", "memory": "16 GB+ RAM", "context": "128K", "quantization": "choose in LM Studio"},
     {"provider": "llamacpp", "model": "gemma-3-1b-it", "install_id": "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M", "parameters": "1B", "size": "~1 GB", "memory": "4 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
-    {"provider": "vllm", "model": "qwen2.5-1.5b-instruct", "install_id": "Qwen/Qwen2.5-1.5B-Instruct", "parameters": "1.5B", "size": "~3 GB", "memory": "6 GB+ VRAM", "context": "32K", "quantization": "full precision weights"},
+    {"provider": "vllm", "model": "qwen2.5-1.5b-instruct", "install_id": "Qwen/Qwen2.5-1.5B-Instruct", "parameters": "1.5B", "size": "~3 GB", "memory": "6 GB+ VRAM", "context": "32K", "quantization": "full precision weights", "tool_parser": "hermes"},
     {"provider": "localai", "model": "llama-3.2-1b-instruct", "install_id": "llama-3.2-1b-instruct:q4_k_m", "parameters": "1B", "size": "~1 GB", "memory": "4 GB+ RAM", "context": "128K", "quantization": "Q4_K_M"},
     {"provider": "ollama", "model": "qwen2.5-coder", "install_id": "qwen2.5-coder:7b", "parameters": "7B", "size": "~4.7 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "qwen3-coder", "install_id": "qwen3-coder:30b", "parameters": "30B (3.3B active)", "size": "~19 GB", "memory": "24 GB+ RAM", "context": "256K", "quantization": "Ollama default"},
     {"provider": "lmstudio", "model": "llama-3.1-8b", "install_id": "llama-3.1-8b@q4_k_m", "parameters": "8B", "size": "~5 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Q4_K_M"},
-    {"provider": "llamacpp", "model": "qwen2.5-coder-7b-instruct", "install_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M", "parameters": "7B", "size": "~4.7 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Q4_K_M"},
-    {"provider": "vllm", "model": "Qwen/Qwen2.5-Coder-32B-Instruct", "install_id": "Qwen/Qwen2.5-Coder-32B-Instruct", "parameters": "32.5B", "size": "~65 GB", "memory": "70 GB+ VRAM", "context": "128K", "quantization": "full precision weights"},
+    {"provider": "vllm", "model": "Qwen/Qwen2.5-Coder-32B-Instruct", "install_id": "Qwen/Qwen2.5-Coder-32B-Instruct", "parameters": "32.5B", "size": "~65 GB", "memory": "70 GB+ VRAM", "context": "128K", "quantization": "full precision weights", "tool_parser": "hermes"},
     {"provider": "vllm", "model": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", "install_id": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", "parameters": "16B (2.4B active)", "size": "~32 GB", "memory": "36 GB+ VRAM", "context": "128K", "quantization": "full precision weights"},
     {"provider": "ollama", "model": "deepseek-r1", "install_id": "deepseek-r1:8b", "parameters": "8B", "size": "~5.2 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "llama3.3", "install_id": "llama3.3:70b", "parameters": "70B", "size": "~43 GB", "memory": "48 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
-    {"provider": "ollama", "model": "llama3.1", "install_id": "llama3.1:8b", "parameters": "8B", "size": "~4.9 GB", "memory": "8 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "gemma3", "install_id": "gemma3:4b", "parameters": "4B", "size": "~3.3 GB", "memory": "6 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "stable-code", "install_id": "stable-code:3b", "parameters": "3B", "size": "~1.6 GB", "memory": "4 GB+ RAM", "context": "16K", "quantization": "Ollama default"},
 )
@@ -2583,6 +2589,7 @@ def _local_install_preview(
         f"{model} via {_model_source_label(provider)}",
         f"Download {metadata['size']} · Memory {metadata['memory']}",
         f"Parameters {metadata['parameters']} · Context {metadata['context']}",
+        f"Quantization {metadata['quantization']} · Authentication: none",
         "Nothing has been downloaded.",
     ]
     return _command_text(
@@ -2943,6 +2950,12 @@ def _activate_local_runtime(
                 "--port",
                 str(port),
             ]
+            install_entry = _local_install_entry(provider, model)
+            tool_parser = install_entry.get("tool_parser") if install_entry else None
+            if tool_parser:
+                command.extend(
+                    ["--enable-auto-tool-choice", "--tool-call-parser", tool_parser]
+                )
         elif provider == "localai":
             command = ["local-ai", "run", install_id, "--address", f":{port}"]
         else:
@@ -5863,7 +5876,11 @@ def _context_window_for_model(model: str) -> int | None:
     normalized = model.strip().casefold()
     if normalized in DEFAULT_CONTEXT_WINDOWS:
         return DEFAULT_CONTEXT_WINDOWS[normalized]
-    for prefix, limit in DEFAULT_CONTEXT_WINDOWS.items():
+    for prefix, limit in sorted(
+        DEFAULT_CONTEXT_WINDOWS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
         if normalized.startswith(prefix.casefold()):
             return limit
     return None
