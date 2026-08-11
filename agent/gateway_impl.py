@@ -3148,7 +3148,10 @@ def _commands_list_provider(payload: Mapping[str, Any]) -> str | None:
 def _agent_command_inventory() -> list[dict[str, Any]]:
     from . import main as main_module
 
-    descriptions = {name: description for name, description in main_module.LOCAL_COMMANDS}
+    descriptions = {
+        command.name: command.description
+        for command in main_module.LOCAL_COMMANDS
+    }
     return [
         {
             "name": "model",

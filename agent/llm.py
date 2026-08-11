@@ -36,6 +36,7 @@ SUPPORTED_PROVIDERS = {
     "vertexai",
     "deepseek",
     "glm",
+    "minimax",
 }
 UNAVAILABLE_PROVIDER_TRANSPORTS = frozenset({
     "copilot",
@@ -225,6 +226,15 @@ class LLMClient:
             else:
                 self.configuration_error = _provider_configuration_error("GLM", "GLM_API_KEY")
                 self.configuration_state = "api_key_required"
+        elif self.provider == "minimax":
+            self.endpoint = os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+            self.mode = "hosted"
+            api_key = os.environ.get("MINIMAX_API_KEY")
+            if api_key:
+                self.client = OpenAI(api_key=api_key, base_url=self.endpoint, timeout=timeout)
+            else:
+                self.configuration_error = _provider_configuration_error("MiniMax", "MINIMAX_API_KEY")
+                self.configuration_state = "api_key_required"
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
 
@@ -314,7 +324,7 @@ class LLMClient:
                 stream=stream,
                 event_handler=event_handler,
             )
-        if self.provider in {"openai-compatible", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "groq", "openrouter", "deepseek", "glm"}:
+        if self.provider in {"openai-compatible", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "groq", "openrouter", "deepseek", "glm", "minimax"}:
             return self._respond_openai_chat(
                 instructions=instructions,
                 messages=messages,
@@ -713,6 +723,7 @@ def _normalize_provider(value: str) -> str:
         "zhipu": "glm",
         "zhipuai": "glm",
         "bigmodel": "glm",
+        "mini-max": "minimax",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in SUPPORTED_PROVIDERS:
@@ -744,6 +755,7 @@ def _default_model_for_provider(provider: str) -> str:
         "glm": os.environ.get("GLM_MODEL")
         or os.environ.get("ZAI_MODEL")
         or "glm-4",
+        "minimax": os.environ.get("MINIMAX_MODEL") or "MiniMax-M3",
     }
     return defaults[provider]
 
@@ -775,7 +787,7 @@ def _model_supports_reasoning(provider: str | None, model: str | None) -> bool:
     reasoning_prefixes = ("gpt-5", "o1", "o3", "o4")
     if provider_name == "openai":
         return model_name.startswith(reasoning_prefixes)
-    if provider_name in {"deepseek", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "openai-compatible", "groq", "openrouter", "glm"}:
+    if provider_name in {"deepseek", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "openai-compatible", "groq", "openrouter", "glm", "minimax"}:
         return "reason" in model_name or model_name.startswith(("o1", "o3", "o4"))
     if provider_name == "anthropic":
         return "thinking" in model_name or "claude-3.7" in model_name or "claude-sonnet-4" in model_name
@@ -803,7 +815,7 @@ def _chat_reasoning_effort(
     model: str | None,
     effort: str | None,
 ) -> str | None:
-    if provider not in {"openai-compatible", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "groq", "openrouter", "deepseek", "glm"}:
+    if provider not in {"openai-compatible", "ollama", "lmstudio", "llamacpp", "vllm", "localai", "groq", "openrouter", "deepseek", "glm", "minimax"}:
         return None
     if not _model_supports_reasoning(provider, model):
         return None

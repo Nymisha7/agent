@@ -93,7 +93,7 @@ DEFAULT_CONTEXT_WINDOWS = {
     "claude-3-5-haiku-latest": 200_000,
     "llama3.1": 128_000,
     "llama3.3": 128_000,
-    "qwen2.5:0.5b": 32_000,
+    "qwen2.5-coder:0.5b": 32_000,
     "qwen2.5-coder": 128_000,
     "qwen2.5-coder-7b-instruct": 128_000,
     "qwen3": 128_000,
@@ -114,6 +114,7 @@ DEFAULT_CONTEXT_WINDOWS = {
     "glm-4.7-flash": 128_000,
     "glm-5": 128_000,
     "glm-5.1": 128_000,
+    "MiniMax-M3": 1_000_000,
     "gemma3": 128_000,
     "gemma4": 128_000,
     "codestral": 128_000,
@@ -123,17 +124,27 @@ DEFAULT_CONTEXT_WINDOWS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class LocalCommandSpec:
+    name: str
+    description: str
+    palette: bool = True
+
+
 LOCAL_COMMANDS = (
-    ("/model", "Choose a model or local runtime"),
-    ("/name", "Show or change this agent's name"),
-    ("/install", "Install an open-source/open-weight model locally"),
-    ("/reasoning", "Set reasoning effort for supported models"),
-    ("/skills", "Show layered workspace and personal skills"),
-    ("/gateway", "Show control-plane routing and session status"),
-    ("/status", "Show model, context, and session usage"),
-    ("/setup", "Connect a model"),
-    ("/help", "Show commands and keyboard shortcuts"),
-    ("/exit", "Close Agent"),
+    LocalCommandSpec("/model", "Choose a model or local runtime"),
+    LocalCommandSpec("/status", "Show model, context, and session usage"),
+    LocalCommandSpec("/apikey", "Enter a provider API key securely"),
+    LocalCommandSpec("/login", "Open a provider account or API-key page"),
+    LocalCommandSpec("/name", "Show or change this agent's name"),
+    LocalCommandSpec("/install", "Install an open-source/open-weight model locally"),
+    LocalCommandSpec("/reasoning", "Set reasoning effort for supported models"),
+    LocalCommandSpec("/tools", "Show how tool selection and approvals work", palette=False),
+    LocalCommandSpec("/skills", "Show layered workspace and personal skills"),
+    LocalCommandSpec("/gateway", "Show control-plane routing and session status"),
+    LocalCommandSpec("/setup", "Connect a model"),
+    LocalCommandSpec("/help", "Show commands and keyboard shortcuts"),
+    LocalCommandSpec("/exit", "Close Agent"),
 )
 
 PROVIDER_API_KEY_ENVS = {
@@ -145,6 +156,7 @@ PROVIDER_API_KEY_ENVS = {
     "azure": "AZURE_OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "glm": "GLM_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
     "openai-compatible": "AGENT_OPENAI_COMPAT_API_KEY",
     "voice": "AGENT_VOICE_API_KEY",
 }
@@ -411,6 +423,7 @@ PROVIDER_LOGIN_URLS = {
     "vertexai": "https://console.cloud.google.com/vertex-ai",
     "deepseek": "https://platform.deepseek.com/api_keys",
     "glm": "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
+    "minimax": "https://platform.minimax.io/console/access",
     "openai-compatible": "https://platform.openai.com/api-keys",
     "voice": "https://platform.openai.com/api-keys",
 }
@@ -426,6 +439,7 @@ PROVIDER_DISPLAY_NAMES = {
     "vertexai": "Google Cloud Vertex AI",
     "deepseek": "DeepSeek",
     "glm": "GLM",
+    "minimax": "MiniMax",
     "openai-compatible": "Custom OpenAI-compatible",
     "voice": "Voice",
     "ollama": "Ollama",
@@ -449,12 +463,13 @@ PROVIDER_SORT_ORDER = {
     "vertexai": 8,
     "deepseek": 9,
     "glm": 10,
-    "ollama": 11,
-    "lmstudio": 12,
-    "llamacpp": 13,
-    "vllm": 14,
-    "localai": 15,
-    "openai-compatible": 16,
+    "minimax": 11,
+    "ollama": 12,
+    "lmstudio": 13,
+    "llamacpp": 14,
+    "vllm": 15,
+    "localai": 16,
+    "openai-compatible": 17,
 }
 MODEL_PICKER_SORT_ORDER = {
     "openai": 0,
@@ -468,12 +483,13 @@ MODEL_PICKER_SORT_ORDER = {
     "openrouter": 8,
     "deepseek": 9,
     "glm": 10,
-    "gemini": 11,
-    "copilot": 12,
-    "bedrock": 13,
-    "azure": 14,
-    "vertexai": 15,
-    "openai-compatible": 16,
+    "minimax": 11,
+    "gemini": 12,
+    "copilot": 13,
+    "bedrock": 14,
+    "azure": 15,
+    "vertexai": 16,
+    "openai-compatible": 17,
 }
 PROVIDER_MODEL_HINTS = {
     "copilot": (
@@ -539,7 +555,7 @@ PROVIDER_MODEL_HINTS = {
         "claude-opus-4.1",
     ),
     "ollama": (
-        "qwen2.5:0.5b",
+        "qwen2.5-coder:0.5b",
         "qwen2.5-coder",
         "qwen3-coder",
         "qwen3",
@@ -579,9 +595,10 @@ PROVIDER_MODEL_HINTS = {
         "deepseek-reasoner",
     ),
     "glm": ("glm-5.1", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4", "glm-4.5"),
+    "minimax": ("MiniMax-M3",),
 }
 LOCAL_INSTALL_CATALOG = (
-    {"provider": "ollama", "model": "qwen2.5:0.5b", "install_id": "qwen2.5:0.5b", "parameters": "0.5B", "size": "~398 MB", "memory": "2 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
+    {"provider": "ollama", "model": "qwen2.5-coder:0.5b", "install_id": "qwen2.5-coder:0.5b", "parameters": "0.5B", "size": "~398 MB", "memory": "2 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
     {"provider": "ollama", "model": "qwen3", "install_id": "qwen3:8b", "parameters": "8B", "size": "~5.2 GB", "memory": "8 GB+ RAM", "context": "40K", "quantization": "Ollama default"},
     {"provider": "lmstudio", "model": "gpt-oss-20b", "install_id": "openai/gpt-oss-20b", "parameters": "20B (3.6B active)", "size": "varies by quantization", "memory": "16 GB+ RAM", "context": "128K", "quantization": "choose in LM Studio"},
     {"provider": "llamacpp", "model": "gemma-3-1b-it", "install_id": "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M", "parameters": "1B", "size": "~1 GB", "memory": "4 GB+ RAM", "context": "32K", "quantization": "Q4_K_M"},
@@ -2002,10 +2019,11 @@ def _dispatch_local_command(
 
 def _slash_help_text() -> str:
     lines = ["Commands"]
-    lines.extend(f"{name} - {description}" for name, description in LOCAL_COMMANDS)
+    lines.extend(f"{command.name} - {command.description}" for command in LOCAL_COMMANDS)
     lines.append("")
+    lines.append("Aliases: /models, /key, /auth, /connect, /quit, /q")
     lines.append("Type / to open the command menu. Use Up/Down to select and Tab to complete.")
-    lines.append("Enter sends · Esc exits · PgUp/PgDn scrolls")
+    lines.append("Enter sends · drag selects · Ctrl+C copies a selection or exits · PgUp/PgDn scrolls")
     return "\n".join(lines)
 
 
@@ -2336,17 +2354,11 @@ def _switch_model(
 
         missing_api_key = configuration_state == "api_key_required"
         browser_setup = configuration_state == "credentials_required"
-        opened_url = (
-            _open_provider_setup_url(resolved_provider)
+        setup_url = (
+            PROVIDER_LOGIN_URLS.get(resolved_provider)
             if missing_api_key or browser_setup
             else None
         )
-        open_line = None
-        if opened_url:
-            opened, url = opened_url
-            verb = "Opened" if opened else "Open"
-            page_kind = "API-key" if missing_api_key else "setup"
-            open_line = f"{verb} {_model_source_label(resolved_provider)} {page_kind} page: {url}"
 
         lines = [f"{_model_source_label(resolved_provider)} · {model}"]
         if missing_api_key:
@@ -2364,8 +2376,8 @@ def _switch_model(
                 "Status: unavailable",
                 f"Details: {configuration_error}",
             ])
-        if open_line:
-            lines.append(open_line)
+        if setup_url:
+            lines.append(f"Provider setup link (open when needed): {setup_url}")
         if missing_api_key:
             lines.append(f"Complete the secure {_model_source_label(resolved_provider)} key prompt to continue.")
         code = (
@@ -3434,19 +3446,6 @@ def _apply_saved_reasoning_effort(ctx: Any, llm: Any) -> None:
         llm.reasoning_effort = effort
 
 
-def _open_provider_setup_url(provider: str) -> tuple[bool, str] | None:
-    if provider in LOCAL_PROVIDERS:
-        return None
-    url = PROVIDER_LOGIN_URLS.get(provider)
-    if not url:
-        return None
-    try:
-        opened = bool(webbrowser.open(url, new=2, autoraise=True))
-    except Exception:
-        opened = False
-    return opened, url
-
-
 def _provider_for_model(model: str, active_provider: str) -> str:
     providers = _providers_for_model(model)
     if active_provider in providers:
@@ -4409,7 +4408,17 @@ def run_tui(ctx: AppContext) -> int:
     finally:
         _stop_language_servers(ctx)
 
-    return int(completed.returncode)
+    exit_code = int(completed.returncode)
+    print(_tui_exit_text(ctx.session_id))
+    return exit_code
+
+
+def _tui_exit_text(session_id: str) -> str:
+    return (
+        "\nSession saved.\n"
+        f"Resume this session: nym --tui resume {shlex.quote(session_id)}\n"
+        "Show available commands inside Nym: /help"
+    )
 
 
 @contextmanager
@@ -5335,26 +5344,28 @@ def _slash_palette_entries(prompt: str, *, ctx: Any | None = None) -> list[Palet
     query = parts[0].casefold() if parts else "/"
     matches = [
         PaletteEntry(
-            value=name,
-            label=name,
-            description=description,
-            complete_to=_slash_command_complete_to(name),
-            execute=_slash_command_executes(name),
+            value=command.name,
+            label=command.name,
+            description=command.description,
+            complete_to=_slash_command_complete_to(command.name),
+            execute=_slash_command_executes(command.name),
         )
-        for name, description in LOCAL_COMMANDS
-        if name.casefold().startswith(query)
+        for command in LOCAL_COMMANDS
+        if command.palette
+        and command.name.casefold().startswith(query)
     ]
     matches.sort(key=lambda entry: entry.value.casefold() != query)
     if not matches:
         matches = [
             PaletteEntry(
-                value=name,
-                label=name,
-                description=description,
-                complete_to=_slash_command_complete_to(name),
-                execute=_slash_command_executes(name),
+                value=command.name,
+                label=command.name,
+                description=command.description,
+                complete_to=_slash_command_complete_to(command.name),
+                execute=_slash_command_executes(command.name),
             )
-            for name, description in LOCAL_COMMANDS
+            for command in LOCAL_COMMANDS
+            if command.palette
         ]
     return matches
 
@@ -5649,7 +5660,11 @@ def _complete_slash_command(prompt: str) -> str | None:
     if not prompt.startswith("/") or " " in prompt:
         return None
     query = prompt.casefold()
-    matches = [name for name, _description in LOCAL_COMMANDS if name.casefold().startswith(query)]
+    matches = [
+        command.name
+        for command in LOCAL_COMMANDS
+        if command.palette and command.name.casefold().startswith(query)
+    ]
     if len(matches) == 1:
         return f"{matches[0]} "
     return None

@@ -204,7 +204,7 @@ an account page or ask for an Agent login:
 
 | Provider | Default endpoint | Example |
 | --- | --- | --- |
-| Ollama | `http://localhost:11434/v1` | `/model ollama qwen2.5:0.5b` |
+| Ollama | `http://localhost:11434/v1` | `/model ollama qwen2.5-coder:0.5b` |
 | LM Studio | `http://localhost:1234/v1` | `/model lmstudio <loaded-model>` |
 | llama.cpp | `http://localhost:8080/v1` | `/model llamacpp <loaded-model>` |
 | vLLM | `http://localhost:8000/v1` | `/model vllm <served-model>` |
@@ -215,7 +215,7 @@ model-list endpoint. Override endpoints with `AGENT_OLLAMA_BASE_URL`,
 `AGENT_LMSTUDIO_BASE_URL`, `AGENT_LLAMACPP_BASE_URL`, `AGENT_VLLM_BASE_URL`, or
 `AGENT_LOCALAI_BASE_URL`.
 
-For the smallest built-in option, use `/install ollama qwen2.5:0.5b`. It downloads
+For the smallest built-in option, use `/install ollama qwen2.5-coder:0.5b`. It downloads
 about 398 MB, runs without an account or API key, and is selected automatically after
 Agent verifies it through the local Ollama API. Hosted copies of open-weight models
 still require the hosting provider's API key; choose the Ollama entry for no-login use.

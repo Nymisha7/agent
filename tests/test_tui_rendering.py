@@ -147,6 +147,7 @@ class TuiExitTests(unittest.TestCase):
         )
 
         with (
+            redirect_stdout(io.StringIO()) as output,
             patch("agent.main.sys.stdin.isatty", return_value=True),
             patch("agent.main.sys.stdout.isatty", return_value=True),
             patch("agent.main.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run_subprocess,
@@ -163,6 +164,8 @@ class TuiExitTests(unittest.TestCase):
         ]
         paste_keys = [command[index + 1] for index in paste_key_indexes]
         self.assertIn("ctrl+v", paste_keys)
+        self.assertIn("nym --tui resume abc123", output.getvalue())
+        self.assertIn("/help", output.getvalue())
         self.assertIn("ctrl+shift+v", paste_keys)
         self.assertIn("shift+insert", paste_keys)
         self.assertIn("alt+v", paste_keys)
@@ -600,7 +603,7 @@ class TuiRenderingTests(unittest.TestCase):
 
         _record_local_command_exchange(
             ctx,
-            "/install ollama qwen2.5:0.5b",
+            "/install ollama qwen2.5-coder:0.5b",
             "Ollama is required before this model can be downloaded.",
         )
 
@@ -732,7 +735,7 @@ class TuiRenderingTests(unittest.TestCase):
         ollama_section = labels.index("── Ollama ──")
         self.assertEqual(
             labels[ollama_section + 1 : ollama_section + 4],
-            ["qwen2.5:0.5b", "qwen2.5-coder", "qwen3-coder"],
+            ["qwen2.5-coder:0.5b", "qwen2.5-coder", "qwen3-coder"],
         )
 
     def test_model_completions_are_grouped_by_provider_ranked_models_first(self) -> None:
@@ -758,8 +761,8 @@ class TuiRenderingTests(unittest.TestCase):
 
         values = [entry["value"] for entry in payload["entries"] if entry["execute"]]
         self.assertLess(values.index("openai/gpt-5.5"), values.index("anthropic/claude-sonnet-4.5"))
-        self.assertLess(values.index("anthropic/claude-sonnet-4.5"), values.index("ollama/qwen2.5:0.5b"))
-        self.assertLess(values.index("ollama/qwen2.5:0.5b"), values.index("ollama/qwen2.5-coder"))
+        self.assertLess(values.index("anthropic/claude-sonnet-4.5"), values.index("ollama/qwen2.5-coder:0.5b"))
+        self.assertLess(values.index("ollama/qwen2.5-coder:0.5b"), values.index("ollama/qwen2.5-coder"))
         self.assertLess(values.index("ollama/qwen2.5-coder"), values.index("ollama/qwen3-coder"))
         self.assertLess(values.index("ollama/qwen3-coder"), values.index("ollama/qwen3"))
         self.assertLess(values.index("ollama/qwen3"), values.index("ollama/custom-local:latest"))
@@ -1370,6 +1373,13 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertIn("open source · local runtime/install · no login", entries[0].description)
         self.assertEqual(_complete_slash_command("/model llama"), "/model ollama llama3.3")
 
+    def test_model_palette_offers_latest_minimax_coding_model(self) -> None:
+        entries = _slash_palette_entries("/model minimax")
+
+        self.assertEqual(entries[0].value, "minimax/MiniMax-M3")
+        self.assertEqual(entries[0].complete_to, "/model minimax MiniMax-M3")
+        self.assertIn("API key", entries[0].description)
+
     def test_model_palette_lines_keep_full_long_model_names(self) -> None:
         model = "Qwen/Qwen2.5-Coder-32B-Instruct"
         lines = _slash_command_lines(f"/model {model}", 24)
@@ -1381,8 +1391,8 @@ class TuiRenderingTests(unittest.TestCase):
     def test_install_palette_offers_explicit_ollama_download_action(self) -> None:
         entries = _slash_palette_entries("/install ollama")
 
-        self.assertEqual(entries[0].value, "ollama/qwen2.5:0.5b")
-        self.assertEqual(entries[0].complete_to, "/install ollama qwen2.5:0.5b")
+        self.assertEqual(entries[0].value, "ollama/qwen2.5-coder:0.5b")
+        self.assertEqual(entries[0].complete_to, "/install ollama qwen2.5-coder:0.5b")
         self.assertTrue(entries[0].execute)
         self.assertIn("Open-source/open-weight", entries[0].description)
         self.assertIn("Provider: Ollama", entries[0].description)
@@ -1671,16 +1681,40 @@ class LocalCommandTests(unittest.TestCase):
                     configuration_error="DeepSeek is not configured. Set DEEPSEEK_API_KEY.",
                 ),
             ),
-            patch("agent.main.webbrowser.open", return_value=True) as open_browser,
+            patch("agent.main.webbrowser.open") as open_browser,
         ):
             result = _handle_local_command(ctx, "/model deepseek deepseek-v4-flash")
 
         self.assertIn("Status: API key required", result)
         self.assertIn("/apikey deepseek", result)
-        self.assertIn("Opened DeepSeek API-key page", result)
+        self.assertIn("Provider setup link (open when needed)", result)
+        self.assertIn("https://platform.deepseek.com/api_keys", result)
         self.assertEqual(ctx.last_local_command_result["code"], "api_key_required")
         self.assertEqual(ctx.last_local_command_result["secret_provider"], "deepseek")
-        open_browser.assert_called_once_with("https://platform.deepseek.com/api_keys", new=2, autoraise=True)
+        open_browser.assert_not_called()
+
+    def test_minimax_hosted_model_prompts_for_its_api_key(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="ollama", model="llama3.1"))
+
+        with (
+            patch(
+                "agent.main.LLMClient",
+                return_value=SimpleNamespace(
+                    provider="minimax",
+                    model="MiniMax-M3",
+                    configuration_error="MiniMax is not configured. Set MINIMAX_API_KEY.",
+                    configuration_state="api_key_required",
+                ),
+            ),
+            patch("agent.main.webbrowser.open") as open_browser,
+        ):
+            result = _handle_local_command(ctx, "/model minimax MiniMax-M3")
+
+        self.assertIn("Status: API key required", result)
+        self.assertIn("/apikey minimax", result)
+        self.assertIn("https://platform.minimax.io/console/access", result)
+        self.assertEqual(ctx.last_local_command_result["secret_provider"], "minimax")
+        open_browser.assert_not_called()
 
     def test_provider_command_surfaces_configuration_error(self) -> None:
         store = SimpleNamespace(update_llm_config=Mock())
@@ -1699,13 +1733,14 @@ class LocalCommandTests(unittest.TestCase):
                     configuration_error="OpenAI is not configured. Set OPENAI_API_KEY.",
                 ),
             ),
-            patch("agent.main.webbrowser.open", return_value=True) as open_browser,
+            patch("agent.main.webbrowser.open") as open_browser,
         ):
             result = _handle_local_command(ctx, "/model openai gpt-5.5")
 
         self.assertIn("Status: API key required", result)
         self.assertIn("/apikey openai", result)
-        self.assertIn("Opened OpenAI API-key page", result)
+        self.assertIn("Provider setup link (open when needed)", result)
+        self.assertIn("https://platform.openai.com/api-keys", result)
         self.assertEqual(ctx.last_local_command_result["code"], "api_key_required")
         self.assertEqual(ctx.last_local_command_result["secret_provider"], "openai")
         self.assertEqual(ctx.llm.provider, "openai")
@@ -1715,7 +1750,7 @@ class LocalCommandTests(unittest.TestCase):
             provider="openai",
             model="gpt-4o",
         )
-        open_browser.assert_called_once_with("https://platform.openai.com/api-keys", new=2, autoraise=True)
+        open_browser.assert_not_called()
 
     def test_anthropic_selection_stays_active_while_key_is_missing(self) -> None:
         store = SimpleNamespace(update_llm_config=Mock())
@@ -1732,7 +1767,7 @@ class LocalCommandTests(unittest.TestCase):
         )
         with (
             patch("agent.main.LLMClient", return_value=candidate),
-            patch("agent.main.webbrowser.open", return_value=True),
+            patch("agent.main.webbrowser.open") as open_browser,
         ):
             result = _handle_local_command(
                 ctx,
@@ -1744,6 +1779,7 @@ class LocalCommandTests(unittest.TestCase):
         self.assertEqual(ctx.pending_model, "claude-sonnet-4.5")
         self.assertIn("Anthropic · claude-sonnet-4.5", result)
         self.assertIn("/apikey anthropic", result)
+        open_browser.assert_not_called()
         store.update_llm_config.assert_called_once_with(
             "session-1",
             provider="anthropic",
@@ -1916,7 +1952,7 @@ class LocalCommandTests(unittest.TestCase):
         progress = []
         candidate = SimpleNamespace(
             provider="ollama",
-            model="qwen2.5:0.5b",
+            model="qwen2.5-coder:0.5b",
             configuration_error=None,
             warm=warm,
         )
@@ -1925,13 +1961,13 @@ class LocalCommandTests(unittest.TestCase):
         with (
             patch(
                 "agent.main._resolve_local_model_name",
-                return_value=("qwen2.5:0.5b", None),
+                return_value=("qwen2.5-coder:0.5b", None),
             ),
             patch("agent.main.LLMClient", return_value=candidate),
         ):
             result = _handle_local_command(
                 ctx,
-                "/model ollama qwen2.5:0.5b",
+                "/model ollama qwen2.5-coder:0.5b",
                 install_progress=progress.append,
             )
 
@@ -1939,11 +1975,11 @@ class LocalCommandTests(unittest.TestCase):
         self.assertEqual(
             progress,
             [
-                "Ollama · loading qwen2.5:0.5b into memory",
-                "Ollama · qwen2.5:0.5b is ready",
+                "Ollama · loading qwen2.5-coder:0.5b into memory",
+                "Ollama · qwen2.5-coder:0.5b is ready",
             ],
         )
-        self.assertEqual(result, "Ollama · qwen2.5:0.5b")
+        self.assertEqual(result, "Ollama · qwen2.5-coder:0.5b")
 
     def test_missing_ollama_model_offers_install_action_without_login(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
@@ -2034,25 +2070,26 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("Download ~4.7 GB", result)
         self.assertNotIn("/install", result)
 
-    def test_qwen_half_billion_install_preview_is_public_and_small(self) -> None:
+    def test_qwen_coder_half_billion_install_preview_is_public_and_small(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
         with patch("agent.main.shutil.which", return_value="/usr/bin/ollama"):
-            result = _handle_local_command(ctx, "/install ollama qwen2.5:0.5b")
+            result = _handle_local_command(ctx, "/install ollama qwen2.5-coder:0.5b")
 
-        self.assertIn("qwen2.5:0.5b via Ollama", result)
+        self.assertIn("qwen2.5-coder:0.5b via Ollama", result)
         self.assertIn("Parameters 0.5B", result)
         self.assertIn("Download ~398 MB", result)
         self.assertIn("Context 32K", result)
         self.assertTrue(ctx.last_local_command_result["transient"])
-        self.assertEqual(_context_window_for_model("qwen2.5:0.5b"), 32_000)
+        self.assertEqual(_context_window_for_model("qwen2.5-coder:0.5b"), 32_000)
         self.assertEqual(_context_window_for_model("qwen2.5-coder:7b"), 128_000)
+        self.assertEqual(_context_window_for_model("MiniMax-M3"), 1_000_000)
 
     def test_ollama_install_preview_warns_when_runtime_is_missing(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
         with patch("agent.main.shutil.which", return_value=None):
-            result = _handle_local_command(ctx, "/install ollama qwen2.5:0.5b")
+            result = _handle_local_command(ctx, "/install ollama qwen2.5-coder:0.5b")
 
         self.assertIn("Ollama is required", result)
         self.assertIn("curl -fsSL https://ollama.com/install.sh | sh", result)
@@ -2095,15 +2132,15 @@ class LocalCommandTests(unittest.TestCase):
             patch("agent.main._ensure_ollama_running", return_value=None),
             patch("agent.main.subprocess.Popen", return_value=process) as popen,
             patch("agent.main._verify_local_model_ready", return_value=None),
-            patch("agent.main._switch_model", return_value="Ollama · qwen2.5:0.5b"),
+            patch("agent.main._switch_model", return_value="Ollama · qwen2.5-coder:0.5b"),
         ):
             result = _handle_local_command(
                 ctx,
-                "/install ollama qwen2.5:0.5b --yes",
+                "/install ollama qwen2.5-coder:0.5b --yes",
             )
 
-        self.assertEqual(popen.call_args.args[0], ["ollama", "pull", "qwen2.5:0.5b"])
-        self.assertIn("Installed `qwen2.5:0.5b`", result)
+        self.assertEqual(popen.call_args.args[0], ["ollama", "pull", "qwen2.5-coder:0.5b"])
+        self.assertIn("Installed `qwen2.5-coder:0.5b`", result)
 
     def test_install_ollama_model_pulls_then_selects_it(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
@@ -2181,12 +2218,12 @@ class LocalCommandTests(unittest.TestCase):
         with patch("agent.main.shutil.which", return_value=None):
             result = _handle_local_command(
                 ctx,
-                "/install ollama qwen2.5:0.5b --yes",
+                "/install ollama qwen2.5-coder:0.5b --yes",
             )
 
         self.assertIn("Ollama is required", result)
         self.assertIn("curl -fsSL https://ollama.com/install.sh | sh", result)
-        self.assertIn("/install ollama qwen2.5:0.5b", result)
+        self.assertIn("/install ollama qwen2.5-coder:0.5b", result)
         self.assertNotIn("API key", result)
 
     def test_non_ollama_install_uses_selected_provider_backend(self) -> None:
@@ -2397,6 +2434,30 @@ class LocalCommandTests(unittest.TestCase):
         self.assertIn("Ollama", result)
         self.assertNotIn("OPENAI_API_KEY", result)
         self.assertNotIn("AGENT_LLAMACPP_BASE_URL", result)
+
+    def test_help_lists_every_canonical_user_command(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        result = _handle_local_command(ctx, "/help")
+
+        for command in (
+            "/model",
+            "/apikey",
+            "/login",
+            "/name",
+            "/install",
+            "/reasoning",
+            "/tools",
+            "/skills",
+            "/gateway",
+            "/status",
+            "/setup",
+            "/help",
+            "/exit",
+        ):
+            self.assertIn(f"{command} -", result)
+        self.assertIn("Aliases:", result)
+        self.assertIn("Ctrl+C copies a selection or exits", result)
 
     def test_setup_palette_uses_guided_provider_choices(self) -> None:
         entries = _slash_palette_entries("/setup ")

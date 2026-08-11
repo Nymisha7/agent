@@ -39,14 +39,33 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(_normalize_provider("deepseek-ai"), "deepseek")
         self.assertEqual(_normalize_provider("zai"), "glm")
         self.assertEqual(_normalize_provider("zhipuai"), "glm")
+        self.assertEqual(_normalize_provider("mini-max"), "minimax")
 
     def test_provider_defaults_cover_local_free_models(self) -> None:
         self.assertEqual(_default_model_for_provider("deepseek"), "deepseek-v4-flash")
         self.assertEqual(_default_model_for_provider("glm"), "glm-4")
+        self.assertEqual(_default_model_for_provider("minimax"), "MiniMax-M3")
         self.assertEqual(_default_model_for_provider("ollama"), "llama3.1")
         self.assertEqual(_default_model_for_provider("llamacpp"), "local-model")
         self.assertEqual(_default_model_for_provider("vllm"), "local-model")
         self.assertEqual(_default_model_for_provider("localai"), "local-model")
+
+    def test_minimax_uses_openai_compatible_hosted_transport(self) -> None:
+        with patch.dict("os.environ", {"MINIMAX_API_KEY": "minimax-secret"}, clear=True):
+            client = LLMClient(provider="minimax")
+
+        self.assertEqual(client.model, "MiniMax-M3")
+        self.assertEqual(client.endpoint, "https://api.minimax.io/v1")
+        self.assertEqual(client.mode, "hosted")
+        self.assertIsNone(client.configuration_error)
+        self.assertIsNotNone(client.client)
+
+    def test_minimax_requires_its_own_api_key(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            client = LLMClient(provider="minimax")
+
+        self.assertEqual(client.configuration_state, "api_key_required")
+        self.assertIn("MINIMAX_API_KEY", client.configuration_error or "")
 
     def test_open_source_local_providers_need_no_login_or_api_key(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -101,7 +120,7 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "response.completed")
 
     def test_local_provider_streams_safe_text_before_tool_capable_response_finishes(self) -> None:
-        client = LLMClient(provider="ollama", model="qwen2.5:0.5b")
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:0.5b")
         events = []
 
         class StreamingChunks:
@@ -174,7 +193,7 @@ class LLMProviderTests(unittest.TestCase):
         )
 
     def test_local_provider_holds_fragmented_plain_text_tool_call(self) -> None:
-        client = LLMClient(provider="ollama", model="qwen2.5:0.5b")
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:0.5b")
         chunks = iter([
             SimpleNamespace(
                 choices=[SimpleNamespace(delta=SimpleNamespace(
@@ -220,7 +239,7 @@ class LLMProviderTests(unittest.TestCase):
         ))
 
     def test_ollama_warm_preloads_model_with_native_api(self) -> None:
-        client = LLMClient(provider="ollama", model="qwen2.5:0.5b")
+        client = LLMClient(provider="ollama", model="qwen2.5-coder:0.5b")
         response = MagicMock()
         response.__enter__.return_value.read.return_value = b'{"done":true}'
 
@@ -235,7 +254,7 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(
             json.loads(request.data.decode("utf-8")),
             {
-                "model": "qwen2.5:0.5b",
+                "model": "qwen2.5-coder:0.5b",
                 "stream": False,
                 "keep_alive": "20m",
             },

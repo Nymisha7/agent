@@ -1029,6 +1029,13 @@ struct TranscriptSelection {
     end: SelectionPoint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlCAction {
+    CopySelection,
+    StopTask,
+    Exit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PasteKey {
     code: PasteKeyCode,
@@ -1622,7 +1629,7 @@ fn run_tui_loop(
                         if app.transcript_drag_start.is_some() =>
                     {
                         update_transcript_selection(&mut app, mouse.column, mouse.row);
-                        copy_transcript_selection_to_clipboard(&mut app);
+                        finish_transcript_selection(&mut app);
                     }
                     MouseEventKind::ScrollUp => scroll_active_view(&mut app, false),
                     MouseEventKind::ScrollDown => scroll_active_view(&mut app, true),
@@ -1803,10 +1810,12 @@ fn run_tui_loop(
                 break;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if app.submitting {
-                    request_active_stop(&mut app);
-                } else {
-                    break;
+                match ctrl_c_action(&app) {
+                    CtrlCAction::CopySelection => {
+                        copy_transcript_selection_to_clipboard(&mut app);
+                    }
+                    CtrlCAction::StopTask => request_active_stop(&mut app),
+                    CtrlCAction::Exit => break,
                 }
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2224,17 +2233,48 @@ fn update_transcript_selection(app: &mut TuiApp, column: u16, row: u16) {
     app.transcript_selection = Some(TranscriptSelection { start, end });
 }
 
+fn finish_transcript_selection(app: &mut TuiApp) {
+    app.transcript_drag_start = None;
+    let selected = app
+        .transcript_selection
+        .and_then(|selection| selected_transcript_text(app, selection));
+    if selected.is_some_and(|text| !text.trim().is_empty()) {
+        app.status = String::from("Text selected · Ctrl+C copy");
+    } else {
+        app.transcript_selection = None;
+        app.status = String::from("No transcript text selected");
+    }
+}
+
+fn ctrl_c_action(app: &TuiApp) -> CtrlCAction {
+    let has_selection = app
+        .transcript_selection
+        .and_then(|selection| selected_transcript_text(app, selection))
+        .is_some_and(|text| !text.trim().is_empty());
+    if has_selection {
+        CtrlCAction::CopySelection
+    } else if app.submitting {
+        CtrlCAction::StopTask
+    } else {
+        CtrlCAction::Exit
+    }
+}
+
 fn copy_transcript_selection_to_clipboard(app: &mut TuiApp) {
+    let Some(text) = take_transcript_selection(app) else {
+        app.status = String::from("No transcript text selected");
+        return;
+    };
+    copy_text_to_clipboard(app, &text, "Copied selected transcript text to clipboard");
+}
+
+fn take_transcript_selection(app: &mut TuiApp) -> Option<String> {
     let selected = app
         .transcript_selection
         .and_then(|selection| selected_transcript_text(app, selection));
     app.transcript_drag_start = None;
     app.transcript_selection = None;
-    let Some(text) = selected.filter(|text| !text.trim().is_empty()) else {
-        app.status = String::from("No transcript text selected");
-        return;
-    };
-    copy_text_to_clipboard(app, &text, "Copied selected transcript text to clipboard");
+    selected.filter(|text| !text.trim().is_empty())
 }
 
 fn selected_transcript_text(app: &TuiApp, selection: TranscriptSelection) -> Option<String> {
@@ -3236,9 +3276,9 @@ fn footer_help_text(
     } else if submitting {
         "Esc/Ctrl+C stop  Enter queue  End follow"
     } else if mouse_capture {
-        "Enter send  click +/Ctrl+O/F4 attach  mic/F5 speak  drag copy  Ctrl+V paste  Alt+C copy"
+        "Enter send  +/Ctrl+O/F4 attach  mic/F5 speak  drag select  Ctrl+C copy  /help commands"
     } else {
-        "Enter send  click +/Ctrl+O/F4 attach  mic/F5 speak  Ctrl+V paste  Alt+C copy  / commands"
+        "Enter send  +/Ctrl+O/F4 attach  mic/F5 speak  Ctrl+V paste  Alt+C copy  /help commands"
     }
 }
 
@@ -7489,6 +7529,60 @@ mod tui_tests {
     }
 
     #[test]
+    fn transcript_selection_remains_active_after_mouse_release() {
+        let mut app = test_app();
+        let start = SelectionPoint { row: 0, col: 1 };
+        app.transcript_cache = Some(TranscriptCache {
+            show_inline_activity: false,
+            area: Rect::new(0, 0, 20, 5),
+            auto_follow: true,
+            requested_scroll: 0,
+            paragraph: Paragraph::new("abcdef"),
+            attachment_hit_areas: Vec::new(),
+            selection_lines: vec![String::from("abcdef")],
+        });
+        app.transcript_drag_start = Some(start);
+        app.transcript_selection = Some(TranscriptSelection {
+            start,
+            end: SelectionPoint { row: 0, col: 3 },
+        });
+
+        finish_transcript_selection(&mut app);
+
+        assert!(app.transcript_drag_start.is_none());
+        assert!(app.transcript_selection.is_some());
+        assert_eq!(app.status, "Text selected · Ctrl+C copy");
+
+        assert_eq!(take_transcript_selection(&mut app).as_deref(), Some("bcd"));
+        assert!(app.transcript_selection.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_prioritizes_selection_then_active_task_then_exit() {
+        let mut app = test_app();
+        app.transcript_cache = Some(TranscriptCache {
+            show_inline_activity: false,
+            area: Rect::new(0, 0, 20, 5),
+            auto_follow: true,
+            requested_scroll: 0,
+            paragraph: Paragraph::new("abcdef"),
+            attachment_hit_areas: Vec::new(),
+            selection_lines: vec![String::from("abcdef")],
+        });
+        app.transcript_selection = Some(TranscriptSelection {
+            start: SelectionPoint { row: 0, col: 1 },
+            end: SelectionPoint { row: 0, col: 3 },
+        });
+        app.submitting = true;
+
+        assert_eq!(ctrl_c_action(&app), CtrlCAction::CopySelection);
+        app.transcript_selection = None;
+        assert_eq!(ctrl_c_action(&app), CtrlCAction::StopTask);
+        app.submitting = false;
+        assert_eq!(ctrl_c_action(&app), CtrlCAction::Exit);
+    }
+
+    #[test]
     fn late_voice_final_does_not_restore_a_submitted_transcript() {
         let mut app = test_app();
         app.input.clear();
@@ -7795,10 +7889,10 @@ mod tui_tests {
                     execute: false,
                 },
                 BridgeCompletionEntry {
-                    value: String::from("ollama/qwen2.5:0.5b"),
-                    label: String::from("qwen2.5:0.5b"),
+                    value: String::from("ollama/qwen2.5-coder:0.5b"),
+                    label: String::from("qwen2.5-coder:0.5b"),
                     description: String::from("Ollama · Ready · local"),
-                    complete_to: String::from("/model ollama qwen2.5:0.5b"),
+                    complete_to: String::from("/model ollama qwen2.5-coder:0.5b"),
                     execute: true,
                 },
                 BridgeCompletionEntry {
@@ -7842,9 +7936,11 @@ mod tui_tests {
         assert!(text.contains("+"));
         assert!(!text.contains("Add file"));
         assert!(!text.contains("F4"));
-        assert!(footer_help_text(false, false, false, true).contains("click +/Ctrl+O/F4"));
-        assert!(footer_help_text(false, false, false, true).contains("drag copy"));
-        assert!(!footer_help_text(false, false, false, false).contains("drag copy"));
+        assert!(footer_help_text(false, false, false, true).contains("+/Ctrl+O/F4 attach"));
+        assert!(footer_help_text(false, false, false, true).contains("drag select"));
+        assert!(footer_help_text(false, false, false, true).contains("Ctrl+C copy"));
+        assert!(footer_help_text(false, false, false, true).contains("/help"));
+        assert!(!footer_help_text(false, false, false, false).contains("drag select"));
     }
 
     #[test]
