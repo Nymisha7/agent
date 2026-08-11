@@ -625,6 +625,7 @@ LOCAL_INSTALL_CATALOG = (
     {"provider": "ollama", "model": "gemma3", "install_id": "gemma3:4b", "parameters": "4B", "size": "~3.3 GB", "memory": "6 GB+ RAM", "context": "128K", "quantization": "Ollama default"},
     {"provider": "ollama", "model": "stable-code", "install_id": "stable-code:3b", "parameters": "3B", "size": "~1.6 GB", "memory": "4 GB+ RAM", "context": "16K", "quantization": "Ollama default"},
 )
+MIN_UNCURATED_AGENT_MODEL_PARAMETERS_B = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1386,6 +1387,11 @@ def _refresh_active_local_model_state(ctx: Any) -> None:
         return
 
     if _local_model_is_available(model, discovered):
+        compatibility_error = _local_model_compatibility_error(provider, model)
+        if compatibility_error is not None:
+            llm.configuration_error = str(compatibility_error)
+            llm.configuration_state = "incompatible"
+            return
         llm.configuration_error = None
         llm.configuration_state = "ready"
         return
@@ -2225,6 +2231,12 @@ def _resolve_local_model_name(
 
     # Exact installed model name.
     if requested_model in discovered:
+        compatibility_error = _local_model_compatibility_error(
+            provider,
+            requested_model,
+        )
+        if compatibility_error is not None:
+            return None, compatibility_error
         return requested_model, None
 
     requested_lower = requested_model.casefold()
@@ -2240,6 +2252,9 @@ def _resolve_local_model_name(
     ]
 
     if len(matches) == 1:
+        compatibility_error = _local_model_compatibility_error(provider, matches[0])
+        if compatibility_error is not None:
+            return None, compatibility_error
         return matches[0], None
 
     if len(matches) > 1:
@@ -2280,6 +2295,52 @@ def _local_install_entry(provider: str, model: str) -> dict[str, str] | None:
         ),
         None,
     )
+
+
+def _local_model_compatibility_error(provider: str, model: str) -> str | None:
+    if _local_install_entry(provider, model) is not None:
+        return None
+    parameter_count = _model_parameter_billions(model)
+    if (
+        parameter_count is None
+        or parameter_count >= MIN_UNCURATED_AGENT_MODEL_PARAMETERS_B
+    ):
+        return None
+    replacement = next(
+        (entry for entry in LOCAL_INSTALL_CATALOG if entry["provider"] == provider),
+        None,
+    )
+    lines = [
+        f"{_model_source_label(provider)} · {model}",
+        "Status: model is too small for native agent tool use.",
+        f"Detected size: {parameter_count:g}B; minimum supported size: "
+        f"{MIN_UNCURATED_AGENT_MODEL_PARAMETERS_B:g}B.",
+        "The model remains installed in its local runtime, but Nym will not select it "
+        "for agent turns.",
+    ]
+    if replacement is not None:
+        lines.append(
+            f"Install a supported replacement: /install {provider} {replacement['model']}"
+        )
+    return _command_text(
+        "\n".join(lines),
+        code="incompatible",
+        setup_required=True,
+        error=True,
+    )
+
+
+def _model_parameter_billions(model: str) -> float | None:
+    matches = re.findall(
+        r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[Bb](?=$|[^A-Za-z0-9])",
+        model,
+    )
+    if not matches:
+        return None
+    try:
+        return min(float(value) for value in matches)
+    except ValueError:
+        return None
 
 
 def _local_model_setup_error(provider: str, model: str, detail: str) -> str:
@@ -3676,7 +3737,15 @@ def _model_options_for_display(ctx: Any) -> list[dict[str, Any]]:
             if discovery_error:
                 option["state"] = ModelState.SERVER_OFFLINE
             elif _local_model_is_available(model, discovered):
-                option["state"] = ModelState.READY
+                compatibility_error = _local_model_compatibility_error(provider, model)
+                option["state"] = (
+                    ModelState.INCOMPATIBLE
+                    if compatibility_error is not None
+                    else ModelState.READY
+                )
+                option["error"] = (
+                    str(compatibility_error) if compatibility_error is not None else None
+                )
             else:
                 option["state"] = ModelState.MODEL_NOT_INSTALLED
         else:
@@ -3688,8 +3757,9 @@ def _model_options_for_display(ctx: Any) -> list[dict[str, Any]]:
                 active_model,
             )
         option["active"] = provider == active_provider and model == active_model
-        option["selectable"] = True
-        option["error"] = None
+        option["selectable"] = option["state"] != ModelState.INCOMPATIBLE
+        if option["state"] != ModelState.INCOMPATIBLE:
+            option["error"] = None
 
     return sorted(options, key=_model_display_sort_key)
 
@@ -5584,7 +5654,7 @@ def _model_palette_entry(option: dict[str, Any], *, with_state: bool) -> Palette
             )
         ),
         complete_to=f"/model {provider} {model}",
-        execute=True,
+        execute=bool(option.get("selectable", True)),
     )
 
 

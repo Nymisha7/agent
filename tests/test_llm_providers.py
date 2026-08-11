@@ -450,6 +450,26 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(response.output, [])
         self.assertIn("not_registered", response.output_text)
 
+    def test_local_provider_executes_single_backtick_text_tool_call(self) -> None:
+        completion = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=(
+                    '`json\n{"name":"inspect_target","arguments":'
+                    '{"path":"/workspace","kind":"directory"}}\n`'
+                ),
+                tool_calls=[],
+            ))],
+            usage=None,
+        )
+
+        response = _chat_completion_to_response(
+            completion,
+            text_tool_names={"inspect_target"},
+        )
+
+        self.assertEqual(response.output[0]["name"], "inspect_target")
+        self.assertEqual(response.output_text, "")
+
     def test_local_provider_executes_plain_text_tool_calls(self) -> None:
         completion = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(

@@ -1235,6 +1235,12 @@ def _chat_completion_to_response(
     )
 
 
+_JSON_TOOL_FENCE_RE = re.compile(
+    r"(?P<fence>`{1,3})(?:json)?\s*(?P<payload>\{.*?\})\s*(?P=fence)",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+
 def _text_content_tool_calls(
     content: str,
     *,
@@ -1259,14 +1265,13 @@ def _text_content_tool_calls(
         ).strip()
         return calls, visible
 
-    fenced = list(re.finditer(
-        r"```(?:json)?\s*(\{.*?\})\s*```",
-        content,
-        flags=re.DOTALL | re.IGNORECASE,
-    ))
+    fenced = list(_JSON_TOOL_FENCE_RE.finditer(content))
     if fenced:
         for match in fenced:
-            parsed = _text_tool_call_object(match.group(1), allowed_names=allowed_names)
+            parsed = _text_tool_call_object(
+                match.group("payload"),
+                allowed_names=allowed_names,
+            )
             if parsed is None:
                 return [], content
             calls.append(parsed)
@@ -1346,14 +1351,12 @@ def _text_tool_call_object(
 
 
 def _looks_like_command_envelope(content: str) -> bool:
+    if re.search(r"</?tool_(?:call|response)\b", content, flags=re.IGNORECASE):
+        return True
     candidates = [content.strip()]
     candidates.extend(
-        match.group(1)
-        for match in re.finditer(
-            r"```(?:json)?\s*(\{.*?\})\s*```",
-            content,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
+        match.group("payload")
+        for match in _JSON_TOOL_FENCE_RE.finditer(content)
     )
     return any(_is_command_envelope_object(candidate) for candidate in candidates)
 
@@ -1368,7 +1371,7 @@ def _local_text_stream_is_safe(
         return False
     lowered = text.casefold()
 
-    structural_prefixes = ("```", "<tool_call>")
+    structural_prefixes = ("`", "<tool_call>", "<tool_response>")
     if any(
         lowered.startswith(prefix) or prefix.startswith(lowered)
         for prefix in structural_prefixes

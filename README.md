@@ -223,9 +223,13 @@ for instruction following and tool calling, and `qwen3:4b` as a compact general
 agent model. To use a Llama instruct model through an existing Ollama installation,
 run `/install ollama llama3.2:3b` (about 2 GB, 4 GB+ RAM). Higher-memory systems
 can use `devstral-small-2:24b` (32 GB+ RAM) for stronger agentic and coding work.
-All of these Ollama entries run locally without
-an account or API key. Hosted copies of open-weight models still require the hosting
-provider's API key.
+All of these Ollama entries run locally without an account or API key. Hosted copies
+of open-weight models still require the hosting provider's API key.
+
+Installed custom models whose IDs report less than 1B parameters remain in their
+local runtime, but Nym marks them incompatible for native agent turns. They cannot
+reliably select tools or follow the tool-result protocol; use a curated 1B+ model,
+with 3B or larger recommended for workspace tasks.
 
 Ollama is not required. The same native agent runtime can use public models through
 the other local providers:

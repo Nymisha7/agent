@@ -185,6 +185,58 @@ def test_local_conversation_uses_one_agent_call() -> None:
     assert llm.requests[0]["tool_choice"] is None
 
 
+def test_local_invalid_json_tool_envelope_is_recovered_without_leaking() -> None:
+    llm = LocalLLM([
+        '`json\n{"name":"find_code_changes","arguments":{"user_input":"hi"}}\n`',
+        "Hello!",
+    ])
+
+    answer = run_agent(
+        llm=llm,
+        rust=object(),
+        workspace_root=".",
+        user_prompt="hi",
+    )
+
+    assert answer == "Hello!"
+    assert len(llm.requests) == 2
+    assert "Available tool names:" in llm.requests[1]["messages"][-1]["content"]
+
+
+def test_local_repeated_invalid_json_tool_envelope_returns_capability_error() -> None:
+    invalid = '`\n{"name":"call_one_of_the_available_native_tools","arguments":{}}\n`'
+    llm = LocalLLM([invalid, invalid])
+
+    answer = run_agent(
+        llm=llm,
+        rust=object(),
+        workspace_root=".",
+        user_prompt="create an app",
+    )
+
+    assert "more capable model" in answer
+    assert "call_one_of_the_available_native_tools" not in answer
+    assert len(llm.requests) == 2
+
+
+def test_local_tool_response_protocol_is_recovered_without_leaking() -> None:
+    llm = LocalLLM([
+        '<tool_response>{"path":"/workspace"}</tool_response>',
+        "Hello!",
+    ])
+
+    answer = run_agent(
+        llm=llm,
+        rust=object(),
+        workspace_root=".",
+        user_prompt="hi",
+    )
+
+    assert answer == "Hello!"
+    assert "tool_response" not in answer
+    assert len(llm.requests) == 2
+
+
 def test_local_router_artifact_does_not_leak_to_user() -> None:
     llm = LocalLLM(["<|im_start|>"])
 

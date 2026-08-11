@@ -563,6 +563,7 @@ enum BridgeCommandCode {
     InstallUnverified,
     InstallNotReady,
     ManualSetupRequired,
+    Incompatible,
     Unavailable,
     #[serde(other)]
     Unknown,
@@ -6160,6 +6161,9 @@ fn command_result_status(result: &BridgeCommandResult) -> String {
         }
         BridgeCommandCode::ApiKeyRequired => String::from("API key required"),
         BridgeCommandCode::CredentialsRequired => String::from("Provider credentials required"),
+        BridgeCommandCode::Incompatible => {
+            String::from("Model is incompatible with native agent tool use")
+        }
         BridgeCommandCode::Unavailable => String::from("Requested model is unavailable"),
         BridgeCommandCode::Ok | BridgeCommandCode::Unknown => {
             if result.error {
@@ -8104,6 +8108,24 @@ mod tui_tests {
         assert_eq!(
             command_result_status(&result),
             "Error — local model installation failed"
+        );
+    }
+
+    #[test]
+    fn incompatible_local_model_has_explicit_status() {
+        let result = BridgeCommandResult {
+            code: BridgeCommandCode::Incompatible,
+            setup_required: true,
+            error: true,
+            secret_provider: None,
+            next_command: None,
+            transient: false,
+            pending_action: None,
+        };
+
+        assert_eq!(
+            command_result_status(&result),
+            "Model is incompatible with native agent tool use"
         );
     }
 

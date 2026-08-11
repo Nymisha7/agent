@@ -53,6 +53,7 @@ DESKTOP_RETRY_EVIDENCE_TOOLS = frozenset({
     "process_list",
 })
 DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT = 1
+DEFAULT_UNEXECUTED_ACTION_RETRY_LIMIT = 1
 REASONING_FAILURE_TEXT_LIMIT = 360
 EMPTY_RESPONSE_RETRY_INSTRUCTION = (
     "The previous attempt did not produce a user-visible answer. Continue from "
@@ -228,6 +229,7 @@ def run_agent(
     available_tool_names = _tool_names_from_schemas(tools)
     unknown_tool_streak = 0
     empty_response_retries = 0
+    unexecuted_action_retries = 0
     unresolved_failure_this_run = False
     unresolved_failure_step: int | None = None
     completion_recovery_used = False
@@ -271,18 +273,25 @@ def run_agent(
                 })
                 continue
             response_text = _response_text(response)
-            if (
-                compact_local_context
-                and step + 1 < max_steps
-                and _looks_like_unexecuted_action(response_text)
-            ):
+            if compact_local_context and _looks_like_unexecuted_action(response_text):
+                if (
+                    step + 1 >= max_steps
+                    or unexecuted_action_retries >= DEFAULT_UNEXECUTED_ACTION_RETRY_LIMIT
+                ):
+                    return (
+                        "The selected local model could not produce a valid answer or native "
+                        "tool call. Choose a more capable model with /model, then retry."
+                    )
+                unexecuted_action_retries += 1
                 msg_history.append({"role": "assistant", "content": response_text})
                 msg_history.append({
                     "role": "user",
                     "content": (
-                        "That JSON was not an executed action. Do not print command JSON. "
-                        "Call one of the available native tools now, or answer in normal text "
-                        "if no tool is needed."
+                        "The previous response exposed internal tool protocol instead of a "
+                        "user answer. Do not print tool JSON, XML, or raw tool results. Return "
+                        "to the original request. Use an exact supplied tool name only when "
+                        "another action is needed; otherwise answer normally. Available tool names: "
+                        + ", ".join(sorted(available_tool_names))
                     ),
                 })
                 continue
@@ -2732,11 +2741,13 @@ def _unwrap_final_text(text: str) -> str:
 
 def _looks_like_unexecuted_action(text: str) -> bool:
     stripped = text.strip()
+    if re.search(r"</?tool_(?:call|response)\b", stripped, flags=re.IGNORECASE):
+        return True
     candidates = [stripped]
     candidates.extend(
-        match.group(1)
+        match.group("payload")
         for match in re.finditer(
-            r"```(?:json)?\s*(\{.*?\})\s*```",
+            r"(?P<fence>`{1,3})(?:json)?\s*(?P<payload>\{.*?\})\s*(?P=fence)",
             text,
             flags=re.DOTALL | re.IGNORECASE,
         )

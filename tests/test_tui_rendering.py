@@ -35,6 +35,7 @@ from agent.main import (
     _load_persisted_api_keys,
     _persist_api_key,
     _persist_agent_name,
+    _model_parameter_billions,
     _queue_status,
     _record_local_command_exchange,
     _refresh_active_local_model_state,
@@ -738,6 +739,34 @@ class TuiRenderingTests(unittest.TestCase):
             labels[ollama_section + 1 : ollama_section + 4],
             ["qwen2.5-coder:3b", "qwen3.5:4b", "granite4:3b"],
         )
+
+    def test_model_completions_disable_uncurated_sub_one_billion_model(self) -> None:
+        ctx = SimpleNamespace(
+            llm=SimpleNamespace(
+                provider="openai",
+                model="gpt-5.5",
+                configuration_error=None,
+            )
+        )
+        availability = {
+            provider: ([], "offline")
+            for provider in {"ollama", "lmstudio", "llamacpp", "vllm", "localai"}
+        }
+        availability["ollama"] = (["qwen2.5:0.5b"], None)
+
+        with patch(
+            "agent.main._discover_local_provider_availability",
+            return_value=availability,
+        ):
+            payload = _tui_bridge_completions("/model ", ctx=ctx)
+
+        entry = next(
+            item
+            for item in payload["entries"]
+            if item["value"] == "ollama/qwen2.5:0.5b"
+        )
+        self.assertFalse(entry["execute"])
+        self.assertIn("Incompatible", entry["description"])
 
     def test_model_completions_are_grouped_by_provider_ranked_models_first(self) -> None:
         ctx = SimpleNamespace(
@@ -1516,6 +1545,28 @@ class TuiRenderingTests(unittest.TestCase):
 
 
 class LocalCommandTests(unittest.TestCase):
+    def test_uncurated_sub_one_billion_model_is_not_selectable(self) -> None:
+        ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
+
+        with (
+            patch("agent.main.shutil.which", return_value="/usr/bin/ollama"),
+            patch("agent.main._ensure_ollama_running", return_value=None),
+            patch(
+                "agent.main._discover_provider_models",
+                return_value=(["qwen2.5:0.5b"], None),
+            ),
+        ):
+            result = _handle_local_command(ctx, "/model ollama qwen2.5:0.5b")
+
+        self.assertIn("too small for native agent tool use", result)
+        self.assertIn("Detected size: 0.5B", result)
+        self.assertIn("/install ollama qwen2.5-coder:3b", result)
+
+    def test_model_parameter_size_parser_is_data_driven(self) -> None:
+        self.assertEqual(_model_parameter_billions("model:0.5b"), 0.5)
+        self.assertEqual(_model_parameter_billions("vendor/model-3B-instruct"), 3.0)
+        self.assertIsNone(_model_parameter_billions("custom-model"))
+
     def test_install_requires_metadata_preview_before_download(self) -> None:
         ctx = SimpleNamespace(llm=SimpleNamespace(provider="openai", model="gpt-4o"))
 
