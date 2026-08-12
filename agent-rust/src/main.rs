@@ -781,6 +781,8 @@ struct BridgeMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 struct BridgeAttachment {
+    #[serde(default)]
+    id: Option<String>,
     filename: String,
     mime: String,
     size_bytes: i64,
@@ -934,6 +936,8 @@ struct UiSetupSurface {
 #[derive(Debug, Clone)]
 struct AttachmentHitArea {
     area: Rect,
+    remove_area: Option<Rect>,
+    attachment_id: Option<String>,
     filename: String,
     mime: String,
     size_bytes: i64,
@@ -1642,7 +1646,14 @@ fn run_tui_loop(
                                 mouse_in_rect(mouse.column, mouse.row, target.area)
                             }) =>
                     {
-                        open_clicked_attachment(&mut app, mouse.column, mouse.row);
+                        activate_clicked_attachment(
+                            &runtime,
+                            &args,
+                            &tx,
+                            &mut app,
+                            mouse.column,
+                            mouse.row,
+                        );
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left)
                         if app.secret_provider.is_none()
@@ -1874,6 +1885,13 @@ fn run_tui_loop(
             KeyCode::Backspace => {
                 if app.secret_provider.is_some() {
                     app.secret_input.pop();
+                } else if app.input.is_empty()
+                    && !app.submitting
+                    && !bridge_process_active(&app)
+                    && !app.attachment_path_mode
+                    && !app.snapshot.session.pending_attachments.is_empty()
+                {
+                    remove_last_pending_attachment(&runtime, &args, &tx, &mut app);
                 } else {
                     app.input.pop();
                     if !app.attachment_path_mode {
@@ -2430,6 +2448,10 @@ fn attachment_bridge_prompt(path: &str) -> String {
     format!("/__nym_attach \"{escaped}\"")
 }
 
+fn attachment_detach_bridge_prompt(attachment_id: &str) -> String {
+    format!("/__nym_detach {attachment_id}")
+}
+
 fn submit_attachment_path(
     runtime: &RuntimeHandle,
     args: &Arc<TuiArgs>,
@@ -2478,6 +2500,71 @@ fn open_clicked_attachment(app: &mut TuiApp, column: u16, row: u16) {
             app.status = format!("{}: {}", target.filename, clip_status(&err.to_string(), 72));
         }
     }
+}
+
+fn activate_clicked_attachment(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    app: &mut TuiApp,
+    column: u16,
+    row: u16,
+) {
+    let target = app
+        .attachment_hit_areas
+        .iter()
+        .find(|target| mouse_in_rect(column, row, target.area))
+        .cloned();
+    let Some(target) = target else {
+        return;
+    };
+    if target
+        .remove_area
+        .is_some_and(|area| mouse_in_rect(column, row, area))
+    {
+        if let Some(attachment_id) = target.attachment_id.as_deref() {
+            submit_attachment_removal(runtime, args, tx, app, attachment_id.to_string());
+        }
+        return;
+    }
+    open_clicked_attachment(app, column, row);
+}
+
+fn remove_last_pending_attachment(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    app: &mut TuiApp,
+) {
+    let attachment = app.snapshot.session.pending_attachments.last().cloned();
+    if let Some(attachment) = attachment {
+        if let Some(attachment_id) = attachment.id {
+            submit_attachment_removal(runtime, args, tx, app, attachment_id);
+        }
+    }
+}
+
+fn submit_attachment_removal(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    app: &mut TuiApp,
+    attachment_id: String,
+) {
+    if app.submitting || bridge_process_active(app) {
+        app.status = String::from("Finish the current task before removing a file");
+        return;
+    }
+    let draft = std::mem::take(&mut app.input);
+    start_prompt_submission(
+        runtime,
+        args,
+        tx,
+        app,
+        attachment_detach_bridge_prompt(&attachment_id),
+    );
+    app.input = draft;
+    app.status = String::from("Removing attachment...");
 }
 
 fn load_attachment_preview(target: &AttachmentHitArea, path: &str) -> Result<AttachmentPreview> {
@@ -3210,9 +3297,9 @@ fn attachment_chip_line(
         if available < 7 {
             break;
         }
-        let filename_limit = available.saturating_sub(4).min(28) as usize;
+        let filename_limit = available.saturating_sub(6).min(28) as usize;
         let filename = clip_status(&attachment.filename, filename_limit).into_owned();
-        let chip = format!(" ▤ {filename} ");
+        let chip = format!(" ▤ {filename} × ");
         let chip_width = chip.chars().count() as u16;
         if !separator.is_empty() {
             spans.push(Span::raw(separator));
@@ -3226,6 +3313,13 @@ fn attachment_chip_line(
         ));
         hit_areas.push(AttachmentHitArea {
             area: Rect::new(chip_x, y, chip_width, 1),
+            remove_area: Some(Rect::new(
+                chip_x.saturating_add(chip_width.saturating_sub(3)),
+                y,
+                2,
+                1,
+            )),
+            attachment_id: attachment.id.clone(),
             filename: attachment.filename.clone(),
             mime: attachment.mime.clone(),
             size_bytes: attachment.size_bytes,
@@ -4061,6 +4155,8 @@ fn transcript_attachment_hit_areas(
                         width,
                         (clipped_end - clipped_start) as u16,
                     ),
+                    remove_area: None,
+                    attachment_id: None,
                     filename: attachment.filename.clone(),
                     mime: attachment.mime.clone(),
                     size_bytes: attachment.size_bytes,
@@ -4798,6 +4894,9 @@ fn transcript_text(
         lines.push(Line::from(""));
     }
     if let Some(prompt) = &app.running_prompt {
+        if is_attachment_management_bridge_prompt(prompt) {
+            return Text::from(lines);
+        }
         let prompt_is_persisted = snapshot.messages.last().is_some_and(|message| {
             message.role == "user" && message.content.trim() == prompt.trim()
         });
@@ -5628,6 +5727,14 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
                                 format!("Attached {} · click the file to open", attachment.filename)
                             })
                             .unwrap_or_else(|| String::from("Attachment was not added"))
+                    } else if completed_prompt
+                        .as_deref()
+                        .is_some_and(is_attachment_detach_bridge_prompt)
+                    {
+                        frame
+                            .answer
+                            .clone()
+                            .unwrap_or_else(|| String::from("Attachment removed"))
                     } else {
                         command_result
                             .map(command_result_status)
@@ -5732,7 +5839,7 @@ fn ensure_final_frame_messages_visible(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if !is_attachment_bridge_prompt(prompt)
+        if !is_attachment_management_bridge_prompt(prompt)
             && !snapshot_contains_message(&app.snapshot, "user", prompt)
         {
             app.snapshot.messages.push(BridgeMessage {
@@ -5744,7 +5851,7 @@ fn ensure_final_frame_messages_visible(
         }
     }
 
-    if !completed_prompt.is_some_and(is_attachment_bridge_prompt) {
+    if !completed_prompt.is_some_and(is_attachment_management_bridge_prompt) {
         if let Some(answer) = answer.map(str::trim).filter(|value| !value.is_empty()) {
             if !snapshot_contains_message(&app.snapshot, "assistant", answer) {
                 app.snapshot.messages.push(BridgeMessage {
@@ -5760,6 +5867,14 @@ fn ensure_final_frame_messages_visible(
 
 fn is_attachment_bridge_prompt(prompt: &str) -> bool {
     prompt.split_whitespace().next() == Some("/__nym_attach")
+}
+
+fn is_attachment_detach_bridge_prompt(prompt: &str) -> bool {
+    prompt.split_whitespace().next() == Some("/__nym_detach")
+}
+
+fn is_attachment_management_bridge_prompt(prompt: &str) -> bool {
+    is_attachment_bridge_prompt(prompt) || is_attachment_detach_bridge_prompt(prompt)
 }
 
 fn snapshot_contains_message(snapshot: &BridgeSnapshot, role: &str, content: &str) -> bool {
@@ -7302,6 +7417,19 @@ mod tui_tests {
     }
 
     #[test]
+    fn attachment_management_commands_stay_out_of_the_transcript() {
+        let mut app = test_app();
+
+        ensure_final_frame_messages_visible(
+            &mut app,
+            Some("/__nym_detach attachment-1"),
+            Some("Removed attachment: notes.txt."),
+        );
+
+        assert!(app.snapshot.messages.is_empty());
+    }
+
+    #[test]
     fn non_stream_bridge_error_json_is_treated_as_final_frame() {
         let frame =
             parse_bridge_stream_line(r#"{"ok":false,"error":"Bridge exited before startup"}"#)
@@ -7978,6 +8106,7 @@ mod tui_tests {
     #[test]
     fn pending_attachment_renders_as_clickable_file_chip() {
         let attachment = BridgeAttachment {
+            id: Some(String::from("attachment-1")),
             filename: String::from("quarterly-report.pdf"),
             mime: String::from("application/pdf"),
             size_bytes: 123,
@@ -7991,6 +8120,9 @@ mod tui_tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].area.x, 10);
         assert_eq!(targets[0].area.y, 20);
+        assert!(rendered.contains('×'));
+        assert_eq!(targets[0].attachment_id.as_deref(), Some("attachment-1"));
+        assert!(targets[0].remove_area.is_some());
         assert_eq!(
             targets[0].storage_path.as_deref(),
             Some("/private/attachments/report")
@@ -8005,6 +8137,7 @@ mod tui_tests {
             content: String::from("Review this"),
             created_at: String::from("now"),
             attachments: vec![BridgeAttachment {
+                id: Some(String::from("attachment-1")),
                 filename: String::from("report.pdf"),
                 mime: String::from("application/pdf"),
                 size_bytes: 123,
@@ -8032,6 +8165,8 @@ mod tui_tests {
         let mut app = test_app();
         app.attachment_hit_areas.push(AttachmentHitArea {
             area: Rect::new(5, 6, 20, 1),
+            remove_area: None,
+            attachment_id: None,
             filename: String::from("notes.txt"),
             mime: String::from("text/plain"),
             size_bytes: 22,

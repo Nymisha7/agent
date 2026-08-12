@@ -1971,6 +1971,33 @@ def _dispatch_local_command(
         persist_agent_state(ctx)
         return f"Attached for next message: {attachment.filename} ({attachment.mime}, {attachment.size_bytes} bytes)."
 
+    if command == "/__nym_detach":
+        if len(parts) != 2:
+            return "The selected file could not be removed."
+        attachment_id = parts[1]
+        removed = next(
+            (
+                attachment
+                for attachment in ctx.pending_attachments
+                if attachment.id == attachment_id
+            ),
+            None,
+        )
+        if removed is None:
+            return "The selected file is no longer attached."
+        ctx.pending_attachments[:] = [
+            attachment
+            for attachment in ctx.pending_attachments
+            if attachment.id != attachment_id
+        ]
+        ctx.session.pending_attachments[:] = [
+            attachment
+            for attachment in ctx.session.pending_attachments
+            if attachment.get("id") != attachment_id
+        ]
+        persist_agent_state(ctx)
+        return f"Removed attachment: {removed.filename}."
+
     if command in {"/login", "/auth"}:
         provider = parts[1] if len(parts) >= 2 else _active_provider(ctx)
         return _login_provider(ctx, provider)
@@ -4816,6 +4843,7 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             "cost_usd": session.cost_usd,
             "pending_attachments": [
                 {
+                    "id": attachment.id,
                     "filename": attachment.filename,
                     "mime": attachment.mime,
                     "size_bytes": attachment.size_bytes,
@@ -4848,6 +4876,7 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
                 "created_at": item.created_at,
                 "attachments": [
                     {
+                        "id": attachment.id,
                         "filename": attachment.filename,
                         "mime": attachment.mime,
                         "size_bytes": attachment.size_bytes,

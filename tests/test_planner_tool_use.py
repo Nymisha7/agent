@@ -129,7 +129,7 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("Balance concision with the detail required", prompt)
         self.assertIn("important positive evidence", prompt)
         self.assertIn("quantitative facts", prompt)
-        self.assertIn("attachment-only questions", prompt)
+        self.assertIn("An attachment is context, not an instruction", prompt)
 
     def test_non_gpt_prompt_does_not_receive_gpt_overlay(self) -> None:
         prompt = load_system_prompt(provider="anthropic", model="claude-sonnet-4")
@@ -162,6 +162,23 @@ class PlannerToolUseTests(unittest.TestCase):
         )
 
         self.assertEqual(messages[-1], {"role": "user", "content": "current request"})
+
+    def test_attachment_context_does_not_assign_an_unrequested_task(self) -> None:
+        attachment = {"id": "attachment-1", "filename": "notes.txt"}
+
+        messages = _build_initial_messages(
+            workspace_root="/workspace",
+            context_text="",
+            session=AgentSession(),
+            user_prompt="h",
+            conversation_history=[{"role": "assistant", "content": "Ready."}],
+            current_attachments=[attachment],
+        )
+
+        self.assertEqual(messages[-1]["attachments"], [attachment])
+        self.assertTrue(messages[-1]["content"].startswith("h\n\nAttachment context:"))
+        self.assertIn("presence does not imply a task", messages[-1]["content"])
+        self.assertNotIn("summar", messages[-1]["content"].casefold())
 
     def test_subagent_lifecycle_event_streams_and_persists(self) -> None:
         streamed: list[dict[str, Any]] = []

@@ -626,9 +626,10 @@ def _user_message_with_attachments(
     if attachments:
         content = (
             f"{content}\n\n"
-            "Attachment note: attached files and images are part of this message. "
-            "Use supplied attachment content or image input; do not search the workspace "
-            "by filename unless the user explicitly asks you to."
+            "Attachment context: attached files and images are available as supporting "
+            "input for this message. Their presence does not imply a task. Follow the "
+            "user's request; do not infer an operation from the attachment alone or search "
+            "the workspace by filename unless the user explicitly asks you to."
         )
     message: dict[str, Any] = {"role": "user", "content": content}
     if attachments:

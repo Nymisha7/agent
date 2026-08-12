@@ -336,6 +336,22 @@ class TuiRenderingTests(unittest.TestCase):
         self.assertEqual([item.filename for item in ctx.pending_attachments], ["notes.txt"])
         self.assertEqual(len(ctx.session.pending_attachments), 1)
 
+    def test_private_composer_bridge_removes_selected_file_by_id(self) -> None:
+        attachment = SimpleNamespace(id="attachment-1", filename="notes.txt")
+        ctx = SimpleNamespace(
+            pending_attachments=[attachment],
+            session=AgentSession(pending_attachments=[{"id": "attachment-1"}]),
+            store=SimpleNamespace(save_agent_state=Mock()),
+            session_id="attachment-session",
+        )
+
+        result = _handle_local_command(ctx, "/__nym_detach attachment-1")
+
+        self.assertEqual(result, "Removed attachment: notes.txt.")
+        self.assertEqual(ctx.pending_attachments, [])
+        self.assertEqual(ctx.session.pending_attachments, [])
+        ctx.store.save_agent_state.assert_called_once()
+
     def test_bridge_local_command_round_trip_includes_prompt_and_answer(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1000,6 +1016,7 @@ class TuiRenderingTests(unittest.TestCase):
 
     def test_tui_bridge_snapshot_exposes_stored_attachment_for_ui_opening(self) -> None:
         attachment = SimpleNamespace(
+            id="attachment-1",
             filename="report.pdf",
             mime="application/pdf",
             size_bytes=123,
@@ -1037,6 +1054,10 @@ class TuiRenderingTests(unittest.TestCase):
 
         snapshot = _tui_bridge_snapshot(ctx)
 
+        self.assertEqual(
+            snapshot["session"]["pending_attachments"][0]["id"],
+            attachment.id,
+        )
         self.assertEqual(
             snapshot["session"]["pending_attachments"][0]["storage_path"],
             attachment.storage_path,
