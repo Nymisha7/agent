@@ -980,7 +980,10 @@ struct AttachmentPreview {
 #[derive(Debug)]
 enum AppEvent {
     StreamFrame(Result<Box<BridgeStreamFrame>>),
-    VoiceFrame(Result<BridgeVoiceFrame>),
+    VoiceFrame {
+        session_id: u64,
+        result: Result<BridgeVoiceFrame>,
+    },
     AttachmentMutation {
         operation: AttachmentMutation,
         result: Box<Result<BridgeResponse>>,
@@ -1039,6 +1042,9 @@ struct TuiApp {
     setup_surface: Option<UiSetupSurface>,
     gateway_view: Option<GatewayViewState>,
     voice_recording: bool,
+    voice_session_id: u64,
+    voice_cancel_signal: Option<Arc<AtomicBool>>,
+    active_voice_process: Arc<Mutex<Option<u32>>>,
     voice_input_prefix: Option<String>,
     voice_partial: String,
     paste_keys: Vec<PasteKey>,
@@ -1552,6 +1558,9 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
             setup_surface: initial_setup_surface,
             gateway_view: None,
             voice_recording: false,
+            voice_session_id: 0,
+            voice_cancel_signal: None,
+            active_voice_process: Arc::new(Mutex::new(None)),
             voice_input_prefix: None,
             voice_partial: String::new(),
             paste_keys,
@@ -1844,6 +1853,10 @@ fn run_tui_loop(
                 }
                 if !app.snapshot.approvals.is_empty() {
                     apply_approval_action(&args, &mut app, "deny");
+                    continue;
+                }
+                if app.voice_recording {
+                    stop_voice_recording(&mut app);
                     continue;
                 }
                 if palette_is_open(&app) || !app.input.is_empty() {
@@ -2175,6 +2188,9 @@ fn run_tui_loop(
     if app.submitting || bridge_process_active(&app) {
         request_active_stop(&mut app);
     }
+    if app.voice_recording || voice_process_active(&app) {
+        cancel_voice_transport(&mut app);
+    }
     Ok(())
 }
 
@@ -2437,6 +2453,11 @@ fn start_voice_recording(
     app: &mut TuiApp,
 ) {
     if app.voice_recording {
+        stop_voice_recording(app);
+        return;
+    }
+    if voice_process_active(app) {
+        app.status = String::from("Stopping voice input...");
         return;
     }
     if !app.snapshot.voice.input_ready {
@@ -2459,6 +2480,10 @@ fn start_voice_recording(
         return;
     }
     app.voice_recording = true;
+    app.voice_session_id = app.voice_session_id.wrapping_add(1);
+    let session_id = app.voice_session_id;
+    let cancel_signal = Arc::new(AtomicBool::new(false));
+    app.voice_cancel_signal = Some(Arc::clone(&cancel_signal));
     let mut prefix = app.input.clone();
     if prefix
         .chars()
@@ -2469,14 +2494,53 @@ fn start_voice_recording(
     }
     app.voice_input_prefix = Some(prefix);
     app.voice_partial.clear();
-    app.status = String::from("Listening and transcribing...");
+    app.status = String::from("Listening and transcribing... select stop to keep text");
     let tx = tx.clone();
     let args = Arc::clone(args);
+    let active_voice_process = Arc::clone(&app.active_voice_process);
     runtime.spawn(async move {
-        if let Err(err) = stream_voice_record(args.as_ref(), tx.clone()).await {
-            let _ = tx.send(AppEvent::VoiceFrame(Err(err)));
+        if let Err(err) = stream_voice_record(
+            args.as_ref(),
+            tx.clone(),
+            session_id,
+            Arc::clone(&cancel_signal),
+            active_voice_process,
+        )
+        .await
+        {
+            if !cancel_signal.load(Ordering::SeqCst) {
+                let _ = tx.send(AppEvent::VoiceFrame {
+                    session_id,
+                    result: Err(err),
+                });
+            }
         }
     });
+}
+
+fn stop_voice_recording(app: &mut TuiApp) {
+    cancel_voice_transport(app);
+    clear_voice_recording_state(app);
+    app.status = String::from("Voice input stopped — transcript kept in message");
+    invalidate_transcript(app);
+}
+
+fn cancel_voice_transport(app: &mut TuiApp) {
+    if let Some(signal) = app.voice_cancel_signal.take() {
+        signal.store(true, Ordering::SeqCst);
+    }
+    if let Ok(active) = app.active_voice_process.lock() {
+        if let Some(pid) = *active {
+            let _ = interrupt_process_tree_pid(pid);
+        }
+    }
+}
+
+fn voice_process_active(app: &TuiApp) -> bool {
+    app.active_voice_process
+        .lock()
+        .map(|active| active.is_some())
+        .unwrap_or(false)
 }
 
 fn submit_attachment_path(
@@ -2905,6 +2969,9 @@ fn start_prompt_submission(
     app: &mut TuiApp,
     prompt: String,
 ) {
+    if app.voice_recording || voice_process_active(app) {
+        cancel_voice_transport(app);
+    }
     clear_voice_recording_state(app);
     app.input.clear();
     app.submitting = true;
@@ -3418,7 +3485,7 @@ fn mic_button_text(enabled: bool, recording: bool) -> Text<'static> {
         Color::DarkGray
     };
     Text::from(Line::from(Span::styled(
-        "🎙",
+        if recording { "■" } else { "🎙" },
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )))
 }
@@ -5823,12 +5890,17 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             }
             _ => {}
         },
-        AppEvent::VoiceFrame(Ok(frame)) if app.voice_recording => match frame.kind.as_str() {
+        AppEvent::VoiceFrame {
+            session_id,
+            result: Ok(frame),
+        } if app.voice_recording && session_id == app.voice_session_id => match frame.kind.as_str()
+        {
             "delta" => {
                 if let Some(delta) = frame.delta {
                     app.voice_partial.push_str(&delta);
                     replace_voice_composer_text(app, &app.voice_partial.clone());
-                    app.status = String::from("Listening and transcribing...");
+                    app.status =
+                        String::from("Listening and transcribing... select stop to keep text");
                 }
             }
             "final" => {
@@ -5857,12 +5929,16 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             }
             _ => {}
         },
-        AppEvent::VoiceFrame(Ok(_)) => {}
-        AppEvent::VoiceFrame(Err(err)) => {
+        AppEvent::VoiceFrame { result: Ok(_), .. } => {}
+        AppEvent::VoiceFrame {
+            session_id,
+            result: Err(err),
+        } if session_id == app.voice_session_id => {
             clear_voice_recording_state(app);
             push_notice(app, "Voice input", &err.to_string(), true);
             app.status = String::from("Voice input unavailable");
         }
+        AppEvent::VoiceFrame { result: Err(_), .. } => {}
         AppEvent::AttachmentMutation { operation, result } => {
             app.submitting = false;
             match *result {
@@ -5910,6 +5986,7 @@ fn replace_voice_composer_text(app: &mut TuiApp, transcript: &str) {
 
 fn clear_voice_recording_state(app: &mut TuiApp) {
     app.voice_recording = false;
+    app.voice_cancel_signal = None;
     app.voice_input_prefix = None;
     app.voice_partial.clear();
 }
@@ -6519,13 +6596,38 @@ fn call_bridge_with_request_id(
     parse_bridge_output(command.output()?)
 }
 
-async fn stream_voice_record(args: &TuiArgs, tx: mpsc::Sender<AppEvent>) -> Result<()> {
-    let mut child = spawn_bridge_async(args, "voice-stream", None)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Voice bridge stdout was not captured."))?;
-    let stderr = child.stderr.take();
+async fn stream_voice_record(
+    args: &TuiArgs,
+    tx: mpsc::Sender<AppEvent>,
+    session_id: u64,
+    cancel_signal: Arc<AtomicBool>,
+    active_voice_process: Arc<Mutex<Option<u32>>>,
+) -> Result<()> {
+    if cancel_signal.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let (mut child, pid, stdout, stderr) = {
+        let mut active = active_voice_process
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Could not claim the voice process slot."))?;
+        if cancel_signal.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if active.is_some() {
+            return Err(anyhow::anyhow!("Voice input is still stopping."));
+        }
+        let mut child = spawn_bridge_async(args, "voice-stream", None)?;
+        let pid = child
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("Voice bridge process id is unavailable."))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Voice bridge stdout was not captured."))?;
+        let stderr = child.stderr.take();
+        *active = Some(pid);
+        (child, pid, stdout, stderr)
+    };
     let stderr_reader = stderr.map(|mut pipe| {
         tokio::spawn(async move {
             let mut text = String::new();
@@ -6535,29 +6637,52 @@ async fn stream_voice_record(args: &TuiArgs, tx: mpsc::Sender<AppEvent>) -> Resu
     });
     let mut reader = AsyncBufReader::new(stdout).lines();
     let mut saw_terminal_frame = false;
-    while let Some(line) = reader.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    let stream_result: Result<()> = async {
+        while let Some(line) = reader.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let frame: BridgeVoiceFrame = serde_json::from_str(&line).map_err(|err| {
+                anyhow::anyhow!(
+                    "Could not parse voice stream frame: {}. line: {}",
+                    err,
+                    line
+                )
+            })?;
+            if matches!(frame.kind.as_str(), "final" | "error") {
+                saw_terminal_frame = true;
+            }
+            if tx
+                .send(AppEvent::VoiceFrame {
+                    session_id,
+                    result: Ok(frame),
+                })
+                .is_err()
+            {
+                return Err(anyhow::anyhow!("UI event receiver closed"));
+            }
         }
-        let frame: BridgeVoiceFrame = serde_json::from_str(&line).map_err(|err| {
-            anyhow::anyhow!(
-                "Could not parse voice stream frame: {}. line: {}",
-                err,
-                line
-            )
-        })?;
-        if matches!(frame.kind.as_str(), "final" | "error") {
-            saw_terminal_frame = true;
-        }
-        if tx.send(AppEvent::VoiceFrame(Ok(frame))).is_err() {
-            return Err(anyhow::anyhow!("UI event receiver closed"));
-        }
+        Ok(())
     }
-    let status = child.wait().await?;
+    .await;
+    if stream_result.is_err() && !cancel_signal.load(Ordering::SeqCst) {
+        let _ = interrupt_process_tree_pid(pid);
+    }
+    let status_result = child.wait().await;
     let stderr = match stderr_reader {
         Some(handle) => handle.await.unwrap_or_default(),
         None => String::new(),
     };
+    if let Ok(mut active) = active_voice_process.lock() {
+        if *active == Some(pid) {
+            *active = None;
+        }
+    }
+    if cancel_signal.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    stream_result?;
+    let status = status_result?;
     if !saw_terminal_frame {
         let detail = stderr.trim();
         if detail.is_empty() {
@@ -6958,6 +7083,9 @@ mod tui_tests {
             setup_surface: None,
             gateway_view: None,
             voice_recording: false,
+            voice_session_id: 0,
+            voice_cancel_signal: None,
+            active_voice_process: Arc::new(Mutex::new(None)),
             voice_input_prefix: None,
             voice_partial: String::new(),
             paste_keys: parse_paste_keys(&[
@@ -7707,24 +7835,30 @@ mod tui_tests {
 
         handle_app_event(
             &mut app,
-            AppEvent::VoiceFrame(Ok(BridgeVoiceFrame {
-                kind: String::from("delta"),
-                delta: Some(String::from("helo")),
-                transcript: None,
-                error: None,
-            })),
+            AppEvent::VoiceFrame {
+                session_id: 0,
+                result: Ok(BridgeVoiceFrame {
+                    kind: String::from("delta"),
+                    delta: Some(String::from("helo")),
+                    transcript: None,
+                    error: None,
+                }),
+            },
         );
         assert_eq!(app.input, "Ask Nym helo");
         assert!(app.voice_recording);
 
         handle_app_event(
             &mut app,
-            AppEvent::VoiceFrame(Ok(BridgeVoiceFrame {
-                kind: String::from("final"),
-                delta: None,
-                transcript: Some(String::from("hello")),
-                error: None,
-            })),
+            AppEvent::VoiceFrame {
+                session_id: 0,
+                result: Ok(BridgeVoiceFrame {
+                    kind: String::from("final"),
+                    delta: None,
+                    transcript: Some(String::from("hello")),
+                    error: None,
+                }),
+            },
         );
         assert!(app.input.is_empty());
         assert!(!app.voice_recording);
@@ -7733,6 +7867,53 @@ mod tui_tests {
             Some("Ask Nym hello")
         );
         assert_eq!(app.status, "Sending voice message...");
+    }
+
+    #[test]
+    fn stopping_voice_keeps_partial_transcript_without_submitting_it() {
+        let mut app = test_app();
+        let cancel_signal = Arc::new(AtomicBool::new(false));
+        app.input = String::from("partially transcribed message");
+        app.voice_recording = true;
+        app.voice_input_prefix = Some(String::new());
+        app.voice_partial = app.input.clone();
+        app.voice_cancel_signal = Some(Arc::clone(&cancel_signal));
+
+        stop_voice_recording(&mut app);
+
+        assert!(!app.voice_recording);
+        assert!(cancel_signal.load(Ordering::SeqCst));
+        assert_eq!(app.input, "partially transcribed message");
+        assert!(app.queued_prompts.is_empty());
+        assert_eq!(
+            app.status,
+            "Voice input stopped — transcript kept in message"
+        );
+    }
+
+    #[test]
+    fn stopped_voice_session_cannot_write_into_a_new_recording() {
+        let mut app = test_app();
+        app.voice_recording = true;
+        app.voice_session_id = 2;
+        app.voice_input_prefix = Some(String::new());
+
+        handle_app_event(
+            &mut app,
+            AppEvent::VoiceFrame {
+                session_id: 1,
+                result: Ok(BridgeVoiceFrame {
+                    kind: String::from("delta"),
+                    delta: Some(String::from("stale transcript")),
+                    transcript: None,
+                    error: None,
+                }),
+            },
+        );
+
+        assert!(app.input.is_empty());
+        assert!(app.voice_partial.is_empty());
+        assert!(app.voice_recording);
     }
 
     #[test]
@@ -7846,12 +8027,15 @@ mod tui_tests {
 
         handle_app_event(
             &mut app,
-            AppEvent::VoiceFrame(Ok(BridgeVoiceFrame {
-                kind: String::from("final"),
-                delta: None,
-                transcript: Some(String::from("close Spark")),
-                error: None,
-            })),
+            AppEvent::VoiceFrame {
+                session_id: 0,
+                result: Ok(BridgeVoiceFrame {
+                    kind: String::from("final"),
+                    delta: None,
+                    transcript: Some(String::from("close Spark")),
+                    error: None,
+                }),
+            },
         );
 
         assert!(app.input.is_empty());
