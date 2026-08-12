@@ -50,6 +50,7 @@ from agent.main import (
     _tui_bridge_snapshot,
     _usage_panel_lines,
     _voice_snapshot,
+    _without_private_attachment_exchanges,
     build_parser,
     handle_prompt,
     main,
@@ -393,6 +394,52 @@ class TuiRenderingTests(unittest.TestCase):
             {"code": "ok", "setup_required": False, "error": False},
         )
 
+    def test_attachment_bridge_actions_mutate_state_without_conversation_turns(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "notes.txt"
+            source.write_text("attachment content", encoding="utf-8")
+            store = SessionStore(root / "sessions.sqlite3")
+            session = store.create_session(workspace_root=root)
+            add_args = build_parser().parse_args([
+                "--tui-bridge",
+                "attachment-add",
+                "--bridge-session-id",
+                session.id,
+                "--bridge-prompt",
+                str(source),
+            ])
+            output = io.StringIO()
+
+            with (
+                patch.dict("os.environ", {"XDG_DATA_HOME": tmp}, clear=False),
+                redirect_stdout(output),
+            ):
+                exit_code = _run_tui_bridge(add_args, store)
+            added = json.loads(output.getvalue())
+            attachment_id = added["snapshot"]["session"]["pending_attachments"][0]["id"]
+
+            remove_args = build_parser().parse_args([
+                "--tui-bridge",
+                "attachment-remove",
+                "--bridge-session-id",
+                session.id,
+                "--bridge-prompt",
+                attachment_id,
+            ])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                remove_exit_code = _run_tui_bridge(remove_args, store)
+            removed = json.loads(output.getvalue())
+            messages = store.list_messages(session.id)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(remove_exit_code, 0)
+        self.assertTrue(added["ok"])
+        self.assertTrue(removed["ok"])
+        self.assertEqual(removed["snapshot"]["session"]["pending_attachments"], [])
+        self.assertEqual(messages, [])
+
     def test_normal_prompt_round_trip_persists_user_and_assistant_messages(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -626,6 +673,31 @@ class TuiRenderingTests(unittest.TestCase):
         )
 
         store.add_messages.assert_not_called()
+
+    def test_private_attachment_commands_are_never_persisted_as_conversation(self) -> None:
+        store = SimpleNamespace(add_messages=Mock())
+        ctx = SimpleNamespace(session_id="abc123", store=store)
+
+        _record_local_command_exchange(
+            ctx,
+            "/__nym_detach attachment-1",
+            "Removed attachment: notes.txt.",
+        )
+
+        store.add_messages.assert_not_called()
+
+    def test_old_private_attachment_exchanges_are_hidden(self) -> None:
+        messages = [
+            SimpleNamespace(role="user", content="hello"),
+            SimpleNamespace(role="assistant", content="Hi."),
+            SimpleNamespace(role="user", content="/__nym_detach attachment-1"),
+            SimpleNamespace(role="assistant", content="Removed attachment: notes.txt."),
+            SimpleNamespace(role="user", content="continue"),
+        ]
+
+        visible = _without_private_attachment_exchanges(messages)
+
+        self.assertEqual([message.content for message in visible], ["hello", "Hi.", "continue"])
 
     def test_local_command_exchange_uses_route_guard_when_available(self) -> None:
         store = SimpleNamespace(

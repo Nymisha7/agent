@@ -1216,6 +1216,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "snapshot", "submit", "stream-submit", "complete", "gateway",
             "approve", "deny", "voice-record", "voice-stream", "voice-speak",
+            "attachment-add", "attachment-remove",
         ),
         help=argparse.SUPPRESS,
     )
@@ -1461,7 +1462,9 @@ def parse_search_roots(_workspace_root: Path) -> list[Path]:
 
 
 def load_session_messages(store: SessionStore, session_id: str) -> list[dict[str, Any]]:
-    messages = store.list_messages(session_id, limit=20)
+    messages = _without_private_attachment_exchanges(
+        store.list_messages(session_id, limit=20)
+    )
     return [
         {
             "role": message.role,
@@ -1705,7 +1708,28 @@ def _is_attachment_bridge_command(prompt: str) -> bool:
         parts = shlex.split(prompt)
     except ValueError:
         return False
-    return bool(parts) and parts[0].casefold() == "/__nym_attach"
+    return bool(parts) and parts[0].casefold() in {
+        "/__nym_attach",
+        "/__nym_detach",
+    }
+
+
+def _without_private_attachment_exchanges(messages: list[Any]) -> list[Any]:
+    """Hide composer protocol messages written by older TUI versions."""
+    visible: list[Any] = []
+    skip_command_answer = False
+    for message in messages:
+        role = getattr(message, "role", None)
+        content = getattr(message, "content", "")
+        if role == "user" and _is_attachment_bridge_command(str(content)):
+            skip_command_answer = True
+            continue
+        if skip_command_answer and role == "assistant":
+            skip_command_answer = False
+            continue
+        skip_command_answer = False
+        visible.append(message)
+    return visible
 
 
 def _cli_approval_requester(request: dict[str, Any]) -> str:
@@ -1940,6 +1964,42 @@ def _handle_local_command(
     return str(result)
 
 
+def _attach_pending_file(ctx: AppContext, path: str) -> str:
+    attachment = import_attachment(path, source="user_file")
+    ctx.pending_attachments.append(attachment)
+    ctx.session.pending_attachments.append(attachment.to_store_input())
+    persist_agent_state(ctx)
+    return (
+        f"Attached for next message: {attachment.filename} "
+        f"({attachment.mime}, {attachment.size_bytes} bytes)."
+    )
+
+
+def _detach_pending_attachment(ctx: AppContext, attachment_id: str) -> str:
+    removed = next(
+        (
+            attachment
+            for attachment in ctx.pending_attachments
+            if attachment.id == attachment_id
+        ),
+        None,
+    )
+    if removed is None:
+        return "The selected file is no longer attached."
+    ctx.pending_attachments[:] = [
+        attachment
+        for attachment in ctx.pending_attachments
+        if attachment.id != attachment_id
+    ]
+    ctx.session.pending_attachments[:] = [
+        attachment
+        for attachment in ctx.session.pending_attachments
+        if attachment.get("id") != attachment_id
+    ]
+    persist_agent_state(ctx)
+    return f"Removed attachment: {removed.filename}."
+
+
 def _dispatch_local_command(
     ctx: AppContext,
     user_input: str,
@@ -1963,40 +2023,14 @@ def _dispatch_local_command(
         if len(parts) != 2:
             return "The selected file could not be added."
         try:
-            attachment = import_attachment(parts[1], source="user_file")
+            return _attach_pending_file(ctx, parts[1])
         except ValueError as exc:
             return str(exc)
-        ctx.pending_attachments.append(attachment)
-        ctx.session.pending_attachments.append(attachment.to_store_input())
-        persist_agent_state(ctx)
-        return f"Attached for next message: {attachment.filename} ({attachment.mime}, {attachment.size_bytes} bytes)."
 
     if command == "/__nym_detach":
         if len(parts) != 2:
             return "The selected file could not be removed."
-        attachment_id = parts[1]
-        removed = next(
-            (
-                attachment
-                for attachment in ctx.pending_attachments
-                if attachment.id == attachment_id
-            ),
-            None,
-        )
-        if removed is None:
-            return "The selected file is no longer attached."
-        ctx.pending_attachments[:] = [
-            attachment
-            for attachment in ctx.pending_attachments
-            if attachment.id != attachment_id
-        ]
-        ctx.session.pending_attachments[:] = [
-            attachment
-            for attachment in ctx.session.pending_attachments
-            if attachment.get("id") != attachment_id
-        ]
-        persist_agent_state(ctx)
-        return f"Removed attachment: {removed.filename}."
+        return _detach_pending_attachment(ctx, parts[1])
 
     if command in {"/login", "/auth"}:
         provider = parts[1] if len(parts) >= 2 else _active_provider(ctx)
@@ -4789,6 +4823,36 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
             from .voice import bridge_voice_speak
             text = (args.bridge_prompt or "").strip()
             payload = bridge_voice_speak(text)
+        elif args.tui_bridge == "attachment-add":
+            path = args.bridge_prompt or ""
+            if not path.strip():
+                payload = {
+                    "ok": False,
+                    "error": "Attachment path cannot be empty.",
+                    "snapshot": _tui_bridge_snapshot(ctx),
+                }
+            else:
+                answer = _attach_pending_file(ctx, path)
+                payload = {
+                    "ok": True,
+                    "answer": answer,
+                    "snapshot": _tui_bridge_snapshot(ctx),
+                }
+        elif args.tui_bridge == "attachment-remove":
+            attachment_id = (args.bridge_prompt or "").strip()
+            if not attachment_id:
+                payload = {
+                    "ok": False,
+                    "error": "Attachment id cannot be empty.",
+                    "snapshot": _tui_bridge_snapshot(ctx),
+                }
+            else:
+                answer = _detach_pending_attachment(ctx, attachment_id)
+                payload = {
+                    "ok": True,
+                    "answer": answer,
+                    "snapshot": _tui_bridge_snapshot(ctx),
+                }
         elif args.tui_bridge == "stream-submit":
             prompt = (args.bridge_prompt or "").strip()
             return _run_tui_stream_submit(ctx, prompt)
@@ -4826,7 +4890,9 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
 
 def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
     session = ctx.store.get_session(ctx.session_id)
-    messages = ctx.store.list_messages(ctx.session_id, limit=TUI_TRANSCRIPT_LIMIT)
+    messages = _without_private_attachment_exchanges(
+        ctx.store.list_messages(ctx.session_id, limit=TUI_TRANSCRIPT_LIMIT)
+    )
     return {
         "session": {
             "id": session.id,

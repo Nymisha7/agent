@@ -965,6 +965,16 @@ struct AttachmentPreview {
 enum AppEvent {
     StreamFrame(Result<BridgeStreamFrame>),
     VoiceFrame(Result<BridgeVoiceFrame>),
+    AttachmentMutation {
+        operation: AttachmentMutation,
+        result: Result<BridgeResponse>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum AttachmentMutation {
+    Add { filename: String },
+    Remove { filename: String },
 }
 
 struct TranscriptCache {
@@ -2443,15 +2453,6 @@ fn start_voice_recording(
     });
 }
 
-fn attachment_bridge_prompt(path: &str) -> String {
-    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("/__nym_attach \"{escaped}\"")
-}
-
-fn attachment_detach_bridge_prompt(attachment_id: &str) -> String {
-    format!("/__nym_detach {attachment_id}")
-}
-
 fn submit_attachment_path(
     runtime: &RuntimeHandle,
     args: &Arc<TuiArgs>,
@@ -2463,10 +2464,19 @@ fn submit_attachment_path(
         app.status = String::from("Finish the current task before adding a file");
         return;
     }
-    let draft = std::mem::take(&mut app.input);
-    start_prompt_submission(runtime, args, tx, app, attachment_bridge_prompt(&path));
-    app.input = draft;
-    app.status = format!("Adding {}...", attachment_display_name(&path));
+    let filename = attachment_display_name(&path).into_owned();
+    start_attachment_mutation(
+        runtime,
+        args,
+        tx,
+        app,
+        "attachment-add",
+        path,
+        AttachmentMutation::Add {
+            filename: filename.clone(),
+        },
+    );
+    app.status = format!("Adding {filename}...");
 }
 
 fn attachment_display_name(path: &str) -> Cow<'_, str> {
@@ -2523,7 +2533,14 @@ fn activate_clicked_attachment(
         .is_some_and(|area| mouse_in_rect(column, row, area))
     {
         if let Some(attachment_id) = target.attachment_id.as_deref() {
-            submit_attachment_removal(runtime, args, tx, app, attachment_id.to_string());
+            submit_attachment_removal(
+                runtime,
+                args,
+                tx,
+                app,
+                attachment_id.to_string(),
+                target.filename,
+            );
         }
         return;
     }
@@ -2539,7 +2556,7 @@ fn remove_last_pending_attachment(
     let attachment = app.snapshot.session.pending_attachments.last().cloned();
     if let Some(attachment) = attachment {
         if let Some(attachment_id) = attachment.id {
-            submit_attachment_removal(runtime, args, tx, app, attachment_id);
+            submit_attachment_removal(runtime, args, tx, app, attachment_id, attachment.filename);
         }
     }
 }
@@ -2550,21 +2567,40 @@ fn submit_attachment_removal(
     tx: &mpsc::Sender<AppEvent>,
     app: &mut TuiApp,
     attachment_id: String,
+    filename: String,
 ) {
     if app.submitting || bridge_process_active(app) {
         app.status = String::from("Finish the current task before removing a file");
         return;
     }
-    let draft = std::mem::take(&mut app.input);
-    start_prompt_submission(
+    start_attachment_mutation(
         runtime,
         args,
         tx,
         app,
-        attachment_detach_bridge_prompt(&attachment_id),
+        "attachment-remove",
+        attachment_id,
+        AttachmentMutation::Remove { filename },
     );
-    app.input = draft;
     app.status = String::from("Removing attachment...");
+}
+
+fn start_attachment_mutation(
+    runtime: &RuntimeHandle,
+    args: &Arc<TuiArgs>,
+    tx: &mpsc::Sender<AppEvent>,
+    app: &mut TuiApp,
+    action: &'static str,
+    value: String,
+    operation: AttachmentMutation,
+) {
+    app.submitting = true;
+    let tx = tx.clone();
+    let args = Arc::clone(args);
+    runtime.spawn(async move {
+        let result = call_bridge_async(args.as_ref(), action, Some(&value)).await;
+        let _ = tx.send(AppEvent::AttachmentMutation { operation, result });
+    });
 }
 
 fn load_attachment_preview(target: &AttachmentHitArea, path: &str) -> Result<AttachmentPreview> {
@@ -5792,6 +5828,28 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             clear_voice_recording_state(app);
             push_notice(app, "Voice input", &err.to_string(), true);
             app.status = String::from("Voice input unavailable");
+        }
+        AppEvent::AttachmentMutation { operation, result } => {
+            app.submitting = false;
+            match result {
+                Ok(response) => {
+                    if let Some(snapshot) = response.snapshot {
+                        app.snapshot = snapshot;
+                    }
+                    app.status = match operation {
+                        AttachmentMutation::Add { filename } => {
+                            format!("Attached {filename}")
+                        }
+                        AttachmentMutation::Remove { filename } => {
+                            format!("Removed {filename}")
+                        }
+                    };
+                }
+                Err(err) => {
+                    push_notice(app, "Attachment", &err.to_string(), true);
+                    app.status = String::from("Attachment update failed");
+                }
+            }
         }
         AppEvent::StreamFrame(Err(err)) => {
             app.submitting = false;
