@@ -3,11 +3,11 @@ mod host;
 mod session_store;
 
 use agent_rust::{
-    compact_whitespace, delete_path, edit_file, glob_files, grep_files, read_path,
+    compact_whitespace, delete_path, edit_file, glob_files, grep_files, inspect_tree, read_path,
     resolve_search_roots, resolve_target, search_files, system_search_roots, write_file,
     DeletePathOptions, EditFileOptions, FileSearchOptions, GlobKind, GlobOptions, GrepOptions,
-    ReadLimits, ReadPathOptions, ResolveTargetOptions, SearchKind, SearchMode, SearchStrategy,
-    TargetKind, WriteFileOptions,
+    InspectTreeOptions, ReadLimits, ReadPathOptions, ResolveTargetOptions, SearchKind, SearchMode,
+    SearchStrategy, TargetKind, WriteFileOptions,
 };
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crossterm::event::{
@@ -75,6 +75,7 @@ enum Command {
     Glob(GlobArgs),
     Grep(GrepArgs),
     InspectTarget(InspectTargetArgs),
+    InspectTree(InspectTreeArgs),
     Read(ReadArgs),
     WriteFile(WriteFileArgs),
     EditFile(EditFileArgs),
@@ -258,6 +259,21 @@ struct InspectTargetArgs {
     contains_fallback: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     fuzzy_fallback: bool,
+}
+
+#[derive(Debug, Parser)]
+struct InspectTreeArgs {
+    path: PathBuf,
+    #[arg(long)]
+    workspace_root: PathBuf,
+    #[arg(long, default_value_t = 25)]
+    max_files: usize,
+    #[arg(long, default_value_t = 1_000)]
+    max_entries: usize,
+    #[arg(long, default_value_t = 12_000)]
+    max_bytes_per_file: usize,
+    #[arg(long, default_value_t = 80_000)]
+    max_total_bytes: usize,
 }
 
 fn parse_target_kind(raw: &str) -> TargetKind {
@@ -963,11 +979,11 @@ struct AttachmentPreview {
 
 #[derive(Debug)]
 enum AppEvent {
-    StreamFrame(Result<BridgeStreamFrame>),
+    StreamFrame(Result<Box<BridgeStreamFrame>>),
     VoiceFrame(Result<BridgeVoiceFrame>),
     AttachmentMutation {
         operation: AttachmentMutation,
-        result: Result<BridgeResponse>,
+        result: Box<Result<BridgeResponse>>,
     },
 }
 
@@ -1446,6 +1462,16 @@ fn run_command(command: Command) -> Result<Value> {
             })?;
 
             Ok(serde_json::to_value(resolved)?)
+        }
+        Command::InspectTree(args) => {
+            Ok(serde_json::to_value(inspect_tree(InspectTreeOptions {
+                root: args.path,
+                workspace_root: args.workspace_root,
+                max_files: args.max_files.clamp(1, 300),
+                max_entries: args.max_entries.clamp(10, 5_000),
+                max_bytes_per_file: args.max_bytes_per_file.clamp(1_000, 200_000),
+                max_total_bytes: args.max_total_bytes.clamp(10_000, 800_000),
+            })?)?)
         }
     }
 }
@@ -2599,7 +2625,10 @@ fn start_attachment_mutation(
     let args = Arc::clone(args);
     runtime.spawn(async move {
         let result = call_bridge_async(args.as_ref(), action, Some(&value)).await;
-        let _ = tx.send(AppEvent::AttachmentMutation { operation, result });
+        let _ = tx.send(AppEvent::AttachmentMutation {
+            operation,
+            result: Box::new(result),
+        });
     });
 }
 
@@ -4090,8 +4119,13 @@ fn render_transcript_selection(
         .row
         .min(lines.len().saturating_sub(1))
         .min(inner_height.saturating_sub(1));
-    for row in start_row..=end_row {
-        let line_width = lines[row].chars().count().min(inner_width);
+    for (row, line) in lines
+        .iter()
+        .enumerate()
+        .take(end_row.saturating_add(1))
+        .skip(start_row)
+    {
+        let line_width = line.chars().count().min(inner_width);
         let first = if row == start_row { start.col } else { 0 }.min(line_width);
         let last = if row == end_row {
             end.col.saturating_add(1)
@@ -5831,7 +5865,7 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
         }
         AppEvent::AttachmentMutation { operation, result } => {
             app.submitting = false;
-            match result {
+            match *result {
                 Ok(response) => {
                     if let Some(snapshot) = response.snapshot {
                         app.snapshot = snapshot;
@@ -6612,7 +6646,10 @@ async fn stream_bridge_submit(
         } else {
             None
         };
-        if tx.send(AppEvent::StreamFrame(Ok(parsed))).is_err() {
+        if tx
+            .send(AppEvent::StreamFrame(Ok(Box::new(parsed))))
+            .is_err()
+        {
             stream_error = Some(anyhow::anyhow!("UI event receiver closed"));
             break;
         }
@@ -7353,7 +7390,7 @@ mod tui_tests {
 
         handle_app_event(
             &mut app,
-            AppEvent::StreamFrame(Ok(BridgeStreamFrame {
+            AppEvent::StreamFrame(Ok(Box::new(BridgeStreamFrame {
                 kind: String::from("final"),
                 prompt: None,
                 answer: Some(String::from("Here is the result.")),
@@ -7361,7 +7398,7 @@ mod tui_tests {
                 event: None,
                 snapshot: Some(snapshot),
                 command_result: None,
-            })),
+            }))),
         );
 
         let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
@@ -7405,7 +7442,7 @@ mod tui_tests {
 
         handle_app_event(
             &mut app,
-            AppEvent::StreamFrame(Ok(BridgeStreamFrame {
+            AppEvent::StreamFrame(Ok(Box::new(BridgeStreamFrame {
                 kind: String::from("final"),
                 prompt: None,
                 answer: Some(String::from("Hi!")),
@@ -7413,7 +7450,7 @@ mod tui_tests {
                 event: None,
                 snapshot: None,
                 command_result: None,
-            })),
+            }))),
         );
 
         assert!(app.notices.is_empty());
@@ -7432,7 +7469,7 @@ mod tui_tests {
 
         handle_app_event(
             &mut app,
-            AppEvent::StreamFrame(Ok(BridgeStreamFrame {
+            AppEvent::StreamFrame(Ok(Box::new(BridgeStreamFrame {
                 kind: String::from("submitted"),
                 prompt: Some(String::from("/model ollama qwen2.5:0.5b")),
                 answer: None,
@@ -7440,7 +7477,7 @@ mod tui_tests {
                 event: None,
                 snapshot: None,
                 command_result: None,
-            })),
+            }))),
         );
 
         assert!(app.notices.is_empty());
@@ -7455,7 +7492,7 @@ mod tui_tests {
 
         handle_app_event(
             &mut app,
-            AppEvent::StreamFrame(Ok(BridgeStreamFrame {
+            AppEvent::StreamFrame(Ok(Box::new(BridgeStreamFrame {
                 kind: String::from("final"),
                 prompt: None,
                 answer: Some(String::from("Tell me the exact folder name or path.")),
@@ -7463,7 +7500,7 @@ mod tui_tests {
                 event: None,
                 snapshot: None,
                 command_result: None,
-            })),
+            }))),
         );
 
         let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
@@ -8367,7 +8404,7 @@ mod tui_tests {
 
         handle_app_event(
             &mut app,
-            AppEvent::StreamFrame(Ok(BridgeStreamFrame {
+            AppEvent::StreamFrame(Ok(Box::new(BridgeStreamFrame {
                 kind: String::from("submitted"),
                 prompt: Some(String::from("/install ollama qwen3")),
                 answer: None,
@@ -8375,7 +8412,7 @@ mod tui_tests {
                 event: None,
                 snapshot: None,
                 command_result: None,
-            })),
+            }))),
         );
 
         assert_eq!(app.status, "Preparing local model install preview");
@@ -8395,7 +8432,7 @@ mod tui_tests {
 
         handle_app_event(
             &mut app,
-            AppEvent::StreamFrame(Ok(BridgeStreamFrame {
+            AppEvent::StreamFrame(Ok(Box::new(BridgeStreamFrame {
                 kind: String::from("final"),
                 prompt: None,
                 answer: Some(answer.to_string()),
@@ -8415,7 +8452,7 @@ mod tui_tests {
                         command: String::from("/install ollama qwen3 --yes"),
                     }),
                 }),
-            })),
+            }))),
         );
 
         assert!(!app.submitting);

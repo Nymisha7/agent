@@ -408,6 +408,34 @@ class RustTools:
             timeout=20,
         )
 
+    def inspect_tree(
+        self,
+        *,
+        path: Path | str,
+        workspace_root: Path,
+        max_files: int,
+        max_entries: int,
+        max_bytes_per_file: int,
+        max_total_bytes: int,
+    ) -> Any:
+        return self.run_json(
+            [
+                "inspect-tree",
+                str(path),
+                "--workspace-root",
+                str(workspace_root),
+                "--max-files",
+                str(max_files),
+                "--max-entries",
+                str(max_entries),
+                "--max-bytes-per-file",
+                str(max_bytes_per_file),
+                "--max-total-bytes",
+                str(max_total_bytes),
+            ],
+            timeout=30,
+        )
+
     def write_file(
         self,
         *,

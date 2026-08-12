@@ -39,6 +39,13 @@ from agent.language_servers import LanguageServerManager, LanguageServerSpec
 from agent.tools import ToolContext, _context_file_paths, build_tool_registry
 
 
+RUST_TEST_BIN = Path(__file__).resolve().parents[1] / "agent-rust" / "target" / "debug" / "agent-rust"
+
+
+def _rust_test_tools() -> RustTools:
+    return RustTools(RUST_TEST_BIN)
+
+
 class PlannerToolUseTests(unittest.TestCase):
     def test_reasoning_summary_delta_is_forwarded_without_raw_thoughts(self) -> None:
         summary = _normalize_stream_event(SimpleNamespace(
@@ -2803,7 +2810,7 @@ class PlannerToolUseTests(unittest.TestCase):
                 (nested / f"file_{index}.py").write_text(f"value = {index}\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -2832,7 +2839,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (workspace_root / "RA_clean").mkdir()
             (workspace_root / "agent").mkdir()
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -2857,7 +2864,7 @@ class PlannerToolUseTests(unittest.TestCase):
             for index in range(50):
                 (project / f"file_{index:02}.txt").write_text("value\n")
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -2881,7 +2888,7 @@ class PlannerToolUseTests(unittest.TestCase):
             custom_file.write_text("step build\nstep verify\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -2912,7 +2919,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (project / "kept.log").write_text("keep\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -2938,7 +2945,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (nested / "service.py").write_text("print('ok')\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -2961,7 +2968,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (project / ".secret" / "token.txt").write_text("hidden\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -2985,7 +2992,7 @@ class PlannerToolUseTests(unittest.TestCase):
             (shallow_build / "generated.txt").write_text("generated\n")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -3010,7 +3017,7 @@ class PlannerToolUseTests(unittest.TestCase):
                 self.skipTest("directory symlinks are not supported on this filesystem")
 
             ctx = ToolContext(
-                rust=RustTools(Path("/tmp/agent-rust")),
+                rust=_rust_test_tools(),
                 workspace_root=workspace_root,
                 search_roots=[],
             )
@@ -3055,6 +3062,7 @@ class PlannerToolUseTests(unittest.TestCase):
         class FakeRust:
             def __init__(self, workspace_root: Path) -> None:
                 self.workspace_root = workspace_root
+                self.delegate = _rust_test_tools()
 
             def inspect_target(self, **kwargs: object) -> dict[str, object]:
                 return {
@@ -3066,6 +3074,9 @@ class PlannerToolUseTests(unittest.TestCase):
                         {"path": "sample_project/web_ui", "kind": "directory", "root": str(self.workspace_root)},
                     ],
                 }
+
+            def inspect_tree(self, **kwargs: object) -> object:
+                return self.delegate.inspect_tree(**kwargs)
 
         with TemporaryDirectory() as tmp:
             workspace_root = Path(tmp)

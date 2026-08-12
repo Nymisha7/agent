@@ -11,9 +11,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from openai import OpenAI
-
-
 DEFAULT_MAX_TEXT_ATTACHMENT_BYTES = 512 * 1024
 DEFAULT_MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
@@ -46,6 +43,13 @@ UNAVAILABLE_PROVIDER_TRANSPORTS = frozenset({
     "vertexai",
 })
 AVAILABLE_PROVIDERS = frozenset(SUPPORTED_PROVIDERS) - UNAVAILABLE_PROVIDER_TRANSPORTS
+
+
+def OpenAI(*args: Any, **kwargs: Any) -> Any:
+    """Construct the optional SDK client only when a provider needs it."""
+    from openai import OpenAI as OpenAIClient
+
+    return OpenAIClient(*args, **kwargs)
 
 
 @dataclass

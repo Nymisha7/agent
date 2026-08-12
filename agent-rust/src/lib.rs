@@ -3,6 +3,7 @@ mod delete_path;
 mod edit_file;
 mod glob;
 mod grep;
+mod inspect_tree;
 mod read_path;
 mod ripgrep;
 mod target_resolver;
@@ -11,6 +12,7 @@ mod write_file;
 
 pub use glob::{glob_files, GlobKind, GlobMatch, GlobOptions, GlobResult};
 pub use grep::{grep_files, GrepMatch, GrepOptions, GrepResult};
+pub use inspect_tree::{inspect_tree, InspectTreeOptions, InspectTreeResult};
 pub use read_path::{
     read_path, ContentDetection, ReadContentKind, ReadLimits, ReadPathOptions, ReadPathResult,
 };

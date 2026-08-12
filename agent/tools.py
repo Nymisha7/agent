@@ -1855,23 +1855,16 @@ def _inspect_tree(args: dict[str, Any], ctx: ToolContext) -> Any:
 
     if not root.exists():
         raise ValueError(f"Path does not exist: {root}")
-
-    if root.is_file():
-        return _inspect_single_file(
-            root,
-            workspace_root=ctx.workspace_root,
-            max_bytes=max_bytes_per_file,
-        )
-
-    if not root.is_dir():
+    if not root.is_file() and not root.is_dir():
         raise ValueError(f"Path is not a regular file or directory: {root}")
 
-    direct_children = _directory_children(root, ctx.workspace_root)
     if (
-        _same_path(root, ctx.workspace_root)
+        root.is_dir()
+        and _same_path(root, ctx.workspace_root)
         and not _looks_like_project_root(root)
         and not _bool_arg(args.get("allow_broad_workspace"), default=False)
     ):
+        direct_children = _directory_children(root, ctx.workspace_root)
         return {
             "ok": False,
             "tool": "inspect_tree",
@@ -1887,72 +1880,14 @@ def _inspect_tree(args: dict[str, Any], ctx: ToolContext) -> Any:
                 "Use allow_broad_workspace=true only for an explicit whole-workspace request."
             ),
         }
-    tree: list[dict[str, Any]] = []
-    files: list[dict[str, Any]] = []
-    skipped: list[dict[str, str]] = []
-    total_bytes = 0
-    truncated = False
-
-    project_paths, tree_truncated = _walk_project(root, max_entries=max_entries)
-    if tree_truncated:
-        truncated = True
-
-    for path in project_paths:
-        rel = _relative_display(path, ctx.workspace_root)
-
-        if path.is_dir():
-            tree.append({"path": rel, "kind": "directory"})
-            continue
-
-        if not path.is_file():
-            skipped.append({"path": rel, "reason": "not a regular file"})
-            continue
-
-        tree.append({"path": rel, "kind": "file", "bytes": path.stat().st_size})
-
-        if len(files) >= max_files:
-            skipped.append({"path": rel, "reason": "max file count reached"})
-            truncated = True
-            continue
-
-        if not _looks_readable_text_file(path):
-            skipped.append({"path": rel, "reason": "binary or unsupported file type"})
-            continue
-
-        remaining = max_total_bytes - total_bytes
-        if remaining <= 0:
-            skipped.append({"path": rel, "reason": "max total content bytes reached"})
-            truncated = True
-            continue
-
-        content_limit = min(max_bytes_per_file, remaining)
-        inspected = _read_text_file(path, content_limit)
-        total_bytes += inspected["bytes_read"]
-        files.append(
-            {
-                "path": rel,
-                "bytes": path.stat().st_size,
-                "truncated": inspected["truncated"],
-                "content": inspected["content"],
-            }
-        )
-        if inspected["truncated"]:
-            truncated = True
-
-    return {
-        "path": str(root),
-        "kind": "directory",
-        "direct_children": direct_children,
-        "tree": tree,
-        "files": files,
-        "skipped": skipped,
-        "file_count": len([item for item in tree if item["kind"] == "file"]),
-        "read_file_count": len(files),
-        "bytes_read": total_bytes,
-        "truncated": truncated,
-        "tree_truncated": tree_truncated,
-        "tree_entry_limit": max_entries,
-    }
+    return ctx.rust.inspect_tree(
+        path=root,
+        workspace_root=ctx.workspace_root,
+        max_files=max_files,
+        max_entries=max_entries,
+        max_bytes_per_file=max_bytes_per_file,
+        max_total_bytes=max_total_bytes,
+    )
 
 
 def _secret_scan(args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -2692,45 +2627,6 @@ def _mutation_verification_failure(
     return failed
 
 
-def _inspect_single_file(
-    path: Path,
-    *,
-    workspace_root: Path,
-    max_bytes: int,
-) -> dict[str, Any]:
-    rel = _relative_display(path, workspace_root)
-    if not _looks_readable_text_file(path):
-        return {
-            "path": str(path),
-            "kind": "file",
-            "files": [],
-            "skipped": [{"path": rel, "reason": "binary or unsupported file type"}],
-            "file_count": 1,
-            "read_file_count": 0,
-            "bytes_read": 0,
-            "truncated": False,
-        }
-
-    inspected = _read_text_file(path, max_bytes)
-    return {
-        "path": str(path),
-        "kind": "file",
-        "files": [
-            {
-                "path": rel,
-                "bytes": path.stat().st_size,
-                "truncated": inspected["truncated"],
-                "content": inspected["content"],
-            }
-        ],
-        "skipped": [],
-        "file_count": 1,
-        "read_file_count": 1,
-        "bytes_read": inspected["bytes_read"],
-        "truncated": inspected["truncated"],
-    }
-
-
 def _walk_project(root: Path, *, max_entries: int) -> tuple[list[Path], bool]:
     policy = _walk_policy(root)
     paths: list[Path] = []
@@ -3006,26 +2902,6 @@ def _looks_readable_text_file(path: Path) -> bool:
     except UnicodeDecodeError:
         return False
     return True
-
-
-def _read_text_file(path: Path, max_bytes: int) -> dict[str, Any]:
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        return {
-            "content": f"[Could not read file: {exc}]",
-            "bytes_read": 0,
-            "truncated": False,
-        }
-
-    truncated = len(data) > max_bytes
-    data = data[:max_bytes]
-    text = data.decode("utf-8", errors="replace")
-    return {
-        "content": text,
-        "bytes_read": len(data),
-        "truncated": truncated,
-    }
 
 
 def _relative_display(path: Path, workspace_root: Path) -> str:
