@@ -4604,298 +4604,6 @@ fn role_header(role: &str, detail: &str, agent_name: &str) -> Line<'static> {
     ])
 }
 
-fn terminal_math_text(text: &str) -> String {
-    if !contains_latex_math(text) {
-        return text.to_string();
-    }
-    MathText::new(text).render()
-}
-
-fn contains_latex_math(text: &str) -> bool {
-    let mut remaining = text;
-    while let Some(position) = remaining.find('\\') {
-        let after_slash = &remaining[position + 1..];
-        let Some(first) = after_slash.chars().next() else {
-            return false;
-        };
-        if matches!(first, '(' | ')' | '[' | ']') {
-            return true;
-        }
-        let command_end = after_slash
-            .find(|value: char| !value.is_ascii_alphabetic())
-            .unwrap_or(after_slash.len());
-        let command = &after_slash[..command_end];
-        if math_command(command).is_some()
-            || matches!(
-                command,
-                "frac"
-                    | "sqrt"
-                    | "mathcal"
-                    | "mathbf"
-                    | "mathrm"
-                    | "mathit"
-                    | "text"
-                    | "operatorname"
-                    | "left"
-                    | "right"
-            )
-        {
-            return true;
-        }
-        remaining = &after_slash[first.len_utf8()..];
-    }
-    false
-}
-
-struct MathText<'a> {
-    source: &'a str,
-    position: usize,
-}
-
-impl<'a> MathText<'a> {
-    fn new(source: &'a str) -> Self {
-        Self {
-            source,
-            position: 0,
-        }
-    }
-
-    fn render(mut self) -> String {
-        let mut output = String::with_capacity(self.source.len());
-        while let Some(character) = self.peek() {
-            match character {
-                '\\' => output.push_str(&self.render_command()),
-                '_' | '^' => {
-                    let superscript = character == '^';
-                    self.bump();
-                    let argument = self.render_argument();
-                    if let Some(converted) = script_text(&argument, superscript) {
-                        output.push_str(&converted);
-                    } else {
-                        output.push(if superscript { '^' } else { '_' });
-                        output.push('(');
-                        output.push_str(&argument);
-                        output.push(')');
-                    }
-                }
-                '{' => {
-                    self.bump();
-                    output.push_str(&self.render_nested_group());
-                }
-                '}' => {
-                    self.bump();
-                }
-                _ => {
-                    output.push(character);
-                    self.bump();
-                }
-            }
-        }
-        output
-    }
-
-    fn render_command(&mut self) -> String {
-        self.bump();
-        let Some(next) = self.peek() else {
-            return String::new();
-        };
-        if !next.is_ascii_alphabetic() {
-            self.bump();
-            return match next {
-                '(' | ')' | '[' | ']' | '\\' => String::new(),
-                ',' | ';' | ':' => String::from(" "),
-                '!' => String::new(),
-                '{' | '}' | '_' | '%' | '#' | '&' => next.to_string(),
-                _ => next.to_string(),
-            };
-        }
-
-        let start = self.position;
-        while self.peek().is_some_and(|value| value.is_ascii_alphabetic()) {
-            self.bump();
-        }
-        let command = &self.source[start..self.position];
-        match command {
-            "frac" => {
-                let numerator = self.render_argument();
-                let denominator = self.render_argument();
-                format!("({numerator})/({denominator})")
-            }
-            "sqrt" => format!("√({})", self.render_argument()),
-            "mathcal" => script_capital(&self.render_argument()),
-            "mathbf" | "mathrm" | "mathit" | "text" | "operatorname" => self.render_argument(),
-            "left" | "right" => String::new(),
-            _ => math_command(command).unwrap_or(command).to_string(),
-        }
-    }
-
-    fn render_argument(&mut self) -> String {
-        while self.peek().is_some_and(char::is_whitespace) {
-            self.bump();
-        }
-        if self.peek() == Some('{') {
-            self.bump();
-            return self.render_nested_group();
-        }
-        self.bump()
-            .map_or_else(String::new, |value| value.to_string())
-    }
-
-    fn render_nested_group(&mut self) -> String {
-        let start = self.position;
-        let mut depth = 1usize;
-        while let Some(character) = self.bump() {
-            match character {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let end = self.position.saturating_sub(1);
-                        return MathText::new(&self.source[start..end]).render();
-                    }
-                }
-                _ => {}
-            }
-        }
-        MathText::new(&self.source[start..]).render()
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.source[self.position..].chars().next()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let character = self.peek()?;
-        self.position += character.len_utf8();
-        Some(character)
-    }
-}
-
-fn math_command(command: &str) -> Option<&'static str> {
-    Some(match command {
-        "sum" => "∑",
-        "prod" => "∏",
-        "int" => "∫",
-        "nabla" => "∇",
-        "partial" => "∂",
-        "infty" => "∞",
-        "cdot" => "·",
-        "times" => "×",
-        "pm" => "±",
-        "approx" => "≈",
-        "neq" | "ne" => "≠",
-        "le" | "leq" => "≤",
-        "ge" | "geq" => "≥",
-        "to" | "rightarrow" => "→",
-        "leftarrow" => "←",
-        "leftrightarrow" | "iff" => "↔",
-        "in" => "∈",
-        "notin" => "∉",
-        "forall" => "∀",
-        "exists" => "∃",
-        "alpha" => "α",
-        "beta" => "β",
-        "gamma" => "γ",
-        "delta" => "δ",
-        "epsilon" => "ε",
-        "theta" => "θ",
-        "lambda" => "λ",
-        "mu" => "μ",
-        "pi" => "π",
-        "rho" => "ρ",
-        "sigma" => "σ",
-        "phi" => "φ",
-        "omega" => "ω",
-        _ => return None,
-    })
-}
-
-fn script_text(value: &str, superscript: bool) -> Option<String> {
-    let mut output = String::with_capacity(value.len());
-    for character in value.chars() {
-        output.push(if superscript {
-            superscript_char(character)?
-        } else {
-            subscript_char(character)?
-        });
-    }
-    Some(output)
-}
-
-fn superscript_char(value: char) -> Option<char> {
-    Some(match value {
-        '0' => '⁰',
-        '1' => '¹',
-        '2' => '²',
-        '3' => '³',
-        '4' => '⁴',
-        '5' => '⁵',
-        '6' => '⁶',
-        '7' => '⁷',
-        '8' => '⁸',
-        '9' => '⁹',
-        '+' => '⁺',
-        '-' => '⁻',
-        '=' => '⁼',
-        '(' => '⁽',
-        ')' => '⁾',
-        'i' => 'ⁱ',
-        'n' => 'ⁿ',
-        'L' => 'ᴸ',
-        _ => return None,
-    })
-}
-
-fn subscript_char(value: char) -> Option<char> {
-    Some(match value {
-        '0' => '₀',
-        '1' => '₁',
-        '2' => '₂',
-        '3' => '₃',
-        '4' => '₄',
-        '5' => '₅',
-        '6' => '₆',
-        '7' => '₇',
-        '8' => '₈',
-        '9' => '₉',
-        '+' => '₊',
-        '-' => '₋',
-        '=' => '₌',
-        '(' => '₍',
-        ')' => '₎',
-        'a' => 'ₐ',
-        'e' => 'ₑ',
-        'h' => 'ₕ',
-        'i' => 'ᵢ',
-        'j' => 'ⱼ',
-        'k' => 'ₖ',
-        'l' => 'ₗ',
-        'm' => 'ₘ',
-        'n' => 'ₙ',
-        'o' => 'ₒ',
-        'p' => 'ₚ',
-        'r' => 'ᵣ',
-        's' => 'ₛ',
-        't' => 'ₜ',
-        'u' => 'ᵤ',
-        'v' => 'ᵥ',
-        'x' => 'ₓ',
-        _ => return None,
-    })
-}
-
-fn script_capital(value: &str) -> String {
-    match value {
-        "E" => String::from("ℰ"),
-        "F" => String::from("ℱ"),
-        "H" => String::from("ℋ"),
-        "L" => String::from("ℒ"),
-        "P" => String::from("℘"),
-        "R" => String::from("ℛ"),
-        _ => value.to_string(),
-    }
-}
-
 fn message_body_line(text: &str) -> Line<'static> {
     let mut spans = vec![Span::styled("  | ", Style::default().fg(Color::DarkGray))];
     let trimmed = text.trim_start();
@@ -4952,22 +4660,16 @@ fn markdown_inline_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
             (None, None) => None,
         };
         let Some((start, delimiter)) = marker else {
-            spans.push(Span::styled(terminal_math_text(remaining), base_style));
+            spans.push(Span::styled(remaining.to_string(), base_style));
             break;
         };
         if start > 0 {
-            spans.push(Span::styled(
-                terminal_math_text(&remaining[..start]),
-                base_style,
-            ));
+            spans.push(Span::styled(remaining[..start].to_string(), base_style));
         }
         let after_start = start + delimiter.len();
         let after_marker = &remaining[after_start..];
         let Some(end) = after_marker.find(delimiter) else {
-            spans.push(Span::styled(
-                terminal_math_text(&remaining[start..]),
-                base_style,
-            ));
+            spans.push(Span::styled(remaining[start..].to_string(), base_style));
             break;
         };
         let content = &after_marker[..end];
@@ -4976,14 +4678,7 @@ fn markdown_inline_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
         } else {
             base_style.fg(Color::Cyan).bg(Color::Rgb(28, 28, 28))
         };
-        spans.push(Span::styled(
-            if delimiter == "`" {
-                content.to_string()
-            } else {
-                terminal_math_text(content)
-            },
-            style,
-        ));
+        spans.push(Span::styled(content.to_string(), style));
         remaining = &after_marker[end + delimiter.len()..];
     }
     spans
@@ -5053,7 +4748,7 @@ fn transcript_text(
                         Style::default().fg(Color::Blue),
                     ),
                     Span::styled(
-                        terminal_math_text(line),
+                        line.to_string(),
                         Style::default().fg(if index == 0 {
                             Color::Blue
                         } else {
@@ -7428,18 +7123,19 @@ mod tui_tests {
     }
 
     #[test]
-    fn latex_formulas_are_rendered_as_readable_terminal_math() {
-        let state = terminal_math_text(r"\[ h_L = h_l + \sum_{i=1}^{L-1} f_i(h_i) \]");
-        let gradient = terminal_math_text(
-            r"\nabla_{h_L}\mathcal{E} = \nabla_{h_L}\mathcal{E} + \nabla_{h_L}\mathcal{E}\left(\frac{\partial}{\partial h_i}\sum_{i=1}^{L-1} f_i(h_i)\right)",
-        );
-        let prose = terminal_math_text(r"The hidden state \(h_L\) carries earlier information.");
+    fn mathematical_source_is_preserved_without_symbol_substitution() {
+        let formulas = [
+            r"Attention(Q,K,V)=softmax((QK^{T})/(\sqrt{d_k}))V",
+            r"\int_0^\infty e^{-x^2}\,dx",
+            r"A_{ij} = \sum_{k=1}^n U_{ik}V_{kj}",
+            r"P(A \mid B) = \frac{P(A \cap B)}{P(B)}",
+        ];
 
-        assert_eq!(state, " h_(L) = hₗ + ∑ᵢ₌₁ᴸ⁻¹ fᵢ(hᵢ) ");
-        assert!(gradient.contains("∇_(h_(L))ℰ"));
-        assert!(gradient.contains("(∂)/(∂ hᵢ)"));
-        assert!(!gradient.contains("\\frac"));
-        assert_eq!(prose, "The hidden state h_(L) carries earlier information.");
+        for formula in formulas {
+            let rendered = rendered_text(&Text::from(message_body_line(formula)));
+            assert!(rendered.contains(formula));
+            assert!(!rendered.contains("Ô"));
+        }
 
         let inline_code = rendered_text(&Text::from(message_body_line(r"`\sum_{i=1}`")));
         assert!(inline_code.contains(r"\sum_{i=1}"));
