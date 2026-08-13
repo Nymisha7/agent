@@ -91,3 +91,4 @@ class BundleDistributionTests(unittest.TestCase):
 
         self.assertIn("self.root_is_pure = False", setup_py)
         self.assertIn('return "py3", "none", platform', setup_py)
+        self.assertIn('os.environ.get("CARGO_TARGET_DIR"', setup_py)

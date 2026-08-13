@@ -20,6 +20,14 @@ RUST_MANIFEST = ROOT / "agent-rust" / "Cargo.toml"
 BUILD_REVISION_FILE = "_build_revision"
 
 
+def _rust_target_dir() -> Path:
+    configured = os.environ.get("CARGO_TARGET_DIR", "").strip()
+    if not configured:
+        return ROOT / "agent-rust" / "target"
+    target = Path(configured)
+    return target if target.is_absolute() else ROOT / target
+
+
 class build_py(_build_py):
     """Build and bundle the Rust backend into Python wheels."""
 
@@ -62,7 +70,7 @@ class build_py(_build_py):
             check=True,
         )
         executable = "agent-rust.exe" if sys.platform.startswith("win") else "agent-rust"
-        source = ROOT / "agent-rust" / "target" / "release" / executable
+        source = _rust_target_dir() / "release" / executable
         if not source.is_file():
             raise RuntimeError(f"Rust build completed but backend binary was not found: {source}")
         target_dir = Path(self.build_lib) / "agent" / "bin"

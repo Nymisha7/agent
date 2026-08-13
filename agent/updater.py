@@ -81,7 +81,10 @@ def apply_update() -> int:
             return 1
 
     print("Refreshing the installed Nym runtime...")
-    install = _install_updated_runtime(install_root)
+    install = _install_updated_runtime(
+        install_root,
+        cargo_target_dir=root / "agent-rust" / "target",
+    )
     if temporary_root is not None:
         _run_git(root, "worktree", "remove", "--force", str(install_root))
         temporary_root.cleanup()
@@ -99,8 +102,13 @@ def apply_update() -> int:
     return 0
 
 
-def _install_updated_runtime(root: Path) -> subprocess.CompletedProcess[str]:
+def _install_updated_runtime(
+    root: Path,
+    *,
+    cargo_target_dir: Path,
+) -> subprocess.CompletedProcess[str]:
     environment = credential_free_environment()
+    environment["CARGO_TARGET_DIR"] = str(cargo_target_dir.resolve(strict=False))
     revision = _git_output(root, "rev-parse", "HEAD")
     if revision:
         environment["NYM_BUILD_REVISION"] = revision

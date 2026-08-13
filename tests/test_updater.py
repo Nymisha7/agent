@@ -12,6 +12,7 @@ from agent.main import _tui_update_required, main
 from agent.updater import (
     UPDATE_COMMAND,
     UpdateStatus,
+    _install_updated_runtime,
     apply_update,
     check_for_update,
     update_source_root,
@@ -144,7 +145,29 @@ class UpdaterTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(checkout_head, author_head)
-        install.assert_called_once_with(checkout)
+        install.assert_called_once_with(
+            checkout,
+            cargo_target_dir=checkout / "agent-rust" / "target",
+        )
+
+    def test_runtime_refresh_reuses_managed_cargo_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "checkout"
+            target = Path(tmp) / "managed" / "agent-rust" / "target"
+            root.mkdir()
+            completed = subprocess.CompletedProcess([], 0)
+            with (
+                patch("agent.updater._git_output", return_value="a" * 40),
+                patch("agent.updater.subprocess.run", return_value=completed) as run,
+            ):
+                result = _install_updated_runtime(root, cargo_target_dir=target)
+
+        self.assertIs(result, completed)
+        self.assertEqual(
+            run.call_args.kwargs["env"]["CARGO_TARGET_DIR"],
+            str(target),
+        )
+        self.assertEqual(run.call_args.kwargs["cwd"], root)
 
     def test_diverged_checkout_updates_from_isolated_revision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,7 +191,13 @@ class UpdaterTests(unittest.TestCase):
             _git("push", cwd=author)
             installed_heads: list[str] = []
 
-            def install(root: Path) -> subprocess.CompletedProcess[str]:
+            build_targets: list[Path] = []
+
+            def install(
+                root: Path,
+                *,
+                cargo_target_dir: Path,
+            ) -> subprocess.CompletedProcess[str]:
                 installed_heads.append(
                     subprocess.run(
                         ["git", "rev-parse", "HEAD"],
@@ -178,6 +207,7 @@ class UpdaterTests(unittest.TestCase):
                         text=True,
                     ).stdout.strip()
                 )
+                build_targets.append(cargo_target_dir)
                 return subprocess.CompletedProcess([], 0)
 
             with (
@@ -208,6 +238,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(checkout_head, local_head)
         self.assertEqual(installed_heads, [remote_head])
+        self.assertEqual(build_targets, [checkout / "agent-rust" / "target"])
 
     def test_update_cli_runs_before_tui_or_session_startup(self) -> None:
         with (
