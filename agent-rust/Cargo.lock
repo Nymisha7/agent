@@ -34,6 +34,7 @@ dependencies = [
  "libc",
  "nucleo-matcher",
  "ratatui",
+ "rust-latex-parser",
  "serde",
  "serde_json",
  "sha2",
@@ -1766,6 +1767,12 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "rust-latex-parser"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30b0949524549f0f83d8a14c71e9b378c45307a77bb6ea6bb969d1399d5ae134"
 
 [[package]]
 name = "rustc-demangle"

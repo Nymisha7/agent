@@ -1,5 +1,6 @@
 use anyhow::Result;
 mod host;
+mod math_render;
 mod session_store;
 
 use agent_rust::{
@@ -4696,8 +4697,8 @@ fn transcript_text(
             &message.created_at,
             &snapshot.agent_name,
         ));
-        for line in message.content.lines() {
-            lines.push(message_body_line(line));
+        for line in math_render::message_lines(&message.content) {
+            lines.push(message_body_line(&line));
         }
         if message.content.is_empty() {
             lines.push(message_body_line(""));
@@ -7123,22 +7124,27 @@ mod tui_tests {
     }
 
     #[test]
-    fn mathematical_source_is_preserved_without_symbol_substitution() {
-        let formulas = [
-            r"Attention(Q,K,V)=softmax((QK^{T})/(\sqrt{d_k}))V",
-            r"\int_0^\infty e^{-x^2}\,dx",
-            r"A_{ij} = \sum_{k=1}^n U_{ik}V_{kj}",
-            r"P(A \mid B) = \frac{P(A \cap B)}{P(B)}",
-        ];
+    fn transcript_renders_delimited_math_as_terminal_text() {
+        let mut app = test_app();
+        app.snapshot.messages.push(BridgeMessage {
+            role: String::from("assistant"),
+            content: String::from(concat!(
+                "The standard formula is:\n\n",
+                "\\[\n",
+                "\\text{Attention}(Q, K, V) = ",
+                "\\text{softmax}\\left(\\frac{QK^\\top}{\\sqrt{d_k}}\\right)V\n",
+                "\\]"
+            )),
+            created_at: String::from("now"),
+            attachments: Vec::new(),
+        });
 
-        for formula in formulas {
-            let rendered = rendered_text(&Text::from(message_body_line(formula)));
-            assert!(rendered.contains(formula));
-            assert!(!rendered.contains("Ô"));
-        }
+        let rendered = rendered_text(&transcript_text(&app.snapshot, &app, true));
 
-        let inline_code = rendered_text(&Text::from(message_body_line(r"`\sum_{i=1}`")));
-        assert!(inline_code.contains(r"\sum_{i=1}"));
+        assert!(rendered.contains("Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V"));
+        assert!(!rendered.contains(r"\text"));
+        assert!(!rendered.contains(r"\["));
+        assert!(!rendered.contains("Ô"));
     }
 
     #[test]
