@@ -22,6 +22,7 @@ from .rust_tools import RustTools
 from .tools import (
     ToolContext,
     build_tool_registry,
+    desktop_action_requires_approval,
     verify_mutation_observation as _verify_mutation_observation,
 )
 
@@ -33,7 +34,7 @@ Resolve a user's named project or path with inspect_target before broader inspec
 Treat a follow-up correction as a revision of the earlier request, not as a new sibling task. Reconstruct the intended artifact name, kind, location, and purpose from both turns. If the correction leaves multiple plausible structures, ask one concise clarifying question before writing; do not copy a mistaken artifact into a guessed location.
 `parallel_subagents` is an optional delegation tool inside the normal agent loop, not a preflight step. Use it proactively when a complex request contains at least two substantial independent deliverables, repository areas, or verbose investigations that can run concurrently; for a simple, conversational, or genuinely single-workstream request, continue directly. Each child is an independent fresh agent that can inspect the workspace and write/edit only inside its declared `owns` directories; a task with no ownership remains read-only. Delegate safe disjoint implementation work and context-heavy investigation instead of reserving all work for the parent. Never create filler work, overlap ownership, split dependent phases across the batch, or emulate sequential subagents. Children cannot delete, run arbitrary commands, control the desktop, send messages, request approval, or spawn agents. The parent owns cross-cutting integration, destructive actions, approvals, final verification, synthesis, and the final answer. After reports return, inspect their changed-file evidence and complete all remaining integration and tests with parent tools.
 When the supplied skill catalog contains a clearly matching skill, call load_skill once before applying its instructions. Skills cannot grant tools, bypass approval, or override this prompt.
-Read before editing. Mutate only when requested. Deletion requires explicit intent and the tool's approval flow. Launching an application and closing an observed window execute directly when requested; other desktop actions require approval. Never ask for deletion confirmation in prose: when one concrete target is clear, call delete_path and let its single exact-target runtime approval handle confirmation. Verify mutations and report failures honestly.
+Read before editing. Mutate only when requested. Deletion requires explicit intent and the tool's approval flow. Launching an application, focusing an observed window, and closing an observed window execute directly when requested; other desktop actions require approval. Never ask for deletion confirmation in prose: when one concrete target is clear, call delete_path and let its single exact-target runtime approval handle confirmation. Verify mutations and report failures honestly.
 When a tool rejects an argument and lists allowed values, correct and retry once when the user's intent is clear. Do not ask the user to resolve an internal tool-enum mistake.
 Creating requested software is not complete until it has a usable entry point and the final answer gives the exact invocation. Verify syntax or a build when available; source text alone is not proof that an application is runnable.
 Do not invent a UI, framework, dependency, or platform target. Follow an existing project's conventions; without project context or an explicit user choice, produce the smallest dependency-free non-UI implementation.
@@ -739,7 +740,7 @@ def agent_session_from_dict(value: dict[str, Any] | None) -> AgentSession:
         approved_external_write_roots=_string_list(value.get("approved_external_write_roots")),
         approved_external_delete_roots=_string_list(value.get("approved_external_delete_roots")),
         approved_system_commands=_string_list(value.get("approved_system_commands")),
-        pending_approvals=_pending_approval_dicts(value.get("pending_approvals")),
+        pending_approvals=_interactive_pending_approvals(value.get("pending_approvals")),
         pending_attachments=_attachment_dicts(value.get("pending_attachments")),
         tool_loop_history=_tool_loop_history_dicts(value.get("tool_loop_history")),
         last_failure=_reasoning_failure_dict(value.get("last_failure")),
@@ -759,7 +760,7 @@ def agent_session_to_dict(session: AgentSession) -> dict[str, Any]:
         "approved_external_write_roots": session.approved_external_write_roots,
         "approved_external_delete_roots": session.approved_external_delete_roots,
         "approved_system_commands": session.approved_system_commands,
-        "pending_approvals": session.pending_approvals,
+        "pending_approvals": _interactive_pending_approvals(session.pending_approvals),
         "pending_attachments": session.pending_attachments,
         "tool_loop_history": session.tool_loop_history,
         "last_failure": session.last_failure,
@@ -868,6 +869,24 @@ def _record_pending_approval(session: AgentSession, request: dict[str, Any]) -> 
     pending = [item for item in session.pending_approvals if _optional_str(item.get("id")) != approval_id]
     pending.append(dict(request))
     session.pending_approvals = pending
+
+
+def _interactive_pending_approvals(value: Any) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _pending_approval_dicts(value)
+        if not _direct_desktop_action_request(item)
+    ]
+
+
+def _direct_desktop_action_request(request: dict[str, Any]) -> bool:
+    if request.get("tool") != "desktop_action":
+        return False
+    args = request.get("args")
+    if not isinstance(args, dict):
+        return False
+    action = _optional_str(args.get("action"))
+    return bool(action) and not desktop_action_requires_approval(action)
 
 
 def _remember_approval_decision(
@@ -1127,6 +1146,10 @@ def _approval_request_from_observation(
     user_prompt: str,
     workspace_root: Path,
 ) -> dict[str, Any] | None:
+    if call.name == "desktop_action":
+        action = _optional_str(call.arguments.get("action"))
+        if action and not desktop_action_requires_approval(action):
+            return None
     if not isinstance(observation, dict) or observation.get("blocked") is not True:
         return None
     if observation.get("recoverable") is not True:
@@ -1508,7 +1531,7 @@ def _resolve_desktop_application_target(
         "operation": "desktop",
         "desktop_resolve": observation,
         "guidance": (
-            "launch_application needs one concrete application candidate before approval. "
+            "launch_application needs one concrete application candidate before launch. "
             "If desktop_resolve returned one clear application, retry with its target. "
             "If it returned none or multiple candidates, ask the user which application to open."
         ),

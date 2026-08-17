@@ -800,6 +800,25 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["target"], "0x30a2a")
 
+    def test_focus_window_runs_without_approval(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **kwargs: Any) -> dict[str, object]:
+                return {"ok": True, "verified": True, **kwargs}
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "focus_window", "target": "0x30a2a"},
+            ctx,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["target"], "0x30a2a")
+
     def test_close_window_rejects_dispatched_but_unverified_result(self) -> None:
         class FakeRust:
             def desktop_action(self, **kwargs: Any) -> dict[str, object]:
@@ -1188,7 +1207,7 @@ class PlannerToolUseTests(unittest.TestCase):
             ModelToolCall(
                 name="desktop_action",
                 call_id="call-desktop",
-                arguments={"action": "close_window", "target": "0x40b94"},
+                arguments={"action": "maximize_window", "target": "0x40b94"},
             ),
             {
                 "ok": False,
@@ -1196,9 +1215,9 @@ class PlannerToolUseTests(unittest.TestCase):
                 "recoverable": True,
                 "reason": "desktop_action_requires_approval",
                 "operation": "desktop",
-                "requested_path": "desktop close_window 0x40b94",
+                "requested_path": "desktop maximize_window 0x40b94",
             },
-            user_prompt="close vitelglobal",
+            user_prompt="maximize vitelglobal",
             workspace_root=Path("/workspace"),
         )
         self.assertIsNotNone(request)
@@ -1211,42 +1230,32 @@ class PlannerToolUseTests(unittest.TestCase):
 
         _attach_approval_display_path(session, request)
 
-        self.assertEqual(request["requested_path"], "desktop close_window 0x40b94")
-        self.assertEqual(request["display_path"], "desktop close_window Vitelglobal")
+        self.assertEqual(request["requested_path"], "desktop maximize_window 0x40b94")
+        self.assertEqual(request["display_path"], "desktop maximize_window Vitelglobal")
         self.assertIn("Vitelglobal", _summarize_approval_request(request))
         self.assertNotIn("0x40b94", _summarize_approval_request(request))
 
-    def test_desktop_launch_approval_ignores_stray_value_in_key(self) -> None:
-        request = _approval_request_from_observation(
-            ModelToolCall(
-                name="desktop_action",
-                call_id="call-desktop",
-                arguments={
-                    "action": "launch_application",
-                    "target": "windows-app:abcdef",
-                    "value": "Vitelglobal",
+    def test_direct_desktop_actions_never_create_approval_requests(self) -> None:
+        for action in ("launch_application", "focus_window", "close_window"):
+            request = _approval_request_from_observation(
+                ModelToolCall(
+                    name="desktop_action",
+                    call_id=f"call-{action}",
+                    arguments={"action": action, "target": "desktop-target"},
+                ),
+                {
+                    "ok": False,
+                    "blocked": True,
+                    "recoverable": True,
+                    "reason": "desktop_action_requires_approval",
+                    "operation": "desktop",
+                    "requested_path": f"desktop {action} desktop-target",
                 },
-            ),
-            {
-                "ok": False,
-                "blocked": True,
-                "recoverable": True,
-                "reason": "desktop_action_requires_approval",
-                "operation": "desktop",
-                "requested_path": "desktop launch_application windows-app:abcdef",
-            },
-            user_prompt="open vitelglobal",
-            workspace_root=Path("/workspace"),
-        )
-        self.assertIsNotNone(request)
+                user_prompt="open the app",
+                workspace_root=Path("/workspace"),
+            )
 
-        _attach_approval_display_path(AgentSession(), request)
-
-        self.assertEqual(request["requested_path"], "desktop launch_application windows-app:abcdef")
-        self.assertEqual(request["display_path"], "desktop launch_application Vitelglobal")
-        assert request is not None
-        self.assertEqual(request["operation"], "desktop")
-        self.assertEqual(request["tool"], "desktop_action")
+            self.assertIsNone(request)
 
     def test_write_mutation_is_verified_against_file_hash(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -3208,6 +3217,34 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(restored.tool_loop_history, session.tool_loop_history)
         self.assertEqual(restored.desktop_targets, session.desktop_targets)
         self.assertEqual(restored.last_desktop_snapshot, session.last_desktop_snapshot)
+
+    def test_session_discards_stale_approvals_for_direct_desktop_actions(self) -> None:
+        pending = [
+            {
+                "id": action,
+                "status": "pending",
+                "tool": "desktop_action",
+                "args": {"action": action, "target": "desktop-target"},
+            }
+            for action in ("launch_application", "focus_window", "close_window")
+        ]
+        pending.append({
+            "id": "volume",
+            "status": "pending",
+            "tool": "desktop_action",
+            "args": {"action": "set_volume", "value": "25"},
+        })
+
+        restored = agent_session_from_dict({"pending_approvals": pending})
+
+        self.assertEqual(
+            [item["id"] for item in restored.pending_approvals],
+            ["volume"],
+        )
+        self.assertEqual(
+            [item["id"] for item in agent_session_to_dict(restored)["pending_approvals"]],
+            ["volume"],
+        )
 
     def test_session_keeps_compact_unresolved_tool_outcome(self) -> None:
         session = AgentSession()

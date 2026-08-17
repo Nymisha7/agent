@@ -157,7 +157,7 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
             action_capability("launch_application", linux_supported && (has_gtk_launch || has_xdg_open || (wsl && has_powershell_host)), if has_gtk_launch { "gtk-launch" } else if has_xdg_open { "xdg-open" } else if wsl && has_powershell_host { "windows_host_powershell" } else { "path_lookup" }, "direct", Some("target_required")),
             action_capability("open_path", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
             action_capability("open_url", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
-            action_capability("focus_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool") || (wsl && has_powershell_host)), window_control_backend(), "approval_required", Some("target_required")),
+            action_capability("focus_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool") || (wsl && has_powershell_host)), window_control_backend(), "direct", Some("target_required")),
             action_capability("minimize_window", linux_supported && command_exists("xdotool"), "xdotool", "approval_required", Some("target_required")),
             action_capability("maximize_window", linux_supported && command_exists("wmctrl"), "wmctrl", "approval_required", Some("target_required")),
             action_capability("restore_window", linux_supported && command_exists("wmctrl"), "wmctrl", "approval_required", Some("target_required")),
@@ -4378,7 +4378,7 @@ mod tests {
             .get("actions")
             .and_then(Value::as_array)
             .expect("desktop actions");
-        for action_name in ["launch_application", "close_window"] {
+        for action_name in ["launch_application", "focus_window", "close_window"] {
             let action = actions
                 .iter()
                 .find(|action| action.get("action").and_then(Value::as_str) == Some(action_name))

@@ -109,8 +109,13 @@ DESKTOP_VALUE_REQUIRED_ACTIONS = frozenset({
     "scroll", "invoke_element", "set_field_text",
 })
 DESKTOP_ACTIONS_WITHOUT_APPROVAL = frozenset({
-    "launch_application", "close_window",
+    "launch_application", "focus_window", "close_window",
 })
+
+
+def desktop_action_requires_approval(action: str) -> bool:
+    return action not in DESKTOP_ACTIONS_WITHOUT_APPROVAL
+
 
 TEXT_SUFFIXES = {
     ".cfg",
@@ -841,8 +846,9 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
             schema=_function_schema(
                 name="desktop_action",
                 description=(
-                    "Perform one narrow desktop or device action. Launching an application and closing "
-                    "an observed window run immediately; other actions require explicit user approval. "
+                    "Perform one narrow desktop or device action. Launching an application, focusing an "
+                    "observed window, and closing an observed window run immediately; other actions "
+                    "require explicit user approval. "
                     "Never use this for read-only questions; use connected_devices, system_info, "
                     "or process_list instead. Results include before/after state and verification."
                 ),
@@ -2027,7 +2033,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             "recoverable": True,
             "reason": "desktop_action_target_required",
             "operation": "desktop",
-            "guidance": f"{action} requires a concrete target before approval can be requested.",
+            "guidance": f"{action} requires a concrete target before it can run.",
         }
     if action in DESKTOP_VALUE_REQUIRED_ACTIONS and value is None:
         return {
@@ -2059,7 +2065,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             raise ValueError("set_mute value must be true, false, or toggle.")
         value = value.casefold()
 
-    if action not in DESKTOP_ACTIONS_WITHOUT_APPROVAL:
+    if desktop_action_requires_approval(action):
         approval_key = _desktop_action_approval_key(action, target, value)
         if approval_key not in ctx.approved_system_commands:
             return {

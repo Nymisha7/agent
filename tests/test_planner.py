@@ -667,6 +667,56 @@ def test_desktop_open_intent_runs_without_approval() -> None:
     assert not session.pending_approvals
 
 
+def test_desktop_open_intent_focuses_existing_window_without_approval() -> None:
+    class FocusLLM:
+        mode = "local"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **_kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(output=[{
+                    "type": "function_call",
+                    "name": "desktop_action",
+                    "call_id": "focus-existing-window",
+                    "arguments": '{"action":"focus_window","target":"0x3a00007"}',
+                }], output_text="")
+            return SimpleNamespace(output=[], output_text="Spark is ready.")
+
+    class FakeRust:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def desktop_action(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(dict(kwargs))
+            return {"ok": True, "verified": True, **kwargs}
+
+    rust = FakeRust()
+    session = AgentSession(desktop_targets=[{
+        "kind": "window",
+        "id": "0x3a00007",
+        "target": "0x3a00007",
+        "title": "Spark",
+    }])
+    approvals: list[dict[str, Any]] = []
+
+    answer = run_agent(
+        llm=FocusLLM(),
+        rust=rust,
+        workspace_root=".",
+        user_prompt="open Spark",
+        session=session,
+        approval_requester=lambda request: approvals.append(dict(request)) or "approved",
+    )
+
+    assert answer == "Spark is ready."
+    assert rust.calls == [{"action": "focus_window", "target": "0x3a00007"}]
+    assert not approvals
+    assert not session.pending_approvals
+
+
 def test_file_open_request_does_not_use_desktop_fast_path() -> None:
     class ChatLLM:
         mode = "local"
