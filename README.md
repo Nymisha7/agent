@@ -94,12 +94,26 @@ Type `/` to open the secondary command menu
 for `/model`, `/install`, `/reasoning`, `/skills`, `/gateway`, `/status`, `/setup`,
 `/help`, and `/exit`.
 
-## Voice
+## Credentials and cost
 
 Remote models require each user to configure their own provider credentials.
 Selecting a model whose provider needs an API key opens a masked key field in the
 TUI; the key is saved in Nym's encrypted local credential store. Local model
 providers remain available without an API key.
+
+For OpenAI Responses models, Nym calls the Responses input-token counting endpoint
+with the same instructions, inputs, tools, and conversation state before generation.
+The returned input count is combined with response-reported output, reasoning, and
+cache usage, then priced using the selected model's standard per-token rates. Costs
+are session estimates shown in the TUI; they are not a replacement for the provider's
+invoice and do not include separately billed hosted-tool calls. Unlisted or third-party
+models remain at `$0` unless rates are supplied with
+`AGENT_INPUT_COST_USD_PER_MILLION_TOKENS`,
+`AGENT_CACHED_INPUT_COST_USD_PER_MILLION_TOKENS`,
+`AGENT_CACHE_WRITE_COST_USD_PER_MILLION_TOKENS`, and
+`AGENT_OUTPUT_COST_USD_PER_MILLION_TOKENS`.
+
+## Voice
 
 Voice setup is optional. When voice credentials are missing, the TUI shows a setup
 notice and selecting the microphone opens the same masked key-entry experience. The

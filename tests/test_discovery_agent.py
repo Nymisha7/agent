@@ -33,6 +33,7 @@ class ScriptedLLM:
             "cache_read": 0,
             "cache_write": 0,
         }
+        self.turn_cost_usd = 0.0
 
     def respond(self, **kwargs: Any) -> Any:
         self.requests.append(kwargs)
@@ -42,6 +43,12 @@ class ScriptedLLM:
         usage = dict(self.turn_usage)
         self.turn_usage = {key: 0 for key in self.turn_usage}
         return usage
+
+    def consume_turn_metrics(self) -> tuple[dict[str, int], float]:
+        usage = self.consume_turn_usage()
+        cost_usd = self.turn_cost_usd
+        self.turn_cost_usd = 0.0
+        return usage, cost_usd
 
 
 def tool_call(name: str, arguments: dict[str, Any], call_id: str) -> Any:
@@ -336,10 +343,13 @@ class DiscoveryAgentTests(unittest.TestCase):
                 barrier.wait()
                 return super().respond(**kwargs)
 
-        children = [
-            BarrierLLM([SimpleNamespace(output=[], output_text="first report")]),
-            BarrierLLM([SimpleNamespace(output=[], output_text="second report")]),
-        ]
+        first_child = BarrierLLM([SimpleNamespace(output=[], output_text="first report")])
+        first_child.turn_usage["input"] = 100
+        first_child.turn_cost_usd = 0.10
+        second_child = BarrierLLM([SimpleNamespace(output=[], output_text="second report")])
+        second_child.turn_usage["output"] = 20
+        second_child.turn_cost_usd = 0.20
+        children = [first_child, second_child]
         factory_lock = threading.Lock()
 
         def factory() -> ScriptedLLM:
@@ -371,6 +381,9 @@ class DiscoveryAgentTests(unittest.TestCase):
         self.assertIn("first report", log)
         self.assertIn("second report", log)
         self.assertIn("parallel-only", log)
+        self.assertEqual(parent.turn_usage["input"], 100)
+        self.assertEqual(parent.turn_usage["output"], 20)
+        self.assertAlmostEqual(parent.turn_cost_usd, 0.30)
         event_kinds = [event["kind"] for event in events]
         self.assertEqual(event_kinds[0], "subagent_run_started")
         self.assertEqual(event_kinds[-1], "subagent_run_completed")

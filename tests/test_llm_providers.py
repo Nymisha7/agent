@@ -630,6 +630,63 @@ class LLMProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
             client.respond(instructions="", messages=[{"role": "user", "content": "hi"}], tools=[])
 
+    def test_openai_responses_counts_exact_input_before_generation(self) -> None:
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=True):
+            client = LLMClient(provider="openai", model="gpt-5.4-mini")
+        count = Mock(return_value=SimpleNamespace(input_tokens=123))
+        create = Mock(return_value=SimpleNamespace(
+            output=[],
+            output_text="done",
+            usage=SimpleNamespace(
+                input_tokens=99,
+                output_tokens=10,
+                input_tokens_details=SimpleNamespace(cached_tokens=23),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=4),
+            ),
+        ))
+        client.client = SimpleNamespace(responses=SimpleNamespace(
+            input_tokens=SimpleNamespace(count=count),
+            create=create,
+        ))
+
+        response = client.respond(
+            instructions="Be useful",
+            messages=[{"role": "user", "content": "Hello"}],
+            tools=[],
+        )
+        usage, cost_usd = client.consume_turn_metrics()
+
+        self.assertEqual(response.output_text, "done")
+        self.assertEqual(usage["input"], 123)
+        self.assertEqual(usage["output"], 10)
+        self.assertEqual(usage["cache_read"], 23)
+        self.assertEqual(usage["reasoning"], 4)
+        self.assertEqual(count.call_args.kwargs, create.call_args.kwargs)
+        self.assertAlmostEqual(cost_usd, 0.000121725)
+
+    def test_openai_responses_uses_reported_input_when_count_is_unavailable(self) -> None:
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=True):
+            client = LLMClient(provider="openai", model="gpt-5.4-mini")
+        client.client = SimpleNamespace(responses=SimpleNamespace(
+            input_tokens=SimpleNamespace(count=Mock(side_effect=RuntimeError("unsupported"))),
+            create=Mock(return_value=SimpleNamespace(
+                output=[],
+                output_text="done",
+                usage=SimpleNamespace(input_tokens=77, output_tokens=5),
+            )),
+        ))
+
+        client.respond(
+            instructions="",
+            messages=[{"role": "user", "content": "Hello"}],
+            tools=[],
+        )
+        usage, cost_usd = client.consume_turn_metrics()
+
+        self.assertEqual(usage["input"], 77)
+        self.assertEqual(usage["output"], 5)
+        self.assertGreater(cost_usd, 0.0)
+
     def test_friendly_error_explains_missing_local_model(self) -> None:
         message = _friendly_llm_error(
             Exception("model 'deepseek-chat' not found"),

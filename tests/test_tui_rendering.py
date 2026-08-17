@@ -447,8 +447,7 @@ class TuiRenderingTests(unittest.TestCase):
             session = store.create_session(workspace_root=root)
             llm = SimpleNamespace(
                 reset_turn_usage=Mock(),
-                consume_turn_usage=Mock(return_value={}),
-                estimate_cost_usd=Mock(return_value=0.0),
+                consume_turn_metrics=Mock(return_value=({}, 0.0)),
             )
             ctx = SimpleNamespace(
                 store=store,
@@ -486,8 +485,7 @@ class TuiRenderingTests(unittest.TestCase):
                 session = store.create_session(workspace_root=root)
                 llm = SimpleNamespace(
                     reset_turn_usage=Mock(),
-                    consume_turn_usage=Mock(return_value={}),
-                    estimate_cost_usd=Mock(return_value=0.0),
+                    consume_turn_metrics=Mock(return_value=({}, 0.0)),
                 )
                 ctx = SimpleNamespace(
                     store=store,
@@ -540,8 +538,7 @@ class TuiRenderingTests(unittest.TestCase):
                 )
             llm = SimpleNamespace(
                 reset_turn_usage=Mock(),
-                consume_turn_usage=Mock(return_value={}),
-                estimate_cost_usd=Mock(return_value=0.0),
+                consume_turn_metrics=Mock(return_value=({}, 0.0)),
             )
             ctx = SimpleNamespace(
                 store=store,
@@ -582,8 +579,7 @@ class TuiRenderingTests(unittest.TestCase):
             )
             llm = SimpleNamespace(
                 reset_turn_usage=Mock(),
-                consume_turn_usage=Mock(return_value={}),
-                estimate_cost_usd=Mock(return_value=0.0),
+                consume_turn_metrics=Mock(return_value=({}, 0.0)),
             )
             hooks = SimpleNamespace(emit=Mock())
             ctx = SimpleNamespace(

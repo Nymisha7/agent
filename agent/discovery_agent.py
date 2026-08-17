@@ -206,8 +206,9 @@ class ParallelSubagentRunner:
                         "complete": False,
                         "error": self._policy.redact_text(str(exc)),
                     }
-                usage = child.consume_turn_usage()
+                usage, cost_usd = child.consume_turn_metrics()
                 _merge_usage(self.parent_llm, usage)
+                _merge_cost(self.parent_llm, cost_usd)
                 result["usage"] = usage
                 result["task_id"] = task["id"]
                 results[index] = result
@@ -733,6 +734,11 @@ def _merge_usage(parent_llm: LLMClient, usage: dict[str, int]) -> None:
     for key, value in usage.items():
         if isinstance(value, int):
             turn_usage[key] = int(turn_usage.get(key, 0)) + value
+
+
+def _merge_cost(parent_llm: LLMClient, cost_usd: float) -> None:
+    if isinstance(cost_usd, (int, float)):
+        parent_llm.turn_cost_usd += max(0.0, float(cost_usd))
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:

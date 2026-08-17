@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from .pricing import calculate_token_cost_usd
+
 DEFAULT_MAX_TEXT_ATTACHMENT_BYTES = 512 * 1024
 DEFAULT_MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
@@ -64,6 +66,7 @@ class LLMClient:
     reasoning_effort: str | None = field(default=None, init=False)
     reasoning_summary: str | None = field(default=None, init=False)
     turn_usage: dict[str, int] = field(default_factory=lambda: empty_usage(), init=False)
+    turn_cost_usd: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         self.provider = _normalize_provider(self.provider or os.environ.get("AGENT_LLM_PROVIDER") or "openai")
@@ -370,6 +373,8 @@ class LLMClient:
         if reasoning is not None:
             request_args["reasoning"] = reasoning
 
+        counted_input_tokens = self._count_openai_input_tokens(request_args)
+
         if stream:
             try:
                 with self.client.responses.stream(**request_args) as response_stream:
@@ -386,7 +391,7 @@ class LLMClient:
                 response = self.client.responses.create(**request_args)
             except Exception as exc:
                 raise RuntimeError(_friendly_llm_error(exc, self.provider, self.model, self.endpoint, self.mode)) from exc
-        self._record_usage(response)
+        self._record_usage(response, input_tokens=counted_input_tokens)
         return response
 
     def _respond_openai_chat(
@@ -645,41 +650,60 @@ class LLMClient:
 
     def reset_turn_usage(self) -> None:
         self.turn_usage = empty_usage()
+        self.turn_cost_usd = 0.0
 
     def consume_turn_usage(self) -> dict[str, int]:
         usage = dict(self.turn_usage)
         self.reset_turn_usage()
         return usage
 
+    def consume_turn_metrics(self) -> tuple[dict[str, int], float]:
+        usage = dict(self.turn_usage)
+        cost_usd = self.turn_cost_usd
+        self.reset_turn_usage()
+        return usage, cost_usd
+
     def estimate_cost_usd(self, usage: dict[str, int]) -> float:
-        input_price = _float_env("AGENT_INPUT_COST_USD_PER_MILLION_TOKENS")
-        output_price = _float_env("AGENT_OUTPUT_COST_USD_PER_MILLION_TOKENS")
-        if input_price is None and output_price is None:
-            return 0.0
+        return calculate_token_cost_usd(
+            provider=self.provider,
+            model=self.model,
+            usage=usage,
+        )
 
-        input_cost = (usage.get("input", 0) / 1_000_000) * (input_price or 0.0)
-        output_cost = (usage.get("output", 0) / 1_000_000) * (output_price or 0.0)
-        return input_cost + output_cost
-
-    def _record_usage(self, response: Any) -> None:
+    def _record_usage(self, response: Any, *, input_tokens: int | None = None) -> None:
         usage = _get(response, "usage")
-        if usage is None:
+        if usage is None and input_tokens is None:
             return
 
-        self.turn_usage["input"] += (
-            _int_field(usage, "input_tokens")
-            or _int_field(usage, "prompt_tokens")
+        delta = empty_usage()
+        delta["input"] = input_tokens if input_tokens is not None else (
+            _int_field(usage, "input_tokens") or _int_field(usage, "prompt_tokens")
         )
-        self.turn_usage["output"] += (
+        delta["output"] = (
             _int_field(usage, "output_tokens")
             or _int_field(usage, "completion_tokens")
         )
 
         input_details = _get(usage, "input_tokens_details") or {}
         output_details = _get(usage, "output_tokens_details") or {}
-        self.turn_usage["cache_read"] += _int_field(input_details, "cached_tokens")
-        self.turn_usage["cache_write"] += _int_field(input_details, "cache_creation_tokens")
-        self.turn_usage["reasoning"] += _int_field(output_details, "reasoning_tokens")
+        delta["cache_read"] = _int_field(input_details, "cached_tokens")
+        delta["cache_write"] = _int_field(input_details, "cache_creation_tokens")
+        delta["reasoning"] = _int_field(output_details, "reasoning_tokens")
+        for name, value in delta.items():
+            self.turn_usage[name] += value
+        self.turn_cost_usd += self.estimate_cost_usd(delta)
+
+    def _count_openai_input_tokens(self, request_args: dict[str, Any]) -> int | None:
+        try:
+            response = self.client.responses.input_tokens.count(**request_args)
+        except Exception:
+            # Counting improves accuracy but must not make an otherwise valid
+            # model request unavailable on an older endpoint or SDK.
+            return None
+        value = _get(response, "input_tokens")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return max(0, int(value))
 
 
 def empty_usage() -> dict[str, int]:

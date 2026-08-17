@@ -1586,7 +1586,7 @@ def _run_prompt_turn(
             })
             raise
     finally:
-        usage = ctx.llm.consume_turn_usage()
+        usage, cost_usd = ctx.llm.consume_turn_metrics()
         ctx.store.add_usage(
             ctx.session_id,
             tokens=TokenUsage(
@@ -1596,7 +1596,7 @@ def _run_prompt_turn(
                 cache_read=usage.get("cache_read", 0),
                 cache_write=usage.get("cache_write", 0),
             ),
-            cost_usd=ctx.llm.estimate_cost_usd(usage),
+            cost_usd=cost_usd,
         )
 
     ctx.store.add_event(
