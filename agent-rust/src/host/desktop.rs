@@ -155,7 +155,8 @@ pub(crate) fn desktop_capabilities() -> Result<Value> {
                 Some("target_required"),
             ),
             action_capability("launch_application", linux_supported && (has_gtk_launch || has_xdg_open || (wsl && has_powershell_host)), if has_gtk_launch { "gtk-launch" } else if has_xdg_open { "xdg-open" } else if wsl && has_powershell_host { "windows_host_powershell" } else { "path_lookup" }, "direct", Some("target_required")),
-            action_capability("open_path", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
+            action_capability("open_path", linux_supported && has_xdg_open, "xdg-open", "direct", Some("target_required")),
+            action_capability("open_path_in_application", linux_supported, "application_command", "direct", Some("target_and_value_required")),
             action_capability("open_url", linux_supported && has_xdg_open, "xdg-open", "approval_required", Some("target_required")),
             action_capability("focus_window", linux_supported && (command_exists("wmctrl") || command_exists("xdotool") || (wsl && has_powershell_host)), window_control_backend(), "direct", Some("target_required")),
             action_capability("minimize_window", linux_supported && command_exists("xdotool"), "xdotool", "approval_required", Some("target_required")),
@@ -511,6 +512,11 @@ pub(crate) fn desktop_action(
             launch_desktop_target(action, required_target(action, target)?, false)
         }
         "open_path" => launch_desktop_target(action, required_target(action, target)?, true),
+        "open_path_in_application" => open_path_in_application(
+            action,
+            required_target(action, target)?,
+            value.ok_or_else(|| anyhow::anyhow!("{action} requires an application executable"))?,
+        ),
         "open_url" => {
             let url = required_target(action, target)?;
             if !(url.starts_with("https://") || url.starts_with("http://")) {
@@ -1057,6 +1063,68 @@ fn launch_desktop_target(action: &str, target: &str, use_xdg_open: bool) -> Resu
         "verification": if verified { "confirmed" } else { "not_confirmed" },
         "waited_ms": waited_ms,
         "focus": focus,
+    }))
+}
+
+fn open_path_in_application(action: &str, target: &str, application: &str) -> Result<Value> {
+    let application = application.trim();
+    if !valid_identifier(application) {
+        return Err(anyhow::anyhow!(
+            "{action} requires an application executable identifier"
+        ));
+    }
+    if !command_exists(application) {
+        return Ok(json!({
+            "ok": false,
+            "tool": "desktop_action",
+            "action": action,
+            "target": target,
+            "application": application,
+            "reason": "application_unavailable",
+            "recoverable": true,
+            "error": format!("Application executable `{application}` was not found on PATH."),
+            "guidance": "Select an installed executable available on PATH.",
+        }));
+    }
+    let path = fs::canonicalize(Path::new(target))
+        .map_err(|error| anyhow::anyhow!("Cannot open local path `{target}`: {error}"))?;
+    let child = ProcessCommand::new(application)
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(json!({
+                "ok": false,
+                "tool": "desktop_action",
+                "action": action,
+                "target": path,
+                "application": application,
+                "reason": "application_launch_failed",
+                "recoverable": true,
+                "error": error.to_string(),
+                "guidance": "Verify that the selected executable can launch this path.",
+            }));
+        }
+    };
+    thread::sleep(Duration::from_millis(50));
+    let early_status = child.try_wait()?;
+    let accepted = early_status.map_or(true, |status| status.success());
+    Ok(json!({
+        "ok": accepted,
+        "tool": "desktop_action",
+        "action": action,
+        "target": path,
+        "application": application,
+        "pid": child.id(),
+        "verified": accepted,
+        "verification": if accepted { "invocation_accepted" } else { "command_failed" },
+        "verification_scope": "application_invocation",
+        "exit_code": early_status.and_then(|status| status.code()),
+        "waited_ms": 50,
     }))
 }
 
@@ -4341,7 +4409,7 @@ fn process_state(pid: i32) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        accessibility_target_id, accessibility_tree_item, bounded_accessible_text,
+        accessibility_target_id, accessibility_tree_item, bounded_accessible_text, desktop_action,
         desktop_capabilities, desktop_observe, dialog_items, dialog_kind, hex_decode, hex_encode,
         parse_busctl_string, parse_pactl_mute, parse_pactl_volume_percent, parse_xrandr_displays,
         windows_host_volume_script,
@@ -4378,13 +4446,55 @@ mod tests {
             .get("actions")
             .and_then(Value::as_array)
             .expect("desktop actions");
-        for action_name in ["launch_application", "focus_window", "close_window"] {
+        for action_name in [
+            "launch_application",
+            "open_path",
+            "open_path_in_application",
+            "focus_window",
+            "close_window",
+        ] {
             let action = actions
                 .iter()
                 .find(|action| action.get("action").and_then(Value::as_str) == Some(action_name))
                 .expect("direct desktop action");
             assert_eq!(action.get("safety").and_then(Value::as_str), Some("direct"));
         }
+    }
+
+    #[test]
+    fn opens_an_existing_path_with_a_selected_application() {
+        let result = desktop_action(
+            "open_path_in_application",
+            std::env::temp_dir().to_str(),
+            Some("true"),
+            None,
+            None,
+        )
+        .expect("desktop action");
+
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result.get("application").and_then(Value::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            result.get("verification_scope").and_then(Value::as_str),
+            Some("application_invocation")
+        );
+    }
+
+    #[test]
+    fn open_path_in_application_rejects_shell_shaped_executables() {
+        let error = desktop_action(
+            "open_path_in_application",
+            std::env::temp_dir().to_str(),
+            Some("code;touch"),
+            None,
+            None,
+        )
+        .expect_err("unsafe executable must be rejected");
+
+        assert!(error.to_string().contains("executable identifier"));
     }
 
     #[test]

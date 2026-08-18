@@ -781,6 +781,85 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["target"], "windows-app:abcdef")
 
+    def test_open_path_in_application_resolves_workspace_path_without_approval(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class FakeRust:
+            def desktop_action(self, **kwargs: Any) -> dict[str, object]:
+                calls.append(kwargs)
+                return {"ok": True, "verified": True, **kwargs}
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            project = workspace / "ctt"
+            project.mkdir()
+            ctx = ToolContext(
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=workspace,
+                search_roots=[],
+            )
+
+            result = build_tool_registry(ctx).execute(
+                "desktop_action",
+                {
+                    "action": "open_path_in_application",
+                    "target": "ctt",
+                    "value": "code",
+                },
+                ctx,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[0]["action"], "open_path_in_application")
+        self.assertEqual(calls[0]["target"], str(project.resolve()))
+        self.assertEqual(calls[0]["value"], "code")
+
+    def test_open_url_rejects_non_url_without_calling_rust(self) -> None:
+        class FakeRust:
+            def desktop_action(self, **_kwargs: Any) -> dict[str, object]:
+                raise AssertionError("invalid URL must not reach Rust")
+
+        ctx = ToolContext(
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root=Path("/tmp"),
+            search_roots=[],
+        )
+
+        result = build_tool_registry(ctx).execute(
+            "desktop_action",
+            {"action": "open_url", "target": "vscode://file/missing"},
+            ctx,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "desktop_url_target_invalid")
+
+    def test_open_url_with_existing_local_path_uses_path_action(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class FakeRust:
+            def desktop_action(self, **kwargs: Any) -> dict[str, object]:
+                calls.append(kwargs)
+                return {"ok": True, "verified": True, **kwargs}
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            ctx = ToolContext(
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=workspace,
+                search_roots=[],
+            )
+
+            result = build_tool_registry(ctx).execute(
+                "desktop_action",
+                {"action": "open_url", "target": "."},
+                ctx,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[0]["action"], "open_path")
+        self.assertEqual(calls[0]["target"], str(workspace.resolve()))
+
     def test_close_window_runs_without_approval(self) -> None:
         class FakeRust:
             def desktop_action(self, **kwargs: Any) -> dict[str, object]:
@@ -1236,7 +1315,13 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertNotIn("0x40b94", _summarize_approval_request(request))
 
     def test_direct_desktop_actions_never_create_approval_requests(self) -> None:
-        for action in ("launch_application", "focus_window", "close_window"):
+        for action in (
+            "launch_application",
+            "open_path",
+            "open_path_in_application",
+            "focus_window",
+            "close_window",
+        ):
             request = _approval_request_from_observation(
                 ModelToolCall(
                     name="desktop_action",
@@ -3226,7 +3311,13 @@ class PlannerToolUseTests(unittest.TestCase):
                 "tool": "desktop_action",
                 "args": {"action": action, "target": "desktop-target"},
             }
-            for action in ("launch_application", "focus_window", "close_window")
+            for action in (
+                "launch_application",
+                "open_path",
+                "open_path_in_application",
+                "focus_window",
+                "close_window",
+            )
         ]
         pending.append({
             "id": "volume",

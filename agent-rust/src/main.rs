@@ -3381,7 +3381,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     }
 
     if app.show_cost_details {
-        draw_cost_dialog(frame, area, &app.snapshot.session);
+        draw_cost_dialog(frame, area, &app.snapshot.session, app.submitting);
     }
 
     if !app.snapshot.approvals.is_empty() {
@@ -3623,7 +3623,12 @@ fn draw_approval_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp
     );
 }
 
-fn draw_cost_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, session: &BridgeSession) {
+fn draw_cost_dialog(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    session: &BridgeSession,
+    submitting: bool,
+) {
     let width = area.width.saturating_sub(4).clamp(1, 62);
     let unclassified = (session.cost_usd - session.costs.total()).max(0.0);
     let extra_rows = usize::from(unclassified > 1e-12);
@@ -3704,7 +3709,11 @@ fn draw_cost_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, session: &Bridge
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Green))
-                    .title(" Session token cost "),
+                    .title(if submitting {
+                        " Session token cost - live "
+                    } else {
+                        " Session token cost "
+                    }),
             )
             .wrap(Wrap { trim: false }),
         popup_area,
@@ -5632,8 +5641,6 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
     match event {
         AppEvent::StreamFrame(Ok(frame)) => match frame.kind.as_str() {
             "submitted" => {
-                app.notices
-                    .retain(|notice| notice.title != "Request failed");
                 if let Some(prompt) = frame.prompt {
                     let install_preview = prompt.trim_start().starts_with("/install ")
                         && !install_command_is_confirmed(&prompt);
@@ -7477,7 +7484,7 @@ mod tui_tests {
     }
 
     #[test]
-    fn submitting_a_new_request_clears_the_previous_request_error() {
+    fn submitting_a_new_request_keeps_the_previous_request_error() {
         let mut app = test_app();
         push_notice(
             &mut app,
@@ -7499,7 +7506,8 @@ mod tui_tests {
             }))),
         );
 
-        assert!(app.notices.is_empty());
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].title, "Request failed");
     }
 
     #[test]

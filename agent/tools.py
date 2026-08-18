@@ -92,7 +92,8 @@ DESKTOP_ACTIONS = frozenset({
     "set_volume", "set_mute", "set_brightness",
     "bluetooth_connect", "bluetooth_disconnect",
     "network_connect", "network_disconnect", "eject_storage",
-    "terminate_process", "launch_application", "open_path", "open_url",
+    "terminate_process", "launch_application", "open_path",
+    "open_path_in_application", "open_url",
     "focus_window", "minimize_window", "maximize_window", "restore_window",
     "close_window", "clipboard_write", "send_key", "type_text", "mouse_click",
     "scroll", "focus_element", "invoke_element", "set_field_text",
@@ -100,16 +101,19 @@ DESKTOP_ACTIONS = frozenset({
 DESKTOP_TARGET_REQUIRED_ACTIONS = frozenset({
     "bluetooth_connect", "bluetooth_disconnect", "network_connect",
     "network_disconnect", "eject_storage", "terminate_process",
-    "launch_application", "open_path", "open_url", "focus_window",
+    "launch_application", "open_path", "open_path_in_application", "open_url",
+    "focus_window",
     "minimize_window", "maximize_window", "restore_window", "close_window",
     "mouse_click", "focus_element", "invoke_element", "set_field_text",
 })
 DESKTOP_VALUE_REQUIRED_ACTIONS = frozenset({
     "set_volume", "set_brightness", "clipboard_write", "send_key", "type_text",
     "scroll", "invoke_element", "set_field_text",
+    "open_path_in_application",
 })
 DESKTOP_ACTIONS_WITHOUT_APPROVAL = frozenset({
-    "launch_application", "focus_window", "close_window",
+    "launch_application", "open_path", "open_path_in_application", "focus_window",
+    "close_window",
 })
 
 
@@ -846,11 +850,13 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
             schema=_function_schema(
                 name="desktop_action",
                 description=(
-                    "Perform one narrow desktop or device action. Launching an application, focusing an "
-                    "observed window, and closing an observed window run immediately; other actions "
-                    "require explicit user approval. "
+                    "Perform one narrow desktop or device action. Launching an application, opening a "
+                    "local path, focusing an observed window, and closing an observed window run "
+                    "immediately; other actions require explicit user approval. "
                     "Never use this for read-only questions; use connected_devices, system_info, "
-                    "or process_list instead. Results include before/after state and verification."
+                    "or process_list instead. Use open_path for a local path's default handler, "
+                    "open_path_in_application for a local path in the executable named by value, "
+                    "and open_url only for HTTP(S). Results include execution verification."
                 ),
                 properties={
                     "action": {
@@ -867,7 +873,11 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                     },
                     "value": {
                         "type": "string",
-                        "description": "Action value, such as volume/brightness percent, true/false/toggle, clipboard text, key spec, or text to type.",
+                        "description": (
+                            "Action value, such as an application executable for "
+                            "open_path_in_application, volume/brightness percent, "
+                            "true/false/toggle, clipboard text, key spec, or text to type."
+                        ),
                     },
                 },
                 required=["action"],
@@ -2035,6 +2045,44 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             "operation": "desktop",
             "guidance": f"{action} requires a concrete target before it can run.",
         }
+    if (
+        action == "open_url"
+        and target is not None
+        and not target.casefold().startswith(("http://", "https://"))
+    ):
+        local_target = _desktop_local_path(target, ctx.workspace_root)
+        if local_target.exists():
+            action = "open_path"
+            target = str(local_target.resolve())
+        else:
+            return {
+                "ok": False,
+                "tool": "desktop_action",
+                "blocked": True,
+                "recoverable": True,
+                "reason": "desktop_url_target_invalid",
+                "operation": "desktop",
+                "guidance": (
+                    "open_url accepts only HTTP(S). Use open_path for a local path, or "
+                    "open_path_in_application with an application executable in value."
+                ),
+            }
+    if action in {"open_path", "open_path_in_application"} and target is not None:
+        local_target = _desktop_local_path(target, ctx.workspace_root)
+        if not local_target.exists():
+            return {
+                "ok": False,
+                "tool": "desktop_action",
+                "blocked": True,
+                "recoverable": True,
+                "reason": "desktop_path_unavailable",
+                "operation": "desktop",
+                "target": str(local_target),
+                "guidance": (
+                    "The local path does not exist. Resolve an existing file or directory first."
+                ),
+            }
+        target = str(local_target.resolve())
     if action in DESKTOP_VALUE_REQUIRED_ACTIONS and value is None:
         return {
             "ok": False,
@@ -2044,7 +2092,9 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             "reason": "desktop_action_value_required",
             "operation": "desktop",
             "guidance": (
-                f"{action} requires clipboard text."
+                f"{action} requires an application executable in value."
+                if action == "open_path_in_application"
+                else f"{action} requires clipboard text."
                 if action == "clipboard_write"
                 else f"{action} requires a value."
                 if action in {"send_key", "type_text", "scroll", "invoke_element", "set_field_text"}
@@ -2108,6 +2158,11 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
         })
         return failed
     return result
+
+
+def _desktop_local_path(target: str, workspace_root: Path) -> Path:
+    path = Path(target).expanduser()
+    return path if path.is_absolute() else workspace_root / path
 
 
 def _desktop_send_message(args: dict[str, Any], ctx: ToolContext) -> Any:

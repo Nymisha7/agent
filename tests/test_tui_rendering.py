@@ -972,6 +972,56 @@ class TuiRenderingTests(unittest.TestCase):
 
         self.assertEqual(snapshot["agent_name"], "Nymi")
 
+    def test_tui_bridge_snapshot_includes_live_turn_usage_and_cost(self) -> None:
+        session = SimpleNamespace(
+            id="cost-session",
+            title="Test",
+            workspace_root="/workspace",
+            updated_at="now",
+            cost_usd=0.01,
+            costs=CostUsage(input=0.002, cached_input=0.001, output=0.007),
+            tokens=TokenUsage(input=100, output=50, cache_read=20),
+        )
+        ctx = SimpleNamespace(
+            session_id="cost-session",
+            agent_name="Nymi",
+            llm=SimpleNamespace(
+                model="gpt-5.4-mini",
+                provider="openai",
+                mode="hosted",
+                configuration_error=None,
+                turn_usage={
+                    "input": 30,
+                    "output": 12,
+                    "reasoning": 4,
+                    "cache_read": 5,
+                    "cache_write": 0,
+                },
+                turn_cost_usd=0.003,
+                turn_cost=CostUsage(
+                    input=0.001,
+                    cached_input=0.0005,
+                    output=0.0015,
+                ),
+            ),
+            session=SimpleNamespace(pending_approvals=[]),
+            store=SimpleNamespace(
+                get_session=lambda _: session,
+                list_messages=lambda _session_id, limit=None: [],
+            ),
+        )
+
+        snapshot = _tui_bridge_snapshot(ctx)["session"]
+
+        self.assertAlmostEqual(snapshot["cost_usd"], 0.013)
+        self.assertAlmostEqual(snapshot["costs"]["input"], 0.003)
+        self.assertAlmostEqual(snapshot["costs"]["cached_input"], 0.0015)
+        self.assertAlmostEqual(snapshot["costs"]["output"], 0.0085)
+        self.assertEqual(snapshot["tokens"]["input"], 130)
+        self.assertEqual(snapshot["tokens"]["output"], 62)
+        self.assertEqual(snapshot["tokens"]["reasoning"], 4)
+        self.assertEqual(snapshot["tokens"]["cache_read"], 25)
+
     def test_tui_bridge_snapshot_keeps_unselected_model_neutral(self) -> None:
         ctx = SimpleNamespace(
             session_id="new-session",

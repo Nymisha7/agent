@@ -4904,6 +4904,7 @@ def _run_tui_bridge(args: argparse.Namespace, store: SessionStore) -> int:
 
 def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
     session = ctx.store.get_session(ctx.session_id)
+    metrics = _tui_session_metrics(session, ctx.llm)
     messages = _without_private_attachment_exchanges(
         ctx.store.list_messages(ctx.session_id, limit=TUI_TRANSCRIPT_LIMIT)
     )
@@ -4920,17 +4921,8 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             "configuration": _llm_configuration(ctx),
             "configuration_state": _llm_configuration_state(ctx),
             "context_limit": _context_window_for_model(ctx.llm.model),
-            "cost_usd": session.cost_usd,
-            "costs": {
-                "input": getattr(getattr(session, "costs", None), "input", 0.0),
-                "cached_input": getattr(
-                    getattr(session, "costs", None), "cached_input", 0.0
-                ),
-                "cache_write": getattr(
-                    getattr(session, "costs", None), "cache_write", 0.0
-                ),
-                "output": getattr(getattr(session, "costs", None), "output", 0.0),
-            },
+            "cost_usd": metrics["cost_usd"],
+            "costs": metrics["costs"],
             "pending_attachments": [
                 {
                     "id": attachment.id,
@@ -4942,14 +4934,14 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
                 for attachment in getattr(ctx, "pending_attachments", ())
             ],
             "tokens": {
-                "input": session.tokens.input,
-                "output": session.tokens.output,
+                "input": metrics["tokens"]["input"],
+                "output": metrics["tokens"]["output"],
                 # Keep the TUI bridge token schema compatible with both current
                 # and previously built Rust front ends.  Older binaries require
                 # these counters even when no reasoning or cache tokens exist.
-                "reasoning": session.tokens.reasoning,
-                "cache_read": session.tokens.cache_read,
-                "cache_write": session.tokens.cache_write,
+                "reasoning": metrics["tokens"]["reasoning"],
+                "cache_read": metrics["tokens"]["cache_read"],
+                "cache_write": metrics["tokens"]["cache_write"],
             },
         },
         "agent_name": _agent_display_name(ctx),
@@ -4977,6 +4969,43 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             }
             for item in messages
         ],
+    }
+
+
+def _tui_session_metrics(session: SessionInfo, llm: Any) -> dict[str, Any]:
+    turn_usage = getattr(llm, "turn_usage", None)
+    turn_usage = turn_usage if isinstance(turn_usage, dict) else {}
+    stored_costs = getattr(session, "costs", None)
+    turn_cost = getattr(llm, "turn_cost", None)
+
+    def token(name: str) -> int:
+        stored = max(0, int(getattr(session.tokens, name, 0)))
+        live = turn_usage.get(name, 0)
+        if isinstance(live, bool) or not isinstance(live, (int, float)):
+            live = 0
+        return stored + max(0, int(live))
+
+    def cost(name: str) -> float:
+        stored = getattr(stored_costs, name, 0.0)
+        live = getattr(turn_cost, name, 0.0)
+        stored = float(stored) if isinstance(stored, (int, float)) else 0.0
+        live = float(live) if isinstance(live, (int, float)) else 0.0
+        return max(0.0, stored) + max(0.0, live)
+
+    live_total = getattr(llm, "turn_cost_usd", 0.0)
+    live_total = float(live_total) if isinstance(live_total, (int, float)) else 0.0
+    return {
+        "cost_usd": max(0.0, float(session.cost_usd)) + max(0.0, live_total),
+        "costs": {
+            "input": cost("input"),
+            "cached_input": cost("cached_input"),
+            "cache_write": cost("cache_write"),
+            "output": cost("output"),
+        },
+        "tokens": {
+            name: token(name)
+            for name in ("input", "output", "reasoning", "cache_read", "cache_write")
+        },
     }
 
 
