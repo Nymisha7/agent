@@ -83,6 +83,31 @@ class UpdaterTests(unittest.TestCase):
         self.assertTrue(status.available)
         self.assertEqual(status.count, 1)
 
+    def test_fetch_precedes_validation_of_installed_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            author, checkout = self._repositories(Path(tmp))
+            (author / "change.txt").write_text("new behavior\n")
+            _git("add", "change.txt", cwd=author)
+            _git("commit", "-m", "ship installed runtime", cwd=author)
+            _git("push", cwd=author)
+            installed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=author,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            with (
+                patch.dict("os.environ", {"AGENT_UPDATE_ROOT": str(checkout)}, clear=False),
+                patch("agent.updater._build_revision_marker", return_value=installed),
+            ):
+                status = check_for_update()
+
+        self.assertFalse(status.available)
+        self.assertEqual(status.current, installed[:12])
+        self.assertEqual(status.latest, installed[:12])
+
     def test_update_source_root_honors_explicit_install_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

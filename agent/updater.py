@@ -187,14 +187,14 @@ def check_for_update() -> UpdateStatus:
             error="This installation is not connected to an update checkout.",
         )
 
+    fetch = _run_git(root, "fetch", "--quiet", "--prune", UPDATE_REMOTE)
+    if fetch.returncode != 0:
+        return _status_error(root, _command_error(fetch, "Could not check for updates."))
+
     current_ref = _installed_revision(root)
     current = _git_output(root, "rev-parse", "--short=12", current_ref)
     if current is None:
         return _status_error(root, "Could not read the installed revision.")
-
-    fetch = _run_git(root, "fetch", "--quiet", "--prune", UPDATE_REMOTE)
-    if fetch.returncode != 0:
-        return _status_error(root, _command_error(fetch, "Could not check for updates."), current=current)
 
     upstream = _upstream_ref(root)
     if upstream is None:
