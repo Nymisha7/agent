@@ -760,9 +760,11 @@ struct BridgeSession {
     #[serde(default)]
     pending_attachments: Vec<BridgeAttachment>,
     #[serde(rename = "tokens")]
-    _tokens: BridgeTokens,
+    tokens: BridgeTokens,
     #[serde(default)]
     cost_usd: f64,
+    #[serde(default)]
+    costs: BridgeCosts,
 }
 
 fn ready_configuration_state() -> String {
@@ -776,15 +778,37 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 struct BridgeTokens {
     #[serde(rename = "input")]
-    _input: i64,
+    input: i64,
     #[serde(rename = "output")]
-    _output: i64,
+    output: i64,
     #[serde(default, rename = "reasoning")]
-    _reasoning: i64,
+    reasoning: i64,
     #[serde(default, rename = "cache_read")]
-    _cache_read: i64,
+    cache_read: i64,
     #[serde(default, rename = "cache_write")]
-    _cache_write: i64,
+    cache_write: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BridgeCosts {
+    #[serde(default)]
+    input: f64,
+    #[serde(default)]
+    cached_input: f64,
+    #[serde(default)]
+    cache_write: f64,
+    #[serde(default)]
+    output: f64,
+}
+
+impl BridgeCosts {
+    fn input_total(&self) -> f64 {
+        self.input + self.cached_input + self.cache_write
+    }
+
+    fn total(&self) -> f64 {
+        self.input_total() + self.output
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1013,6 +1037,7 @@ struct TuiApp {
     attachment_path_mode: bool,
     attachment_button_area: Option<Rect>,
     mic_button_area: Option<Rect>,
+    cost_button_area: Option<Rect>,
     pending_action_area: Option<Rect>,
     attachment_hit_areas: Vec<AttachmentHitArea>,
     palette_hit_areas: Vec<PaletteHitArea>,
@@ -1042,6 +1067,7 @@ struct TuiApp {
     setup_required: bool,
     setup_surface: Option<UiSetupSurface>,
     gateway_view: Option<GatewayViewState>,
+    show_cost_details: bool,
     voice_recording: bool,
     voice_session_id: u64,
     voice_cancel_signal: Option<Arc<AtomicBool>>,
@@ -1529,6 +1555,7 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
             attachment_path_mode: false,
             attachment_button_area: None,
             mic_button_area: None,
+            cost_button_area: None,
             pending_action_area: None,
             attachment_hit_areas: Vec::new(),
             palette_hit_areas: Vec::new(),
@@ -1558,6 +1585,7 @@ fn run_tui_blocking(args: Arc<TuiArgs>, runtime: RuntimeHandle) -> Result<()> {
             setup_required: initial_needs_setup,
             setup_surface: initial_setup_surface,
             gateway_view: None,
+            show_cost_details: false,
             voice_recording: false,
             voice_session_id: 0,
             voice_cancel_signal: None,
@@ -1641,6 +1669,15 @@ fn run_tui_loop(
                     {
                         submit_pending_action(&runtime, &args, &tx, &mut app);
                     }
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                        if app.snapshot.approvals.is_empty()
+                            && app.cost_button_area.is_some_and(|area| {
+                                mouse_in_rect(mouse.column, mouse.row, area)
+                            }) =>
+                    {
+                        app.show_cost_details = !app.show_cost_details;
+                    }
+                    _ if app.show_cost_details => {}
                     MouseEventKind::Down(crossterm::event::MouseButton::Left)
                         if app.secret_provider.is_none()
                             && app.snapshot.approvals.is_empty()
@@ -1741,6 +1778,14 @@ fn run_tui_loop(
             continue;
         }
         needs_redraw = true;
+
+        if app.show_cost_details && app.snapshot.approvals.is_empty() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+                app.show_cost_details = false;
+                app.status = String::from("Ready");
+            }
+            continue;
+        }
 
         if app.attachment_preview.is_some() && app.snapshot.approvals.is_empty() {
             match key.code {
@@ -3034,6 +3079,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     app.attachment_hit_areas.clear();
     app.palette_hit_areas.clear();
     app.pending_action_area = None;
+    app.cost_button_area = None;
     let area = frame.area();
     let setup_height = setup_surface_height(app.setup_surface.as_ref(), area.width);
     let [header_area, content_area, setup_area, status_area, composer_area] = Layout::default()
@@ -3164,8 +3210,13 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             width: cost_width,
             height: status_area.height,
         };
+        app.cost_button_area = Some(cost_area);
         frame.render_widget(
-            Paragraph::new(cost_text).style(Style::default().fg(Color::Green)),
+            Paragraph::new(cost_text).style(
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
             cost_area,
         );
     }
@@ -3329,6 +3380,10 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         draw_attachment_preview(frame, area, preview);
     }
 
+    if app.show_cost_details {
+        draw_cost_dialog(frame, area, &app.snapshot.session);
+    }
+
     if !app.snapshot.approvals.is_empty() {
         draw_approval_dialog(frame, area, app);
     }
@@ -3343,6 +3398,7 @@ fn draw_app(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     if app.snapshot.approvals.is_empty()
         && app.gateway_view.is_none()
         && app.attachment_preview.is_none()
+        && !app.show_cost_details
     {
         frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(2)), cursor_y));
     }
@@ -3565,6 +3621,136 @@ fn draw_approval_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp
             .wrap(Wrap { trim: false }),
         popup_area,
     );
+}
+
+fn draw_cost_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, session: &BridgeSession) {
+    let width = area.width.saturating_sub(4).clamp(1, 62);
+    let unclassified = (session.cost_usd - session.costs.total()).max(0.0);
+    let extra_rows = usize::from(unclassified > 1e-12);
+    let height = (13 + extra_rows as u16).min(area.height.saturating_sub(2).max(1));
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let tokens = &session.tokens;
+    let uncached_input = tokens
+        .input
+        .saturating_sub(tokens.cache_read.max(0))
+        .saturating_sub(tokens.cache_write.max(0))
+        .max(0);
+    let mut lines = vec![
+        cost_detail_line("Total", None, session.cost_usd, true),
+        Line::from(""),
+        cost_detail_line(
+            "Input",
+            Some(tokens.input),
+            session.costs.input_total(),
+            true,
+        ),
+        cost_detail_line(
+            "  Uncached",
+            Some(uncached_input),
+            session.costs.input,
+            false,
+        ),
+        cost_detail_line(
+            "  Cached",
+            Some(tokens.cache_read),
+            session.costs.cached_input,
+            false,
+        ),
+        cost_detail_line(
+            "  Cache write",
+            Some(tokens.cache_write),
+            session.costs.cache_write,
+            false,
+        ),
+        cost_detail_line("Output", Some(tokens.output), session.costs.output, true),
+        Line::from(vec![
+            Span::styled("  Reasoning", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "  {} tokens (included in output)",
+                    format_token_count(tokens.reasoning)
+                ),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    ];
+    if unclassified > 1e-12 {
+        lines.push(cost_detail_line("Legacy/other", None, unclassified, false));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Provider  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/{}", session.provider, session.model),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Enter or Esc closes",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green))
+                    .title(" Session token cost "),
+            )
+            .wrap(Wrap { trim: false }),
+        popup_area,
+    );
+}
+
+fn cost_detail_line(
+    label: &str,
+    tokens: Option<i64>,
+    cost_usd: f64,
+    emphasized: bool,
+) -> Line<'static> {
+    let modifier = if emphasized {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    };
+    let token_text = tokens
+        .map(|value| format!("{} tokens", format_token_count(value)))
+        .unwrap_or_default();
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<13}"),
+            Style::default().fg(Color::White).add_modifier(modifier),
+        ),
+        Span::styled(
+            format!("{token_text:>16}"),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(
+            format!("  {:>9}", format_cost_usd(cost_usd)),
+            Style::default().fg(Color::Green).add_modifier(modifier),
+        ),
+    ])
+}
+
+fn format_token_count(value: i64) -> String {
+    let digits = value.max(0).to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    grouped
 }
 
 fn draw_gateway_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, view: &GatewayViewState) {
@@ -6720,14 +6906,15 @@ mod tui_tests {
             model_selected: true,
             _context_limit: Some(128_000),
             pending_attachments: Vec::new(),
-            _tokens: BridgeTokens {
-                _input: 0,
-                _output: 0,
-                _reasoning: 0,
-                _cache_read: 0,
-                _cache_write: 0,
+            tokens: BridgeTokens {
+                input: 0,
+                output: 0,
+                reasoning: 0,
+                cache_read: 0,
+                cache_write: 0,
             },
             cost_usd: 0.0,
+            costs: BridgeCosts::default(),
         }
     }
 
@@ -6749,6 +6936,7 @@ mod tui_tests {
             attachment_path_mode: false,
             attachment_button_area: None,
             mic_button_area: None,
+            cost_button_area: None,
             pending_action_area: None,
             attachment_hit_areas: Vec::new(),
             palette_hit_areas: Vec::new(),
@@ -6778,6 +6966,7 @@ mod tui_tests {
             setup_required: false,
             setup_surface: None,
             gateway_view: None,
+            show_cost_details: false,
             voice_recording: false,
             voice_session_id: 0,
             voice_cancel_signal: None,
@@ -8360,6 +8549,34 @@ mod tui_tests {
         assert_eq!(footer_cost_text(0.0), "cost $0");
         assert_eq!(footer_cost_text(0.0042), "cost $0.0042");
         assert_eq!(footer_cost_text(1.234), "cost $1.23");
+    }
+
+    #[test]
+    fn cost_detail_rows_show_token_counts_and_component_costs() {
+        let rendered = rendered_text(&Text::from(cost_detail_line(
+            "Input",
+            Some(12_345),
+            0.0042,
+            true,
+        )));
+
+        assert!(rendered.contains("Input"));
+        assert!(rendered.contains("12,345 tokens"));
+        assert!(rendered.contains("$0.0042"));
+        assert_eq!(format_token_count(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn bridge_costs_keep_input_and_output_totals_separate() {
+        let costs = BridgeCosts {
+            input: 0.30,
+            cached_input: 0.05,
+            cache_write: 0.10,
+            output: 0.55,
+        };
+
+        assert!((costs.input_total() - 0.45).abs() < f64::EPSILON);
+        assert!((costs.total() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -630,7 +630,7 @@ class LLMProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
             client.respond(instructions="", messages=[{"role": "user", "content": "hi"}], tools=[])
 
-    def test_openai_responses_counts_exact_input_before_generation(self) -> None:
+    def test_openai_responses_uses_actual_usage_after_preflight_count(self) -> None:
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=True):
             client = LLMClient(provider="openai", model="gpt-5.4-mini")
         count = Mock(return_value=SimpleNamespace(input_tokens=123))
@@ -654,15 +654,18 @@ class LLMProviderTests(unittest.TestCase):
             messages=[{"role": "user", "content": "Hello"}],
             tools=[],
         )
-        usage, cost_usd = client.consume_turn_metrics()
+        usage, cost = client.consume_turn_cost_metrics()
 
         self.assertEqual(response.output_text, "done")
-        self.assertEqual(usage["input"], 123)
+        self.assertEqual(usage["input"], 99)
         self.assertEqual(usage["output"], 10)
         self.assertEqual(usage["cache_read"], 23)
         self.assertEqual(usage["reasoning"], 4)
         self.assertEqual(count.call_args.kwargs, create.call_args.kwargs)
-        self.assertAlmostEqual(cost_usd, 0.000121725)
+        self.assertAlmostEqual(cost.input, 0.000057)
+        self.assertAlmostEqual(cost.cached_input, 0.000001725)
+        self.assertAlmostEqual(cost.output, 0.000045)
+        self.assertAlmostEqual(cost.total, 0.000103725)
 
     def test_openai_responses_uses_reported_input_when_count_is_unavailable(self) -> None:
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=True):
@@ -686,6 +689,30 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(usage["input"], 77)
         self.assertEqual(usage["output"], 5)
         self.assertGreater(cost_usd, 0.0)
+
+    def test_openai_responses_uses_preflight_count_when_usage_omits_input(self) -> None:
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=True):
+            client = LLMClient(provider="openai", model="gpt-5.4-mini")
+        client.client = SimpleNamespace(responses=SimpleNamespace(
+            input_tokens=SimpleNamespace(
+                count=Mock(return_value=SimpleNamespace(input_tokens=55))
+            ),
+            create=Mock(return_value=SimpleNamespace(
+                output=[],
+                output_text="done",
+                usage=SimpleNamespace(output_tokens=5),
+            )),
+        ))
+
+        client.respond(
+            instructions="",
+            messages=[{"role": "user", "content": "Hello"}],
+            tools=[],
+        )
+        usage, _cost_usd = client.consume_turn_metrics()
+
+        self.assertEqual(usage["input"], 55)
+        self.assertEqual(usage["output"], 5)
 
     def test_friendly_error_explains_missing_local_model(self) -> None:
         message = _friendly_llm_error(

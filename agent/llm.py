@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from .pricing import calculate_token_cost_usd
+from .pricing import TokenCost, calculate_token_cost, calculate_token_cost_usd
 
 DEFAULT_MAX_TEXT_ATTACHMENT_BYTES = 512 * 1024
 DEFAULT_MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
@@ -67,6 +67,7 @@ class LLMClient:
     reasoning_summary: str | None = field(default=None, init=False)
     turn_usage: dict[str, int] = field(default_factory=lambda: empty_usage(), init=False)
     turn_cost_usd: float = field(default=0.0, init=False)
+    turn_cost: TokenCost = field(default_factory=TokenCost, init=False)
 
     def __post_init__(self) -> None:
         self.provider = _normalize_provider(self.provider or os.environ.get("AGENT_LLM_PROVIDER") or "openai")
@@ -651,6 +652,7 @@ class LLMClient:
     def reset_turn_usage(self) -> None:
         self.turn_usage = empty_usage()
         self.turn_cost_usd = 0.0
+        self.turn_cost = TokenCost()
 
     def consume_turn_usage(self) -> dict[str, int]:
         usage = dict(self.turn_usage)
@@ -663,8 +665,21 @@ class LLMClient:
         self.reset_turn_usage()
         return usage, cost_usd
 
+    def consume_turn_cost_metrics(self) -> tuple[dict[str, int], TokenCost]:
+        usage = dict(self.turn_usage)
+        cost = self.turn_cost
+        self.reset_turn_usage()
+        return usage, cost
+
     def estimate_cost_usd(self, usage: dict[str, int]) -> float:
         return calculate_token_cost_usd(
+            provider=self.provider,
+            model=self.model,
+            usage=usage,
+        )
+
+    def estimate_cost(self, usage: dict[str, int]) -> TokenCost:
+        return calculate_token_cost(
             provider=self.provider,
             model=self.model,
             usage=usage,
@@ -676,9 +691,10 @@ class LLMClient:
             return
 
         delta = empty_usage()
-        delta["input"] = input_tokens if input_tokens is not None else (
-            _int_field(usage, "input_tokens") or _int_field(usage, "prompt_tokens")
-        )
+        reported_input = _optional_int_field(usage, "input_tokens")
+        if reported_input is None:
+            reported_input = _optional_int_field(usage, "prompt_tokens")
+        delta["input"] = reported_input if reported_input is not None else (input_tokens or 0)
         delta["output"] = (
             _int_field(usage, "output_tokens")
             or _int_field(usage, "completion_tokens")
@@ -691,7 +707,9 @@ class LLMClient:
         delta["reasoning"] = _int_field(output_details, "reasoning_tokens")
         for name, value in delta.items():
             self.turn_usage[name] += value
-        self.turn_cost_usd += self.estimate_cost_usd(delta)
+        cost = self.estimate_cost(delta)
+        self.turn_cost = self.turn_cost + cost
+        self.turn_cost_usd += cost.total
 
     def _count_openai_input_tokens(self, request_args: dict[str, Any]) -> int | None:
         try:
@@ -1523,6 +1541,13 @@ def _int_field(value: Any, key: str) -> int:
     if isinstance(raw, float):
         return int(raw)
     return 0
+
+
+def _optional_int_field(value: Any, key: str) -> int | None:
+    raw = _get(value, key)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return max(0, int(raw))
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:

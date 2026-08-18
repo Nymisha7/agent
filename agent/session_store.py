@@ -43,6 +43,22 @@ class TokenUsage:
 
 
 @dataclass(frozen=True)
+class CostUsage:
+    input: float = 0.0
+    cached_input: float = 0.0
+    cache_write: float = 0.0
+    output: float = 0.0
+
+    @property
+    def input_total(self) -> float:
+        return self.input + self.cached_input + self.cache_write
+
+    @property
+    def total(self) -> float:
+        return self.input_total + self.output
+
+
+@dataclass(frozen=True)
 class SessionInfo:
     id: str
     project_id: str | None
@@ -57,6 +73,7 @@ class SessionInfo:
     agent: str | None
     permission: dict[str, Any] | None
     cost_usd: float
+    costs: CostUsage
     tokens: TokenUsage
     summary: str | None
     active_root: str | None

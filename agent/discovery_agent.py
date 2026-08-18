@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - Windows falls back to the process-loca
 
 from .llm import LLMClient
 from .policy import PolicyEngine
+from .pricing import TokenCost
 from .rust_tools import RustTools
 from .session_store import utc_now
 from .tools import ToolContext, build_tool_registry, verify_mutation_observation
@@ -206,9 +207,15 @@ class ParallelSubagentRunner:
                         "complete": False,
                         "error": self._policy.redact_text(str(exc)),
                     }
-                usage, cost_usd = child.consume_turn_metrics()
+                consume_cost_metrics = getattr(child, "consume_turn_cost_metrics", None)
+                if callable(consume_cost_metrics):
+                    usage, cost = consume_cost_metrics()
+                    cost_usd = cost.total
+                    _merge_cost_breakdown(self.parent_llm, cost)
+                else:
+                    usage, cost_usd = child.consume_turn_metrics()
+                    _merge_cost(self.parent_llm, cost_usd)
                 _merge_usage(self.parent_llm, usage)
-                _merge_cost(self.parent_llm, cost_usd)
                 result["usage"] = usage
                 result["task_id"] = task["id"]
                 results[index] = result
@@ -739,6 +746,11 @@ def _merge_usage(parent_llm: LLMClient, usage: dict[str, int]) -> None:
 def _merge_cost(parent_llm: LLMClient, cost_usd: float) -> None:
     if isinstance(cost_usd, (int, float)):
         parent_llm.turn_cost_usd += max(0.0, float(cost_usd))
+
+
+def _merge_cost_breakdown(parent_llm: LLMClient, cost: TokenCost) -> None:
+    parent_llm.turn_cost = parent_llm.turn_cost + cost
+    parent_llm.turn_cost_usd += cost.total
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:

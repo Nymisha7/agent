@@ -56,6 +56,10 @@ create table if not exists sessions (
     agent text,
     permission_json text,
     cost_usd real not null default 0,
+    cost_input_usd real not null default 0,
+    cost_cached_input_usd real not null default 0,
+    cost_cache_write_usd real not null default 0,
+    cost_output_usd real not null default 0,
     tokens_input integer not null default 0,
     tokens_output integer not null default 0,
     tokens_reasoning integer not null default 0,
@@ -285,6 +289,8 @@ pub enum SessionRequest {
         tokens: TokenUsage,
         #[serde(default)]
         cost_usd: f64,
+        #[serde(default)]
+        costs: CostUsage,
     },
     AddEvent {
         session_id: String,
@@ -393,6 +399,30 @@ pub struct TokenUsage {
     pub cache_write: i64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CostUsage {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub cached_input: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+    #[serde(default)]
+    pub output: f64,
+}
+
+impl CostUsage {
+    fn total(&self) -> f64 {
+        self.input + self.cached_input + self.cache_write + self.output
+    }
+
+    fn is_valid(&self) -> bool {
+        [self.input, self.cached_input, self.cache_write, self.output]
+            .into_iter()
+            .all(|value| value.is_finite() && value >= 0.0)
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectInfo {
     pub id: String,
@@ -427,6 +457,7 @@ pub struct SessionInfo {
     pub agent: Option<String>,
     pub permission: Option<Map<String, Value>>,
     pub cost_usd: f64,
+    pub costs: CostUsage,
     pub tokens: TokenUsage,
     pub summary: Option<String>,
     pub active_root: Option<String>,
@@ -906,8 +937,9 @@ impl SessionStore {
                 session_id,
                 tokens,
                 cost_usd,
+                costs,
             } => {
-                self.add_usage(session_id, tokens, cost_usd).await?;
+                self.add_usage(session_id, tokens, cost_usd, costs).await?;
                 Ok(Value::Null)
             }
             SessionRequest::AddEvent {
@@ -1923,9 +1955,23 @@ impl SessionStore {
         session_id: String,
         tokens: TokenUsage,
         cost_usd: f64,
+        costs: CostUsage,
     ) -> StoreResult<()> {
-        if !cost_usd.is_finite() {
-            return Err(StoreError::invalid("cost_usd must be finite."));
+        if !cost_usd.is_finite() || cost_usd < 0.0 {
+            return Err(StoreError::invalid(
+                "cost_usd must be finite and non-negative.",
+            ));
+        }
+        if !costs.is_valid() {
+            return Err(StoreError::invalid(
+                "cost components must be finite and non-negative.",
+            ));
+        }
+        let classified_cost = costs.total();
+        if classified_cost > cost_usd + f64::EPSILON.max(cost_usd.abs() * 1e-9) {
+            return Err(StoreError::invalid(
+                "cost components cannot exceed cost_usd.",
+            ));
         }
         if tokens.input == 0
             && tokens.output == 0
@@ -1933,6 +1979,7 @@ impl SessionStore {
             && tokens.cache_read == 0
             && tokens.cache_write == 0
             && cost_usd == 0.0
+            && classified_cost == 0.0
         {
             return Ok(());
         }
@@ -1947,6 +1994,10 @@ impl SessionStore {
                          tokens_cache_read = tokens_cache_read + ?,
                          tokens_cache_write = tokens_cache_write + ?,
                          cost_usd = cost_usd + ?,
+                         cost_input_usd = cost_input_usd + ?,
+                         cost_cached_input_usd = cost_cached_input_usd + ?,
+                         cost_cache_write_usd = cost_cache_write_usd + ?,
+                         cost_output_usd = cost_output_usd + ?,
                          updated_at = ?
                      where id = ?",
                 )
@@ -1956,6 +2007,10 @@ impl SessionStore {
                 .bind(tokens.cache_read)
                 .bind(tokens.cache_write)
                 .bind(cost_usd)
+                .bind(costs.input)
+                .bind(costs.cached_input)
+                .bind(costs.cache_write)
+                .bind(costs.output)
                 .bind(now)
                 .bind(&session_id)
                 .execute(conn)
@@ -3008,7 +3063,8 @@ fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
 
 const SESSION_SELECT: &str = "select id, project_id, workspace_id, title, workspace_root, cwd,
     created_at, updated_at, provider, model, agent, permission_json,
-    cost_usd, tokens_input, tokens_output, tokens_reasoning,
+    cost_usd, cost_input_usd, cost_cached_input_usd, cost_cache_write_usd,
+    cost_output_usd, tokens_input, tokens_output, tokens_reasoning,
     tokens_cache_read, tokens_cache_write, summary, active_root, focus_path,
     last_prompt, state_json from sessions";
 
@@ -3064,6 +3120,20 @@ fn session_from_row(row: SqliteRow) -> StoreResult<SessionInfo> {
         agent: row.try_get("agent")?,
         permission: json_object(row.try_get("permission_json")?),
         cost_usd: row.try_get::<Option<f64>, _>("cost_usd")?.unwrap_or(0.0),
+        costs: CostUsage {
+            input: row
+                .try_get::<Option<f64>, _>("cost_input_usd")?
+                .unwrap_or(0.0),
+            cached_input: row
+                .try_get::<Option<f64>, _>("cost_cached_input_usd")?
+                .unwrap_or(0.0),
+            cache_write: row
+                .try_get::<Option<f64>, _>("cost_cache_write_usd")?
+                .unwrap_or(0.0),
+            output: row
+                .try_get::<Option<f64>, _>("cost_output_usd")?
+                .unwrap_or(0.0),
+        },
         tokens: TokenUsage {
             input: row.try_get::<Option<i64>, _>("tokens_input")?.unwrap_or(0),
             output: row.try_get::<Option<i64>, _>("tokens_output")?.unwrap_or(0),
@@ -3126,6 +3196,10 @@ async fn migrate_legacy_session_columns(conn: &mut SqliteConnection) -> StoreRes
         ("agent", "text"),
         ("permission_json", "text"),
         ("cost_usd", "real not null default 0"),
+        ("cost_input_usd", "real not null default 0"),
+        ("cost_cached_input_usd", "real not null default 0"),
+        ("cost_cache_write_usd", "real not null default 0"),
+        ("cost_output_usd", "real not null default 0"),
         ("tokens_input", "integer not null default 0"),
         ("tokens_output", "integer not null default 0"),
         ("tokens_reasoning", "integer not null default 0"),

@@ -8,11 +8,93 @@ import unittest
 from unittest.mock import patch
 
 from agent.main import _selected_model, _workspace_root_key, create_new_session
-from agent.session_store import SessionStore
+from agent.session_store import CostUsage, SessionStore, TokenUsage
 from agent.sqlx_session_store import _resolve_rust_binary
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_token_cost_breakdown_round_trips_and_accumulates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root / "sessions.sqlite3")
+            session = store.create_session(
+                workspace_root=root,
+                provider="openai",
+                model="gpt-5.4-mini",
+            )
+            first = CostUsage(
+                input=0.0006,
+                cached_input=0.000015,
+                output=0.00045,
+            )
+            second = CostUsage(input=0.0001, output=0.0002)
+
+            store.add_usage(
+                session.id,
+                tokens=TokenUsage(input=1_000, output=100, cache_read=200),
+                cost_usd=first.total,
+                costs=first,
+            )
+            store.add_usage(
+                session.id,
+                tokens=TokenUsage(input=100, output=20),
+                cost_usd=second.total,
+                costs=second,
+            )
+
+            restored = store.get_session(session.id)
+
+        self.assertAlmostEqual(restored.cost_usd, first.total + second.total)
+        self.assertAlmostEqual(restored.costs.input, 0.0007)
+        self.assertAlmostEqual(restored.costs.cached_input, 0.000015)
+        self.assertAlmostEqual(restored.costs.output, 0.00065)
+        self.assertEqual(restored.tokens.input, 1_100)
+        self.assertEqual(restored.tokens.output, 120)
+
+    def test_existing_session_database_adds_cost_breakdown_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "sessions.sqlite3"
+            with sqlite3.connect(database) as conn:
+                conn.execute(
+                    """create table sessions (
+                        id text primary key, project_id text, workspace_id text,
+                        title text not null, workspace_root text not null, cwd text,
+                        created_at text not null, updated_at text not null,
+                        provider text, model text, agent text, permission_json text,
+                        cost_usd real not null default 0,
+                        tokens_input integer not null default 0,
+                        tokens_output integer not null default 0,
+                        tokens_reasoning integer not null default 0,
+                        tokens_cache_read integer not null default 0,
+                        tokens_cache_write integer not null default 0,
+                        summary text, active_root text, focus_path text,
+                        last_prompt text, state_json text
+                    )"""
+                )
+                conn.execute(
+                    """insert into sessions (
+                        id, title, workspace_root, created_at, updated_at, cost_usd
+                    ) values ('legacy', 'Legacy', ?, 'now', 'now', 0.25)""",
+                    (str(root),),
+                )
+
+            store = SessionStore(database)
+            restored = store.get_session("legacy")
+            with store._connect() as conn:
+                columns = {
+                    row[1] for row in conn.execute("pragma table_info(sessions)")
+                }
+
+        self.assertEqual(restored.cost_usd, 0.25)
+        self.assertEqual(restored.costs, CostUsage())
+        self.assertTrue({
+            "cost_input_usd",
+            "cost_cached_input_usd",
+            "cost_cache_write_usd",
+            "cost_output_usd",
+        }.issubset(columns))
+
     def test_session_database_and_created_directory_are_private(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "private-data"

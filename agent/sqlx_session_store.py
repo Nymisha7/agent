@@ -15,6 +15,7 @@ from .session_store import (
     DEFAULT_SESSION_WRITE_LOCK_ACQUIRE_TIMEOUT_MS,
     EventInfo,
     AttachmentInfo,
+    CostUsage,
     MessageInfo,
     ProjectInfo,
     SessionInfo,
@@ -404,12 +405,14 @@ class SessionStore:
         *,
         tokens: TokenUsage,
         cost_usd: float = 0.0,
+        costs: CostUsage | None = None,
     ) -> None:
         self._call(
             "add_usage",
             session_id=session_id,
             tokens=asdict(tokens),
             cost_usd=cost_usd,
+            costs=asdict(costs or CostUsage()),
         )
 
     def add_event(
@@ -620,6 +623,16 @@ def _token_usage(value: Any) -> TokenUsage:
     )
 
 
+def _cost_usage(value: Any) -> CostUsage:
+    data = _mapping_result(value)
+    return CostUsage(
+        input=float(data.get("input", 0)),
+        cached_input=float(data.get("cached_input", 0)),
+        cache_write=float(data.get("cache_write", 0)),
+        output=float(data.get("output", 0)),
+    )
+
+
 def _session_info(value: Any) -> SessionInfo:
     data = _mapping_result(value)
     tokens = data.get("tokens")
@@ -645,6 +658,7 @@ def _session_info(value: Any) -> SessionInfo:
         agent=data.get("agent"),
         permission=data.get("permission"),
         cost_usd=float(data.get("cost_usd", 0)),
+        costs=_cost_usage(data.get("costs", {})),
         tokens=_token_usage(tokens),
         summary=data.get("summary"),
         active_root=data.get("active_root"),

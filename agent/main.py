@@ -54,7 +54,7 @@ from .planner import (
     run_agent,
 )
 from .rust_tools import RustTools
-from .session_store import SessionInfo, SessionStore, TokenUsage
+from .session_store import CostUsage, SessionInfo, SessionStore, TokenUsage
 from .skills import SkillCatalog, discover_skill_catalog
 from .system_events import drain_system_events, resolve_main_system_event_session_key
 
@@ -1586,7 +1586,20 @@ def _run_prompt_turn(
             })
             raise
     finally:
-        usage, cost_usd = ctx.llm.consume_turn_metrics()
+        consume_cost_metrics = getattr(ctx.llm, "consume_turn_cost_metrics", None)
+        if callable(consume_cost_metrics):
+            recorded_cost_usd = max(0.0, float(getattr(ctx.llm, "turn_cost_usd", 0.0)))
+            usage, turn_cost = consume_cost_metrics()
+            costs = CostUsage(
+                input=turn_cost.input,
+                cached_input=turn_cost.cached_input,
+                cache_write=turn_cost.cache_write,
+                output=turn_cost.output,
+            )
+            cost_usd = max(recorded_cost_usd, costs.total)
+        else:
+            usage, cost_usd = ctx.llm.consume_turn_metrics()
+            costs = CostUsage()
         ctx.store.add_usage(
             ctx.session_id,
             tokens=TokenUsage(
@@ -1597,6 +1610,7 @@ def _run_prompt_turn(
                 cache_write=usage.get("cache_write", 0),
             ),
             cost_usd=cost_usd,
+            costs=costs,
         )
 
     ctx.store.add_event(
@@ -4907,6 +4921,16 @@ def _tui_bridge_snapshot(ctx: AppContext) -> dict[str, Any]:
             "configuration_state": _llm_configuration_state(ctx),
             "context_limit": _context_window_for_model(ctx.llm.model),
             "cost_usd": session.cost_usd,
+            "costs": {
+                "input": getattr(getattr(session, "costs", None), "input", 0.0),
+                "cached_input": getattr(
+                    getattr(session, "costs", None), "cached_input", 0.0
+                ),
+                "cache_write": getattr(
+                    getattr(session, "costs", None), "cache_write", 0.0
+                ),
+                "output": getattr(getattr(session, "costs", None), "output", 0.0),
+            },
             "pending_attachments": [
                 {
                     "id": attachment.id,

@@ -25,21 +25,51 @@ class ModelPricing:
     long_context_threshold: int = LONG_CONTEXT_THRESHOLD
 
 
+@dataclass(frozen=True)
+class TokenCost:
+    input: float = 0.0
+    cached_input: float = 0.0
+    cache_write: float = 0.0
+    output: float = 0.0
+
+    @property
+    def input_total(self) -> float:
+        return self.input + self.cached_input + self.cache_write
+
+    @property
+    def total(self) -> float:
+        return self.input_total + self.output
+
+    def __add__(self, other: object) -> TokenCost:
+        if not isinstance(other, TokenCost):
+            return NotImplemented
+        return TokenCost(
+            input=self.input + other.input,
+            cached_input=self.cached_input + other.cached_input,
+            cache_write=self.cache_write + other.cache_write,
+            output=self.output + other.output,
+        )
+
+
 # Standard processing rates in USD per million text tokens. Keep this catalog in
 # one place so model aliases, snapshots, and pricing updates do not leak into the
 # runtime. Source: https://developers.openai.com/api/docs/pricing
 OPENAI_MODEL_PRICING: Mapping[str, ModelPricing] = {
+    "gpt-5.6": ModelPricing(
+        TokenRates(5.00, 0.50, 30.00, 6.25),
+        TokenRates(10.00, 1.00, 45.00, 12.50),
+    ),
     "gpt-5.6-sol": ModelPricing(
+        TokenRates(5.00, 0.50, 30.00, 6.25),
+        TokenRates(10.00, 1.00, 45.00, 12.50),
+    ),
+    "gpt-5.6-terra": ModelPricing(
         TokenRates(2.50, 0.25, 15.00, 3.125),
         TokenRates(5.00, 0.50, 22.50, 6.25),
     ),
-    "gpt-5.6-terra": ModelPricing(
+    "gpt-5.6-luna": ModelPricing(
         TokenRates(1.00, 0.10, 6.00, 1.25),
         TokenRates(2.00, 0.20, 9.00, 2.50),
-    ),
-    "gpt-5.6-luna": ModelPricing(
-        TokenRates(0.10, 0.01, 0.60, 0.125),
-        TokenRates(0.20, 0.02, 0.90, 0.25),
     ),
     "gpt-5.5-pro": ModelPricing(
         TokenRates(30.00, None, 180.00),
@@ -75,10 +105,19 @@ def calculate_token_cost_usd(
     model: str | None,
     usage: Mapping[str, int],
 ) -> float:
+    return calculate_token_cost(provider=provider, model=model, usage=usage).total
+
+
+def calculate_token_cost(
+    *,
+    provider: str | None,
+    model: str | None,
+    usage: Mapping[str, int],
+) -> TokenCost:
     pricing = _pricing_for(provider, model)
     rates = _rates_with_overrides(pricing, usage)
     if rates is None:
-        return 0.0
+        return TokenCost()
 
     input_tokens = _token_count(usage, "input")
     cached_tokens = min(input_tokens, _token_count(usage, "cache_read"))
@@ -91,12 +130,12 @@ def calculate_token_cost_usd(
 
     cached_rate = rates.cached_input if rates.cached_input is not None else rates.input
     cache_write_rate = rates.cache_write if rates.cache_write is not None else rates.input
-    return (
-        uncached_tokens * rates.input
-        + cached_tokens * cached_rate
-        + cache_write_tokens * cache_write_rate
-        + output_tokens * rates.output
-    ) / MILLION_TOKENS
+    return TokenCost(
+        input=uncached_tokens * rates.input / MILLION_TOKENS,
+        cached_input=cached_tokens * cached_rate / MILLION_TOKENS,
+        cache_write=cache_write_tokens * cache_write_rate / MILLION_TOKENS,
+        output=output_tokens * rates.output / MILLION_TOKENS,
+    )
 
 
 def _pricing_for(provider: str | None, model: str | None) -> ModelPricing | None:

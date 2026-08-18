@@ -58,7 +58,7 @@ from agent.main import (
     run_tui,
 )
 from agent.planner import AgentSession
-from agent.session_store import SessionStore, TokenUsage
+from agent.session_store import CostUsage, SessionStore, TokenUsage
 from agent.system_events import enqueue_system_event, reset_system_events_for_test
 
 
@@ -1062,6 +1062,11 @@ class TuiRenderingTests(unittest.TestCase):
                     workspace_root="/workspace",
                     updated_at="now",
                     cost_usd=0.0123,
+                    costs=CostUsage(
+                        input=0.002,
+                        cached_input=0.0001,
+                        output=0.0102,
+                    ),
                     tokens=TokenUsage(),
                 ),
                 list_messages=lambda _session_id, limit=None: seen_limits.append(limit) or [],
@@ -1080,6 +1085,15 @@ class TuiRenderingTests(unittest.TestCase):
             {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0},
         )
         self.assertEqual(snapshot["session"]["cost_usd"], 0.0123)
+        self.assertEqual(
+            snapshot["session"]["costs"],
+            {
+                "input": 0.002,
+                "cached_input": 0.0001,
+                "cache_write": 0.0,
+                "output": 0.0102,
+            },
+        )
         self.assertEqual(seen_limits, [TUI_TRANSCRIPT_LIMIT])
 
     def test_tui_bridge_snapshot_exposes_stored_attachment_for_ui_opening(self) -> None:
