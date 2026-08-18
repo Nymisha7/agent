@@ -856,7 +856,9 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                     "Never use this for read-only questions; use connected_devices, system_info, "
                     "or process_list instead. Use open_path for a local path's default handler, "
                     "open_path_in_application for a local path in the executable named by value, "
-                    "and open_url only for HTTP(S). Results include execution verification."
+                    "and open_url only for HTTP(S). open_path_in_application launches the selected "
+                    "application when needed; do not call launch_application first. Results include "
+                    "execution verification."
                 ),
                 properties={
                     "action": {

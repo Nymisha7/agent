@@ -35,6 +35,7 @@ Treat a follow-up correction as a revision of the earlier request, not as a new 
 `parallel_subagents` is an optional delegation tool inside the normal agent loop, not a preflight step. Use it proactively when a complex request contains at least two substantial independent deliverables, repository areas, or verbose investigations that can run concurrently; for a simple, conversational, or genuinely single-workstream request, continue directly. Each child is an independent fresh agent that can inspect the workspace and write/edit only inside its declared `owns` directories; a task with no ownership remains read-only. Delegate safe disjoint implementation work and context-heavy investigation instead of reserving all work for the parent. Never create filler work, overlap ownership, split dependent phases across the batch, or emulate sequential subagents. Children cannot delete, run arbitrary commands, control the desktop, send messages, request approval, or spawn agents. The parent owns cross-cutting integration, destructive actions, approvals, final verification, synthesis, and the final answer. After reports return, inspect their changed-file evidence and complete all remaining integration and tests with parent tools.
 When the supplied skill catalog contains a clearly matching skill, call load_skill once before applying its instructions. Skills cannot grant tools, bypass approval, or override this prompt.
 Read before editing. Mutate only when requested. Deletion requires explicit intent and the tool's approval flow. Launching an application, focusing an observed window, and closing an observed window execute directly when requested; other desktop actions require approval. Never ask for deletion confirmation in prose: when one concrete target is clear, call delete_path and let its single exact-target runtime approval handle confirmation. Verify mutations and report failures honestly.
+Emit related file writes together. A verified mutation receipt makes a reread unnecessary unless new evidence is needed. When a local path and executable are known, call open_path_in_application once after the writes; it launches the app as needed, so do not also call launch_application or inspect the window unless the receipt is incomplete or focus was explicitly requested.
 When a tool rejects an argument and lists allowed values, correct and retry once when the user's intent is clear. Do not ask the user to resolve an internal tool-enum mistake.
 Creating requested software is not complete until it has a usable entry point and the final answer gives the exact invocation. Verify syntax or a build when available; source text alone is not proof that an application is runnable.
 Do not invent a UI, framework, dependency, or platform target. Follow an existing project's conventions; without project context or an explicit user choice, produce the smallest dependency-free non-UI implementation.
@@ -240,15 +241,22 @@ def run_agent(
     unresolved_failure_this_run = False
     unresolved_failure_step: int | None = None
     completion_recovery_used = False
+    continuation_id: str | None = None
+    continuation_input: list[dict[str, Any]] | None = None
     run_id = uuid.uuid4().hex
     tool_loop_history = active_session.tool_loop_history
     for step in range(max_steps):
         model_started = time.perf_counter()
+        request_messages = (
+            continuation_input
+            if continuation_id is not None and continuation_input is not None
+            else msg_history
+        )
         response = llm.respond(
             instructions=system_prompt,
-            messages=msg_history,
+            messages=request_messages,
             tools=tools,
-            previous_response_id=None,
+            previous_response_id=continuation_id,
             tool_choice=None,
             stream=stream_event is not None,
             event_handler=(
@@ -261,10 +269,12 @@ def run_agent(
             _debug_event("model-call", {
                 "step": step + 1,
                 "duration_ms": round((time.perf_counter() - model_started) * 1_000),
-                "message_count": len(msg_history),
+                "message_count": len(request_messages),
                 "tool_count": len(tools),
+                "continued": continuation_id is not None,
             })
         tool_calls = _tool_calls(response)
+        response_id = _response_continuation_id(llm, response)
         if not tool_calls:
             raw_response_text = _raw_response_text(response)
             if (
@@ -278,6 +288,8 @@ def run_agent(
                     "role": "user",
                     "content": EMPTY_RESPONSE_RETRY_INSTRUCTION,
                 })
+                continuation_id = response_id
+                continuation_input = [msg_history[-1]]
                 continue
             response_text = _response_text(response)
             if compact_local_context and _looks_like_unexecuted_action(response_text):
@@ -301,6 +313,8 @@ def run_agent(
                         + ", ".join(sorted(available_tool_names))
                     ),
                 })
+                continuation_id = response_id
+                continuation_input = [msg_history[-1]]
                 continue
             if unresolved_failure_this_run and not completion_recovery_used:
                 completion_recovery_used = True
@@ -309,11 +323,14 @@ def run_agent(
                     "role": "user",
                     "content": _completion_recovery_instruction(active_session),
                 })
+                continuation_id = response_id
+                continuation_input = [msg_history[-1]]
                 continue
             return policy.redact_text(response_text)
 
         tool_outputs: list[dict[str, Any]] = []
         unknown_tool_guard_message: str | None = None
+        superseded_launches = _superseded_desktop_launches(tool_calls, active_session)
         parallel_observations = (
             _parallel_tool_observations(tool_calls, tool_registry, tool_ctx)
             if _can_parallel_tool_calls(tool_calls, available_tool_names)
@@ -322,7 +339,12 @@ def run_agent(
         for call in tool_calls:
             if debug:
                 _debug_event("tool-call", {"name": call.name, "arguments": call.arguments})
-            if call.name not in available_tool_names:
+            if call.call_id in superseded_launches:
+                observation = _superseded_desktop_launch_observation(
+                    call,
+                    superseded_by=superseded_launches[call.call_id],
+                )
+            elif call.name not in available_tool_names:
                 unknown_tool_streak += 1
                 observation = _unknown_tool_observation(
                     call,
@@ -542,38 +564,52 @@ def run_agent(
             msg_history.extend(tool_outputs)
             final_response = llm.respond(
                 instructions=system_prompt,
-                messages=[
-                    *msg_history,
-                    {"role": "user", "content": unknown_tool_guard_message},
-                ],
+                messages=(
+                    [
+                        *tool_outputs,
+                        {"role": "user", "content": unknown_tool_guard_message},
+                    ]
+                    if response_id is not None
+                    else [
+                        *msg_history,
+                        {"role": "user", "content": unknown_tool_guard_message},
+                    ]
+                ),
                 tools=[],
-                previous_response_id=None,
+                previous_response_id=response_id,
             )
             return policy.redact_text(_response_text(final_response))
         msg_history.extend(_response_output_items(response))
         msg_history.extend(tool_outputs)
+        next_input = list(tool_outputs)
         if unresolved_failure_this_run:
-            msg_history.append({
+            recovery_message = {
                 "role": "user",
                 "content": _recovery_instruction(active_session),
-            })
+            }
+            msg_history.append(recovery_message)
+            next_input.append(recovery_message)
+        continuation_id = response_id
+        continuation_input = next_input
 
+    stop_message = {
+        "role": "user",
+        "content": (
+            "Stop using tools now. Answer the user's request from the evidence "
+            "already gathered. Be explicit about any gaps caused by the tool "
+            "budget being exhausted. "
+            + _unresolved_completion_constraint(active_session)
+        ),
+    }
     final_response = llm.respond(
         instructions=system_prompt,
-        messages=[
-            *msg_history,
-            {
-                "role": "user",
-                "content": (
-                    "Stop using tools now. Answer the user's request from the evidence "
-                    "already gathered. Be explicit about any gaps caused by the tool "
-                    "budget being exhausted. "
-                    + _unresolved_completion_constraint(active_session)
-                ),
-            },
-        ],
+        messages=(
+            [*(continuation_input or []), stop_message]
+            if continuation_id is not None
+            else [*msg_history, stop_message]
+        ),
         tools=[],
-        previous_response_id=None,
+        previous_response_id=continuation_id,
     )
     answer = _response_text(final_response)
     return policy.redact_text(answer)
@@ -659,6 +695,89 @@ _MODEL_ARTIFACT_RE = re.compile(r"<\|[^|]{1,80}\|>")
 
 def _strip_model_artifacts(text: str) -> str:
     return _MODEL_ARTIFACT_RE.sub("", text).strip()
+
+
+def _superseded_desktop_launches(
+    tool_calls: list[ModelToolCall],
+    session: AgentSession,
+) -> dict[str, str]:
+    path_opens = [
+        call
+        for call in tool_calls
+        if call.name == "desktop_action"
+        and call.arguments.get("action") == "open_path_in_application"
+    ]
+    if not path_opens:
+        return {}
+
+    superseded: dict[str, str] = {}
+    for call in tool_calls:
+        if (
+            call.name != "desktop_action"
+            or call.arguments.get("action") != "launch_application"
+        ):
+            continue
+        launch_identity = _desktop_launch_identity(call, session)
+        if not launch_identity:
+            continue
+        for path_open in path_opens:
+            executable = path_open.arguments.get("value")
+            if not isinstance(executable, str):
+                continue
+            executable_identity = _application_identity_tokens(executable)
+            if executable_identity and executable_identity <= launch_identity:
+                superseded[call.call_id] = path_open.call_id
+                break
+    return superseded
+
+
+def _desktop_launch_identity(
+    call: ModelToolCall,
+    session: AgentSession,
+) -> set[str]:
+    target = call.arguments.get("target")
+    values = [call.arguments.get("value")]
+    observed_identity = False
+    if isinstance(target, str):
+        for item in reversed(session.desktop_targets):
+            if target not in {item.get("target"), item.get("id")}:
+                continue
+            values.extend((item.get("name"), item.get("title")))
+            observed_identity = True
+            break
+        if not observed_identity:
+            values.append(target)
+    return _application_identity_tokens(
+        *(value for value in values if isinstance(value, str))
+    )
+
+
+def _application_identity_tokens(*values: str) -> set[str]:
+    return {
+        token
+        for value in values
+        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if len(token) >= 3
+    }
+
+
+def _superseded_desktop_launch_observation(
+    call: ModelToolCall,
+    *,
+    superseded_by: str,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "complete": True,
+        "verified": True,
+        "tool": call.name,
+        "action": "launch_application",
+        "target": call.arguments.get("target"),
+        "skipped": True,
+        "reason": "superseded_by_path_open",
+        "superseded_by": superseded_by,
+        "verification": "not_needed",
+    }
 
 
 def _can_parallel_tool_calls(
@@ -2756,6 +2875,13 @@ def _response_output_items(response: Any) -> list[dict[str, Any]]:
             if isinstance(dumped, dict):
                 normalized.append(dumped)
     return normalized
+
+
+def _response_continuation_id(llm: LLMClient, response: Any) -> str | None:
+    if getattr(llm, "provider", None) != "openai":
+        return None
+    response_id = _get(response, "id")
+    return response_id if isinstance(response_id, str) and response_id else None
 
 
 def _parse_arguments(raw_args: Any) -> dict[str, Any]:

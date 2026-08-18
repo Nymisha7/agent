@@ -21,6 +21,7 @@ from agent.planner import (
     _build_initial_messages,
     _handle_subagent_event,
     _summarize_approval_request,
+    _superseded_desktop_launches,
     _prepare_tool_output,
     _sanitize_tool_observation_for_model,
     _preflight_tool_call,
@@ -3682,6 +3683,150 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(session.active_root, "/workspace/sample_project")
         self.assertEqual(session.focus_paths, ["/workspace/sample_project"])
         self.assertEqual(session.last_candidates, [{"path": "/workspace/sample_project", "kind": "directory"}])
+
+    def test_openai_turn_continues_with_only_incremental_tool_output(self) -> None:
+        class FakeLLM:
+            provider = "openai"
+            model = "gpt-test"
+            reasoning_effort = None
+            reasoning_summary = None
+
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.requests.append(kwargs)
+                if len(self.requests) == 1:
+                    return SimpleNamespace(
+                        id="resp-1",
+                        output=[{
+                            "type": "function_call",
+                            "name": "desktop_capabilities",
+                            "call_id": "capabilities-1",
+                            "arguments": "{}",
+                        }],
+                        output_text="",
+                    )
+                return SimpleNamespace(id="resp-2", output=[], output_text="Done.")
+
+        class FakeRust:
+            def desktop_capabilities(self) -> dict[str, Any]:
+                return {"ok": True, "actions": []}
+
+        llm = FakeLLM()
+        answer = run_agent(
+            llm=llm,  # type: ignore[arg-type]
+            rust=FakeRust(),  # type: ignore[arg-type]
+            workspace_root="/workspace",
+            user_prompt="check desktop support",
+        )
+
+        self.assertEqual(answer, "Done.")
+        self.assertIsNone(llm.requests[0]["previous_response_id"])
+        self.assertEqual(llm.requests[1]["previous_response_id"], "resp-1")
+        self.assertEqual(len(llm.requests[1]["messages"]), 1)
+        self.assertEqual(
+            llm.requests[1]["messages"][0]["type"],
+            "function_call_output",
+        )
+        self.assertEqual(
+            llm.requests[1]["messages"][0]["call_id"],
+            "capabilities-1",
+        )
+
+    def test_path_open_supersedes_matching_application_launch_in_same_batch(self) -> None:
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.requests.append(kwargs)
+                if len(self.requests) == 1:
+                    return SimpleNamespace(output=[
+                        {
+                            "type": "function_call",
+                            "name": "desktop_action",
+                            "call_id": "launch-1",
+                            "arguments": json.dumps({
+                                "action": "launch_application",
+                                "target": "editor-app",
+                            }),
+                        },
+                        {
+                            "type": "function_call",
+                            "name": "desktop_action",
+                            "call_id": "open-1",
+                            "arguments": json.dumps({
+                                "action": "open_path_in_application",
+                                "target": ".",
+                                "value": "code",
+                            }),
+                        },
+                    ], output_text="")
+                return SimpleNamespace(output=[], output_text="Opened.")
+
+        class FakeRust:
+            def __init__(self) -> None:
+                self.actions: list[str] = []
+
+            def desktop_action(self, **kwargs: Any) -> dict[str, Any]:
+                self.actions.append(kwargs["action"])
+                return {"ok": True, "verified": True, **kwargs}
+
+        with TemporaryDirectory() as directory:
+            rust = FakeRust()
+            llm = FakeLLM()
+            session = AgentSession(desktop_targets=[{
+                "kind": "application",
+                "id": "editor-app",
+                "target": "editor-app",
+                "name": "Visual Studio Code",
+            }])
+            answer = run_agent(
+                llm=llm,  # type: ignore[arg-type]
+                rust=rust,  # type: ignore[arg-type]
+                workspace_root=directory,
+                user_prompt="open this project in the observed editor",
+                session=session,
+            )
+
+        self.assertEqual(answer, "Opened.")
+        self.assertEqual(rust.actions, ["open_path_in_application"])
+        outputs = [
+            item
+            for item in llm.requests[1]["messages"]
+            if item.get("type") == "function_call_output"
+        ]
+        self.assertEqual([item["call_id"] for item in outputs], ["launch-1", "open-1"])
+        skipped = json.loads(outputs[0]["output"])
+        self.assertEqual(skipped["reason"], "superseded_by_path_open")
+
+    def test_path_open_does_not_supersede_unrelated_application_launch(self) -> None:
+        launch = ModelToolCall(
+            name="desktop_action",
+            call_id="launch-browser",
+            arguments={"action": "launch_application", "target": "browser-app"},
+        )
+        path_open = ModelToolCall(
+            name="desktop_action",
+            call_id="open-editor",
+            arguments={
+                "action": "open_path_in_application",
+                "target": "/workspace",
+                "value": "code",
+            },
+        )
+        session = AgentSession(desktop_targets=[{
+            "kind": "application",
+            "id": "browser-app",
+            "target": "browser-app",
+            "name": "Google Chrome",
+        }])
+
+        self.assertEqual(
+            _superseded_desktop_launches([launch, path_open], session),
+            {},
+        )
 
     def test_run_agent_accepts_plain_assistant_response_as_completion(self) -> None:
         class FakeLLM:
