@@ -6,13 +6,14 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from agent.main import _tui_update_required, main
 from agent.updater import (
     UPDATE_COMMAND,
     UpdateStatus,
     _install_updated_runtime,
+    _refresh_installed_runtime,
     apply_update,
     check_for_update,
     update_source_root,
@@ -124,6 +125,16 @@ class UpdaterTests(unittest.TestCase):
                     "agent.updater._install_updated_runtime",
                     return_value=subprocess.CompletedProcess([], 0),
                 ) as install,
+                patch(
+                    "agent.updater._installed_package_revision",
+                    side_effect=lambda: subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip(),
+                ),
                 redirect_stdout(io.StringIO()),
             ):
                 result = apply_update()
@@ -213,6 +224,10 @@ class UpdaterTests(unittest.TestCase):
             with (
                 patch.dict("os.environ", {"AGENT_UPDATE_ROOT": str(checkout)}, clear=False),
                 patch("agent.updater._install_updated_runtime", side_effect=install),
+                patch(
+                    "agent.updater._installed_package_revision",
+                    side_effect=lambda: installed_heads[-1],
+                ),
                 redirect_stdout(io.StringIO()),
             ):
                 status = check_for_update()
@@ -239,6 +254,36 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(checkout_head, local_head)
         self.assertEqual(installed_heads, [remote_head])
         self.assertEqual(build_targets, [checkout / "agent-rust" / "target"])
+
+    def test_runtime_refresh_retries_when_same_version_install_stays_stale(self) -> None:
+        root = Path("/checkout")
+        target = Path("/build/target")
+        completed = subprocess.CompletedProcess([], 0)
+        with (
+            patch(
+                "agent.updater._install_updated_runtime",
+                side_effect=(completed, completed),
+            ) as install,
+            patch(
+                "agent.updater._installed_package_revision",
+                side_effect=("1" * 40, "2" * 40),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = _refresh_installed_runtime(
+                root,
+                cargo_target_dir=target,
+                expected_revision="2" * 40,
+            )
+
+        self.assertIs(result, completed)
+        self.assertEqual(
+            install.call_args_list,
+            [
+                call(root, cargo_target_dir=target),
+                call(root, cargo_target_dir=target, force=True),
+            ],
+        )
 
     def test_update_cli_runs_before_tui_or_session_startup(self) -> None:
         with (

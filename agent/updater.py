@@ -80,10 +80,19 @@ def apply_update() -> int:
             print(f"Nym could not update its checkout: {_command_error(merge, 'git merge failed.')}")
             return 1
 
+    expected_revision = _git_output(install_root, "rev-parse", "HEAD")
+    if expected_revision is None:
+        if temporary_root is not None:
+            _run_git(root, "worktree", "remove", "--force", str(install_root))
+            temporary_root.cleanup()
+        print("Nym could not identify the revision prepared for installation.")
+        return 1
+
     print("Refreshing the installed Nym runtime...")
-    install = _install_updated_runtime(
+    install = _refresh_installed_runtime(
         install_root,
         cargo_target_dir=root / "agent-rust" / "target",
+        expected_revision=expected_revision,
     )
     if temporary_root is not None:
         _run_git(root, "worktree", "remove", "--force", str(install_root))
@@ -106,6 +115,7 @@ def _install_updated_runtime(
     root: Path,
     *,
     cargo_target_dir: Path,
+    force: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     environment = credential_free_environment()
     environment["CARGO_TARGET_DIR"] = str(cargo_target_dir.resolve(strict=False))
@@ -113,18 +123,21 @@ def _install_updated_runtime(
     if revision:
         environment["NYM_BUILD_REVISION"] = revision
     try:
+        command = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--upgrade-strategy",
+            "only-if-needed",
+            "--no-cache-dir",
+        ]
+        if force:
+            command.extend(("--force-reinstall", "--no-deps"))
+        command.append(str(root))
         return subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "--upgrade-strategy",
-                "only-if-needed",
-                "--no-cache-dir",
-                str(root),
-            ],
+            command,
             cwd=root,
             env=environment,
             text=True,
@@ -132,6 +145,39 @@ def _install_updated_runtime(
         )
     except OSError as exc:
         return subprocess.CompletedProcess([sys.executable, "-m", "pip"], 1, "", str(exc))
+
+
+def _refresh_installed_runtime(
+    root: Path,
+    *,
+    cargo_target_dir: Path,
+    expected_revision: str,
+) -> subprocess.CompletedProcess[str]:
+    install = _install_updated_runtime(root, cargo_target_dir=cargo_target_dir)
+    if install.returncode != 0 or _installed_package_revision() == expected_revision:
+        return install
+
+    print("The installed runtime remained stale; forcing a package refresh...")
+    install = _install_updated_runtime(root, cargo_target_dir=cargo_target_dir, force=True)
+    if install.returncode != 0 or _installed_package_revision() == expected_revision:
+        return install
+    return subprocess.CompletedProcess(
+        install.args,
+        1,
+        install.stdout,
+        "The installed runtime revision does not match the downloaded update.",
+    )
+
+
+def _installed_package_revision() -> str | None:
+    try:
+        marker = importlib.metadata.distribution("agent").locate_file("agent/_build_revision")
+        revision = Path(marker).read_text(encoding="ascii").strip()
+    except (importlib.metadata.PackageNotFoundError, OSError):
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        return None
+    return revision.lower()
 
 def check_for_update() -> UpdateStatus:
     root = update_source_root()
