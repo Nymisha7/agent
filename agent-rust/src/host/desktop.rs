@@ -1,6 +1,6 @@
 use super::{
     bluetooth::info_value as bluetooth_info_value,
-    platform::{command_exists, is_wsl_runtime},
+    platform::{command_exists, is_wsl_runtime, user_downloads_directory},
     system::{
         read_trimmed, required_target, run_capture_dynamic, run_capture_with_stdin, CommandOutput,
     },

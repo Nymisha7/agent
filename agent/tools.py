@@ -661,7 +661,8 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 description=(
                     "Inspect the current runtime host and return structured operating-system "
                     "details such as hostname, uptime, CPU count, memory, disk summary, and "
-                    "whether the agent is running under WSL."
+                    "whether the agent is running under WSL. Also returns user directories "
+                    "that the runtime can resolve, so use them before asking for a path."
                 ),
                 properties={},
                 required=[],

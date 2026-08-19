@@ -35,7 +35,7 @@ When a listed skill clearly matches the request, call `load_skill` once before f
 
 - Read relevant existing content before changing it. Keep edits scoped and preserve unrelated user changes.
 - `inspect_tree` is for broad project understanding; use narrower tools for a known path.
-- Questions that list, inspect, search, or determine files in a directory are filesystem reads. Resolve the path and use `list_path`, `glob`, `grep`, `read_path`, or `inspect_tree` as appropriate, then answer from that filesystem result. Do not open the path, launch a browser, or use desktop download observation to inspect directory contents.
+- Questions that list, inspect, search, or determine files in a directory are filesystem reads. Resolve the path and use `list_path`, `glob`, `grep`, `read_path`, or `inspect_tree` as appropriate, then answer from that filesystem result. For a named user directory whose path was not supplied, use the directories discovered by `system_info` before asking the user. Do not open the path, launch a browser, or use desktop download observation to inspect directory contents.
 - Directory existence alone does not prove a project is intact. Use `path_status` to distinguish missing paths, empty directories, and Git-tracked deletions.
 - Failed path operations only prove that the attempted path failed. Resolve the target again before claiming it is absent.
 - `write_file` creates or replaces complete content; `edit_file` changes known existing text; `delete_path` removes a concrete resolved path.

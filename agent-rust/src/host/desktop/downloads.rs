@@ -1,27 +1,7 @@
 use super::*;
 
 pub(super) fn downloads_directory() -> Option<PathBuf> {
-    let home = env::var_os("HOME").map(PathBuf::from)?;
-    let config_home = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    let configured = fs::read_to_string(config_home.join("user-dirs.dirs"))
-        .ok()
-        .and_then(|content| {
-            content.lines().find_map(|line| {
-                let value = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=")?.trim();
-                let value = value.strip_prefix('"')?.strip_suffix('"')?;
-                if value == "$HOME" {
-                    Some(home.clone())
-                } else if let Some(relative) = value.strip_prefix("$HOME/") {
-                    Some(home.join(relative))
-                } else {
-                    let path = PathBuf::from(value);
-                    path.is_absolute().then_some(path)
-                }
-            })
-        });
-    configured.or_else(|| Some(home.join("Downloads")))
+    user_downloads_directory()
 }
 
 pub(super) fn download_inventory(limit: usize) -> Result<Value> {

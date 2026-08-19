@@ -20,7 +20,7 @@ pub(crate) use desktop::{valid_bluetooth_address, valid_identifier, valid_path_t
 pub(crate) use inventory::connected_devices;
 #[cfg(test)]
 pub(crate) use inventory::windows_device_category;
-use platform::{command_exists, is_wsl_runtime};
+use platform::{command_exists, is_wsl_runtime, user_downloads_directory};
 use system::{required_target, run_capture, run_capture_dynamic};
 
 pub(crate) fn system_info() -> Result<Value> {
@@ -32,6 +32,7 @@ pub(crate) fn system_info() -> Result<Value> {
     let disk = root_disk_summary();
     let wsl = is_wsl_runtime();
     let runtime = if wsl { "wsl" } else { std::env::consts::OS };
+    let downloads = user_downloads_directory();
 
     Ok(json!({
         "ok": true,
@@ -45,6 +46,9 @@ pub(crate) fn system_info() -> Result<Value> {
         "uptime_seconds": uptime_seconds,
         "memory": meminfo,
         "disk": disk,
+        "user_directories": {
+            "downloads": downloads,
+        },
     }))
 }
 
