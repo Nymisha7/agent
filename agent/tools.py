@@ -442,8 +442,9 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
             schema=_function_schema(
                 name="list_path",
                 description=(
-                    "List a directory or inspect a file path explicitly. Use this when the "
-                    "user already gave a path or when you need a direct listing."
+                    "Query the actual filesystem to list a directory or inspect a file path. "
+                    "Use this when the user gave a path or needs a direct directory listing; "
+                    "do not open the path or use a browser to discover its contents."
                 ),
                 properties={
                     "path": {
@@ -722,6 +723,7 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 description=(
                     "Read the current desktop state visible to this runtime: installed "
                     "applications, visible windows, active window, connected displays, and audio state when supported. "
+                    "The downloads scope reports browser transfer status, not files in a directory. "
                     "This is read-only and reports backend limitations instead of changing state."
                 ),
                 properties={
@@ -855,7 +857,8 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                     "local path, focusing an observed window, and closing an observed window run "
                     "immediately; other actions require explicit user approval. "
                     "Never use this for read-only questions; use connected_devices, system_info, "
-                    "or process_list instead. Use open_path for a local path's default handler, "
+                    "process_list, or filesystem tools instead. Use open_path only when the user "
+                    "explicitly asked to open a local path with its default handler, "
                     "open_path_in_application for a local path in the executable named by value, "
                     "and open_url only for HTTP(S). open_path_in_application launches the selected "
                     "application when needed; do not call launch_application first. Results include "
