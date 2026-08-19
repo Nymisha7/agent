@@ -4218,6 +4218,68 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(session.pending_approvals[0]["status"], "approved")
         self.assertEqual(session.pending_approvals[0]["decision"], "approved")
 
+    def test_parallel_external_reads_share_one_capability_approval(self) -> None:
+        class FakeLLM:
+            def __init__(self, target: Path) -> None:
+                self.calls = 0
+                self.target = target
+
+            def respond(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                if self.calls == 1:
+                    path = str(self.target)
+                    return SimpleNamespace(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": "list_path",
+                                "call_id": "list-downloads",
+                                "arguments": json.dumps({"path": path}),
+                            },
+                            {
+                                "type": "function_call",
+                                "name": "path_status",
+                                "call_id": "status-downloads",
+                                "arguments": json.dumps({"path": path}),
+                            },
+                            {
+                                "type": "function_call",
+                                "name": "glob",
+                                "call_id": "search-downloads",
+                                "arguments": json.dumps({"path": path, "pattern": "*"}),
+                            },
+                        ],
+                        output_text="",
+                    )
+                return SimpleNamespace(output=[], output_text="Files inspected.")
+
+        class FakeRust:
+            def read_path(self, **_kwargs: Any) -> dict[str, Any]:
+                return {"ok": True, "entries": ["report.pdf"]}
+
+            def glob_files(self, **_kwargs: Any) -> dict[str, Any]:
+                return {"ok": True, "matches": ["report.pdf"]}
+
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            external = Path(tmp) / "external"
+            external.mkdir()
+            (external / "report.pdf").write_text("report")
+            approvals: list[dict[str, Any]] = []
+
+            answer = run_agent(
+                llm=FakeLLM(external),  # type: ignore[arg-type]
+                rust=FakeRust(),  # type: ignore[arg-type]
+                workspace_root=str(workspace),
+                user_prompt="What files are in that directory?",
+                approval_requester=lambda request: approvals.append(dict(request)) or "approved",
+            )
+
+        self.assertEqual(answer, "Files inspected.")
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["operation"], "read")
+
     def test_follow_up_delete_uses_one_structured_approval_without_revalidation(self) -> None:
         class FakeLLM:
             def __init__(self, target: Path) -> None:

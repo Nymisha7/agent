@@ -59,6 +59,7 @@ DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT = 1
 DEFAULT_UNEXECUTED_ACTION_RETRY_LIMIT = 1
 REASONING_FAILURE_TEXT_LIMIT = 360
 LOCAL_FILE_MUTATION_TOOLS = frozenset({"write_file", "edit_file"})
+FILESYSTEM_READ_APPROVAL_OPERATIONS = frozenset({"read", "list", "inspect", "search"})
 _FILE_MUTATION_INTENT_RE = re.compile(
     r"\b(?:add|build|change|create|edit|fix|generate|implement|make|modify|patch|"
     r"refactor|rename|replace|save|scaffold|update|write)\b",
@@ -1049,15 +1050,38 @@ def _approval_has_decision(
             continue
         if item.get("status") != decision and item.get("decision") != decision:
             continue
-        if item.get("tool") != request.get("tool") or item.get("operation") != request.get("operation"):
-            continue
         if _optional_str(item.get("prompt")) != request_prompt:
+            continue
+        item_operation = _optional_str(item.get("operation"))
+        request_operation = _optional_str(request.get("operation"))
+        if (
+            item_operation in FILESYSTEM_READ_APPROVAL_OPERATIONS
+            and request_operation in FILESYSTEM_READ_APPROVAL_OPERATIONS
+        ):
+            if _approval_path_contains(item, request):
+                return True
+            continue
+        if item.get("tool") != request.get("tool") or item_operation != request_operation:
             continue
         if _approval_path(item) == request_path:
             return True
         if _same_close_application_approval(session, item, request):
             return True
     return False
+
+
+def _approval_path_contains(approved: dict[str, Any], requested: dict[str, Any]) -> bool:
+    approved_path = _approval_path(approved)
+    requested_path = _approval_path(requested)
+    if not approved_path or not requested_path:
+        return False
+    try:
+        Path(requested_path).expanduser().resolve(strict=False).relative_to(
+            Path(approved_path).expanduser().resolve(strict=False)
+        )
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _same_close_application_approval(
