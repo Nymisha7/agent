@@ -1,11 +1,12 @@
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::ffi::OsStr;
 use std::fs;
-use std::process::Command as ProcessCommand;
 
+mod bluetooth;
 mod desktop;
 mod inventory;
+mod platform;
+mod system;
 pub(crate) use desktop::desktop_action;
 pub(crate) use desktop::desktop_capabilities;
 pub(crate) use desktop::desktop_clipboard_files;
@@ -19,7 +20,8 @@ pub(crate) use desktop::{valid_bluetooth_address, valid_identifier, valid_path_t
 pub(crate) use inventory::connected_devices;
 #[cfg(test)]
 pub(crate) use inventory::windows_device_category;
-use inventory::{bluetooth_info_value, is_wsl_runtime, read_trimmed};
+use platform::{command_exists, is_wsl_runtime};
+use system::{required_target, run_capture, run_capture_dynamic};
 
 pub(crate) fn system_info() -> Result<Value> {
     let hostname = fs::read_to_string("/etc/hostname")
@@ -124,17 +126,6 @@ fn unix_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let candidate = dir.join(name);
-                candidate.is_file()
-            })
-        })
-        .unwrap_or(false)
 }
 
 pub(crate) fn process_list(limit: usize, sort_by: &str) -> Result<Value> {
@@ -279,35 +270,6 @@ fn command_json<const N: usize>(
         "data": parsed,
         "stderr": output.stderr,
     }))
-}
-
-fn required_target<'a>(command: &str, target: Option<&'a str>) -> Result<&'a str> {
-    target.ok_or_else(|| anyhow::anyhow!("{} requires --target", command))
-}
-
-#[derive(Debug)]
-struct CommandOutput {
-    status: i32,
-    stdout: String,
-    stderr: String,
-}
-
-fn run_capture<const N: usize>(argv: &[&str; N]) -> Result<CommandOutput> {
-    run_capture_dynamic(argv)
-}
-
-fn run_capture_dynamic<T: AsRef<OsStr>>(argv: &[T]) -> Result<CommandOutput> {
-    let Some((program, arguments)) = argv.split_first() else {
-        return Err(anyhow::anyhow!("Cannot run an empty command"));
-    };
-    let mut command = ProcessCommand::new(program.as_ref());
-    command.args(arguments.iter().map(AsRef::as_ref));
-    let output = command.output()?;
-    Ok(CommandOutput {
-        status: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
 }
 
 fn read_uptime_seconds() -> Option<f64> {

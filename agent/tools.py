@@ -750,8 +750,9 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                 name="desktop_resolve",
                 description=(
                     "Resolve a natural desktop target name to concrete observed applications "
-                    "or windows. Use this before launching, focusing, closing, or otherwise "
-                    "acting on a desktop target when the user gave a name instead of an id."
+                    "or windows for read-only discovery, ambiguity handling, or an exact window "
+                    "target. Application launches resolve names within desktop_action and do not "
+                    "need this separate call."
                 ),
                 properties={
                     "query": {
@@ -870,7 +871,9 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                         "type": "string",
                         "description": (
                             "Concrete target when required: device address, interface, /dev path, "
-                            "PID, application ID, local path, HTTP(S) URL, window id from desktop_observe, or x,y screen coordinates for mouse_click."
+                            "PID, application name or ID, local path, HTTP(S) URL, window id from "
+                            "desktop_observe, or x,y screen coordinates for mouse_click. Application "
+                            "names are resolved to installed targets before Rust execution."
                         ),
                     },
                     "value": {

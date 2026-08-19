@@ -32,6 +32,9 @@ class build_py(_build_py):
     """Build and bundle the Rust backend into Python wheels."""
 
     def run(self) -> None:
+        build_lib = Path(self.build_lib)
+        if build_lib.exists():
+            shutil.rmtree(build_lib)
         self._build_rust_backend()
         super().run()
         self._write_build_revision()

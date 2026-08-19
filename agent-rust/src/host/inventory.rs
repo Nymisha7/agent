@@ -1,9 +1,12 @@
-use super::{command_exists, run_capture_dynamic};
+use super::{
+    bluetooth::info_value as bluetooth_info_value,
+    platform::{command_exists, is_wsl_runtime},
+    system::{read_trimmed, run_capture_dynamic},
+};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn connected_devices(scope: &str) -> Result<Value> {
@@ -282,12 +285,6 @@ fn capability_availability(path: &str, command: Option<&str>) -> Value {
         "status": if available { "available" } else if cfg!(target_os = "linux") { "unavailable" } else { "unsupported_platform" },
         "source": if command_available { command } else if path_available { Some(path) } else { None },
     })
-}
-
-pub(super) fn is_wsl_runtime() -> bool {
-    fs::read_to_string("/proc/version")
-        .map(|text| text.to_lowercase().contains("microsoft"))
-        .unwrap_or(false)
 }
 
 fn usb_devices() -> Vec<Value> {
@@ -681,13 +678,6 @@ fn wifi_ssid(interface: &str) -> Option<String> {
     None
 }
 
-pub(super) fn bluetooth_info_value(text: &str, key: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let (name, value) = line.trim().split_once(':')?;
-        (name == key).then(|| value.trim().to_string())
-    })
-}
-
 fn bluetooth_battery_percent(text: &str) -> Option<u64> {
     let raw = bluetooth_info_value(text, "Battery Percentage")?;
     raw.split_whitespace().find_map(|part| {
@@ -695,11 +685,4 @@ fn bluetooth_battery_percent(text: &str) -> Option<u64> {
             .parse::<u64>()
             .ok()
     })
-}
-
-pub(super) fn read_trimmed(path: PathBuf) -> Option<String> {
-    fs::read_to_string(path)
-        .ok()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
 }

@@ -80,6 +80,8 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertIn("connected_devices", prompt)
         self.assertIn("desktop_capabilities", prompt)
         self.assertIn("desktop_observe", prompt)
+        self.assertIn("runtime preflight resolves it", prompt)
+        self.assertIn("runtime preflight resolves it", LOCAL_AGENT_PROMPT)
         self.assertIn("run_system_command", prompt)
         self.assertIn("desktop_action", prompt)
         self.assertIn("generated, dependency, cache, and build output", prompt)
@@ -482,6 +484,9 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertNotIn("language_server", default_tool_names)
         self.assertIn("read_path", default_tool_names)
         desktop_action = next(schema for schema in registry.schemas() if schema["name"] == "desktop_action")
+        desktop_resolve = next(schema for schema in registry.schemas() if schema["name"] == "desktop_resolve")
+        self.assertIn("do not need this separate call", desktop_resolve["description"])
+        self.assertIn("resolved to installed targets", desktop_action["parameters"]["properties"]["target"]["description"])
         actions = desktop_action["parameters"]["properties"]["action"]["enum"]
         self.assertIn("focus_window", actions)
         self.assertIn("close_window", actions)
