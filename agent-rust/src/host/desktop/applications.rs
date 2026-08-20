@@ -89,13 +89,20 @@ pub(super) fn open_path_in_application(
     target: &str,
     application: &str,
 ) -> Result<Value> {
+    let path = fs::canonicalize(Path::new(target))
+        .map_err(|error| anyhow::anyhow!("Cannot open local path `{target}`: {error}"))?;
     let application = application.trim();
+    if let Some(shortcut) = decode_windows_shortcut_target(application)? {
+        return open_path_with_windows_shortcut(action, &path, application, &shortcut);
+    }
     if !valid_identifier(application) {
         return Err(anyhow::anyhow!(
-            "{action} requires an application executable identifier"
+            "{action} requires an application identifier"
         ));
     }
-    if !command_exists(application) {
+    let direct = command_exists(application);
+    let gtk = !direct && command_exists("gtk-launch");
+    if !direct && !gtk {
         return Ok(json!({
             "ok": false,
             "tool": "desktop_action",
@@ -108,9 +115,11 @@ pub(super) fn open_path_in_application(
             "guidance": "Select an installed executable available on PATH.",
         }));
     }
-    let path = fs::canonicalize(Path::new(target))
-        .map_err(|error| anyhow::anyhow!("Cannot open local path `{target}`: {error}"))?;
-    let child = ProcessCommand::new(application)
+    let mut command = ProcessCommand::new(if direct { application } else { "gtk-launch" });
+    if gtk {
+        command.arg(application);
+    }
+    let child = command
         .arg(&path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -141,6 +150,7 @@ pub(super) fn open_path_in_application(
         "action": action,
         "target": path,
         "application": application,
+        "backend": if direct { "executable" } else { "gtk-launch" },
         "pid": child.id(),
         "verified": accepted,
         "verification": if accepted { "invocation_accepted" } else { "command_failed" },
@@ -148,6 +158,89 @@ pub(super) fn open_path_in_application(
         "exit_code": early_status.and_then(|status| status.code()),
         "waited_ms": 50,
     }))
+}
+
+pub(super) fn open_path_with_windows_shortcut(
+    action: &str,
+    path: &Path,
+    application: &str,
+    shortcut: &str,
+) -> Result<Value> {
+    if !windows_host_powershell_available() || !command_exists("wslpath") {
+        return Ok(json!({
+            "ok": false,
+            "tool": "desktop_action",
+            "action": action,
+            "target": path,
+            "application": application,
+            "reason": "dependency_unavailable",
+            "recoverable": true,
+            "error": "Opening a WSL path in a Windows application requires PowerShell and wslpath.",
+        }));
+    }
+    let path_text = path.to_string_lossy();
+    let windows_path = run_capture_dynamic(&["wslpath", "-w", path_text.as_ref()])?;
+    if windows_path.status != 0 || windows_path.stdout.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "tool": "desktop_action",
+            "action": action,
+            "target": path,
+            "application": application,
+            "reason": "path_translation_failed",
+            "recoverable": true,
+            "stderr": windows_path.stderr,
+        }));
+    }
+    let payload = serde_json::to_string(&json!({
+        "shortcut": shortcut,
+        "argument": windows_path.stdout,
+    }))?;
+    let output = run_capture_with_stdin(
+        &[
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-STA",
+            "-Command",
+            windows_host_open_shortcut_script(),
+        ],
+        &payload,
+    )?;
+    Ok(json!({
+        "ok": output.status == 0,
+        "tool": "desktop_action",
+        "action": action,
+        "target": path,
+        "application": application,
+        "backend": "windows_host_powershell",
+        "exit_code": output.status,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "verified": output.status == 0,
+        "verification": if output.status == 0 { "invocation_accepted" } else { "failed" },
+        "verification_scope": "application_invocation",
+    }))
+}
+
+pub(super) fn windows_host_open_shortcut_script() -> &'static str {
+    r#"
+$payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$shortcut = [string]$payload.shortcut
+$argument = [string]$payload.argument
+if (-not $shortcut.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase)) { Write-Error 'Expected a Start Menu shortcut'; exit 2 }
+if (-not (Test-Path -LiteralPath $shortcut -PathType Leaf)) { Write-Error 'Shortcut not found'; exit 3 }
+if ($argument.Contains('"')) { Write-Error 'Invalid path argument'; exit 4 }
+$link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+if (-not $link.TargetPath -or -not (Test-Path -LiteralPath $link.TargetPath -PathType Leaf)) { Write-Error 'Shortcut target not found'; exit 5 }
+$arguments = @()
+if ($link.Arguments) { $arguments += $link.Arguments }
+$arguments += ('"' + $argument + '"')
+$params = @{ FilePath = $link.TargetPath; ArgumentList = ($arguments -join ' '); PassThru = $true }
+if ($link.WorkingDirectory -and (Test-Path -LiteralPath $link.WorkingDirectory -PathType Container)) { $params.WorkingDirectory = $link.WorkingDirectory }
+$process = Start-Process @params
+@{ pid = $process.Id } | ConvertTo-Json -Compress
+"#
 }
 
 pub(super) fn launch_windows_host_shortcut(

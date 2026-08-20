@@ -860,7 +860,7 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                     "Never use this for read-only questions; use connected_devices, system_info, "
                     "process_list, or filesystem tools instead. Use open_path only when the user "
                     "explicitly asked to open a local path with its default handler, "
-                    "open_path_in_application for a local path in the executable named by value, "
+                    "open_path_in_application for a local path in the application named by value, "
                     "and open_url only for HTTP(S). open_path_in_application launches the selected "
                     "application when needed; do not call launch_application first. Results include "
                     "execution verification."
@@ -883,7 +883,7 @@ def register_rust_file_tools(registry: ToolRegistry, _ctx: ToolContext) -> None:
                     "value": {
                         "type": "string",
                         "description": (
-                            "Action value, such as an application executable for "
+                            "Action value, such as an application name, executable, or resolved target for "
                             "open_path_in_application, volume/brightness percent, "
                             "true/false/toggle, clipboard text, key spec, or text to type."
                         ),
@@ -2073,7 +2073,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
                 "operation": "desktop",
                 "guidance": (
                     "open_url accepts only HTTP(S). Use open_path for a local path, or "
-                    "open_path_in_application with an application executable in value."
+                    "open_path_in_application with an application name or identifier in value."
                 ),
             }
     if action in {"open_path", "open_path_in_application"} and target is not None:
@@ -2101,7 +2101,7 @@ def _desktop_action(args: dict[str, Any], ctx: ToolContext) -> Any:
             "reason": "desktop_action_value_required",
             "operation": "desktop",
             "guidance": (
-                f"{action} requires an application executable in value."
+                f"{action} requires an application name or identifier in value."
                 if action == "open_path_in_application"
                 else f"{action} requires clipboard text."
                 if action == "clipboard_write"

@@ -833,6 +833,57 @@ class PlannerToolUseTests(unittest.TestCase):
         self.assertEqual(calls[0]["target"], str(project.resolve()))
         self.assertEqual(calls[0]["value"], "code")
 
+    def test_open_path_in_application_resolves_natural_application_name_in_preflight(self) -> None:
+        target = "windows-shortcut:abcdef"
+
+        class FakeRust:
+            def desktop_resolve(self, **_kwargs: Any) -> dict[str, Any]:
+                return {
+                    "ok": True,
+                    "ambiguous": True,
+                    "candidates": [
+                        {
+                            "kind": "application",
+                            "name": "Visual Studio Code",
+                            "exec": "Visual Studio Code.lnk",
+                            "target": target,
+                            "score": 100,
+                        },
+                        {
+                            "kind": "application",
+                            "name": "Visual Studio Code",
+                            "target": "windows-shortcut:fedcba",
+                            "score": 100,
+                        },
+                    ],
+                }
+
+        call = ModelToolCall(
+            name="desktop_action",
+            call_id="open-project",
+            arguments={
+                "action": "open_path_in_application",
+                "target": "/workspace/project",
+                "value": "Visual Studio Code",
+            },
+        )
+        with patch(
+            "agent.planner.shutil.which",
+            side_effect=lambda name: "/usr/bin/code" if name == "code" else None,
+        ):
+            observation = _preflight_tool_call(
+                call,
+                tool_ctx=ToolContext(
+                    rust=FakeRust(),  # type: ignore[arg-type]
+                    workspace_root=Path("/workspace"),
+                    search_roots=[],
+                ),
+                session=AgentSession(),
+            )
+
+        self.assertIsNone(observation)
+        self.assertEqual(call.arguments["value"], "code")
+
     def test_open_url_rejects_non_url_without_calling_rust(self) -> None:
         class FakeRust:
             def desktop_action(self, **_kwargs: Any) -> dict[str, object]:

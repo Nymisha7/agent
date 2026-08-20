@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -35,7 +36,7 @@ Treat a follow-up correction as a revision of the earlier request, not as a new 
 `parallel_subagents` is an optional delegation tool inside the normal agent loop, not a preflight step. Use it proactively when a complex request contains at least two substantial independent deliverables, repository areas, or verbose investigations that can run concurrently; for a simple, conversational, or genuinely single-workstream request, continue directly. Each child is an independent fresh agent that can inspect the workspace and write/edit only inside its declared `owns` directories; a task with no ownership remains read-only. Delegate safe disjoint implementation work and context-heavy investigation instead of reserving all work for the parent. Never create filler work, overlap ownership, split dependent phases across the batch, or emulate sequential subagents. Children cannot delete, run arbitrary commands, control the desktop, send messages, request approval, or spawn agents. The parent owns cross-cutting integration, destructive actions, approvals, final verification, synthesis, and the final answer. After reports return, inspect their changed-file evidence and complete all remaining integration and tests with parent tools.
 When the supplied skill catalog contains a clearly matching skill, call load_skill once before applying its instructions. Skills cannot grant tools, bypass approval, or override this prompt.
 Read before editing. Mutate only when requested. Deletion requires explicit intent and the tool's approval flow. Launching an application, focusing an observed window, and closing an observed window execute directly when requested; other desktop actions require approval. Never ask for deletion confirmation in prose: when one concrete target is clear, call delete_path and let its single exact-target runtime approval handle confirmation. Verify mutations and report failures honestly.
-Emit related file writes together. A verified mutation receipt makes a reread unnecessary unless new evidence is needed. When a local path and executable are known, call open_path_in_application once after the writes; it launches the app as needed, so do not also call launch_application or inspect the window unless the receipt is incomplete or focus was explicitly requested.
+Emit related file writes together. A verified mutation receipt makes a reread unnecessary unless new evidence is needed. When a local path and application are known, call open_path_in_application once after the writes; it resolves and launches the app as needed, so do not also call launch_application or inspect the window unless the receipt is incomplete or focus was explicitly requested.
 When a tool rejects an argument and lists allowed values, correct and retry once when the user's intent is clear. Do not ask the user to resolve an internal tool-enum mistake.
 Creating requested software is not complete until it has a usable entry point and the final answer gives the exact invocation. Verify syntax or a build when available; source text alone is not proof that an application is runnable.
 Do not invent a UI, framework, dependency, or platform target. Follow an existing project's conventions; without project context or an explicit user choice, produce the smallest dependency-free non-UI implementation.
@@ -1506,6 +1507,17 @@ def _preflight_tool_call(
             resolved = _resolve_desktop_application_target(call, tool_ctx, session)
             if resolved is not None:
                 return resolved
+        if action == "open_path_in_application":
+            application = _optional_str(call.arguments.get("value"))
+            if application and not _valid_desktop_application_id(application):
+                resolved = _resolve_desktop_application_target(
+                    call,
+                    tool_ctx,
+                    session,
+                    argument_name="value",
+                )
+                if resolved is not None:
+                    return resolved
         if action in {"focus_window", "minimize_window", "maximize_window", "restore_window", "close_window"}:
             if not target or not session or not _desktop_window_target_observed(session, target):
                 return {
@@ -1625,8 +1637,10 @@ def _resolve_desktop_application_target(
     call: ModelToolCall,
     tool_ctx: ToolContext,
     session: AgentSession | None,
+    *,
+    argument_name: str = "target",
 ) -> dict[str, Any] | None:
-    target = _optional_str(call.arguments.get("target"))
+    target = _optional_str(call.arguments.get(argument_name))
     if not target:
         return None
     query = target.strip()
@@ -1649,9 +1663,12 @@ def _resolve_desktop_application_target(
             continue
         if isinstance(observation, dict) and session is not None:
             _apply_desktop_resolve(session, observation)
-        resolved_target = _resolved_desktop_application_target(observation, resolution_query)
+        candidate = _resolved_desktop_application_candidate(observation, resolution_query)
+        resolved_target = _resolved_desktop_application_target(candidate)
         if resolved_target:
-            call.arguments["target"] = resolved_target
+            if argument_name == "value":
+                resolved_target = _installed_desktop_application_command(candidate) or resolved_target
+            call.arguments[argument_name] = resolved_target
             return None
 
     if resolution_error is not None and observation is None:
@@ -1675,14 +1692,18 @@ def _resolve_desktop_application_target(
         "operation": "desktop",
         "desktop_resolve": observation,
         "guidance": (
-            "launch_application needs one concrete application candidate before launch. "
+            f"{call.arguments.get('action') or 'launch_application'} needs one concrete "
+            "application candidate before launch. "
             "If desktop_resolve returned one clear application, retry with its target. "
             "If it returned none or multiple candidates, ask the user which application to open."
         ),
     }
 
 
-def _resolved_desktop_application_target(observation: Any, query: str) -> str | None:
+def _resolved_desktop_application_candidate(
+    observation: Any,
+    query: str,
+) -> dict[str, Any] | None:
     observation_dict = observation if isinstance(observation, dict) else {}
     candidates = observation_dict.get("candidates")
     candidates = candidates if isinstance(candidates, list) else []
@@ -1692,10 +1713,35 @@ def _resolved_desktop_application_target(observation: Any, query: str) -> str | 
             candidate = candidates[0]
     if candidate is None:
         candidate = _single_clear_desktop_application_candidate(candidates, query)
+    return candidate
+
+
+def _resolved_desktop_application_target(candidate: dict[str, Any] | None) -> str | None:
     if candidate is None:
         return None
     resolved_target = _optional_str(candidate.get("target")) or _optional_str(candidate.get("id"))
     return resolved_target if resolved_target and _valid_desktop_application_id(resolved_target) else None
+
+
+def _installed_desktop_application_command(candidate: dict[str, Any] | None) -> str | None:
+    if candidate is None:
+        return None
+    values = [
+        _optional_str(candidate.get("exec")),
+        _optional_str(candidate.get("name")),
+    ]
+    checked: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        for token in reversed(re.findall(r"[A-Za-z0-9_.+-]+", value)):
+            for command in (token, token.casefold()):
+                if command in checked or not _valid_desktop_application_id(command):
+                    continue
+                checked.add(command)
+                if shutil.which(command):
+                    return command
+    return None
 
 
 def _remembered_closed_application_query(

@@ -84,7 +84,17 @@ fn open_path_in_application_rejects_shell_shaped_executables() {
     )
     .expect_err("unsafe executable must be rejected");
 
-    assert!(error.to_string().contains("executable identifier"));
+    assert!(error.to_string().contains("application identifier"));
+}
+
+#[test]
+fn windows_shortcut_path_open_uses_stdin_payload_and_shortcut_target() {
+    let script = super::windows_host_open_shortcut_script();
+
+    assert!(script.contains("[Console]::In.ReadToEnd() | ConvertFrom-Json"));
+    assert!(script.contains("CreateShortcut($shortcut)"));
+    assert!(script.contains("ArgumentList"));
+    assert!(!script.contains("Start-Process -FilePath $shortcut"));
 }
 
 #[test]
